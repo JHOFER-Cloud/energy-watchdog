@@ -25,6 +25,9 @@ prometheus:
   # Don't treat surplus as "wake" unless the battery is at least this charged. Low on
   # purpose: it only needs enough buffer to ride out short cloud cover.
   minBatteryPercent: 20
+  # Multiplier to convert the production/consumption metrics to watts, so the *Watts
+  # thresholds mean watts. The sonnenbatterie metrics are milliwatts, hence 0.001.
+  powerScale: 0.001
   productionMetric: sonnenbatterie_production_mw
   consumptionMetric: sonnenbatterie_consumption_mw
   batteryMetric: sonnenbatterie_user_charge_level_percent

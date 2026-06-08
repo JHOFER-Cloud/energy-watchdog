@@ -43,6 +43,10 @@ type Prometheus struct {
 	// MinBatteryPercent gates waking: don't count surplus as "wake" unless the
 	// battery is at least this charged, so we never wake into a battery about to deplete.
 	MinBatteryPercent float64 `yaml:"minBatteryPercent"`
+	// PowerScale multiplies the production/consumption metrics to convert them to watts,
+	// so the *Watts thresholds mean what they say. The sonnenbatterie metrics are in
+	// milliwatts, so use 0.001. Defaults to 1 (metric already in watts).
+	PowerScale float64 `yaml:"powerScale"`
 
 	ProductionMetric  string `yaml:"productionMetric"`
 	ConsumptionMetric string `yaml:"consumptionMetric"`

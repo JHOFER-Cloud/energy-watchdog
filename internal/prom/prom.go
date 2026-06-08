@@ -39,19 +39,24 @@ type Reading struct {
 }
 
 // Read evaluates the surplus and battery queries built from cfg. Production and
-// consumption are summed so multiple inverter/battery series collapse to a house total.
+// consumption are summed so multiple inverter/battery series collapse to a house total,
+// then scaled to watts via cfg.PowerScale.
 func (c *Client) Read(ctx context.Context, cfg config.Prometheus) (Reading, error) {
+	scale := cfg.PowerScale
+	if scale == 0 {
+		scale = 1
+	}
 	avgSurplus := fmt.Sprintf("sum(avg_over_time(%s[%s])) - sum(avg_over_time(%s[%s]))",
 		cfg.ProductionMetric, cfg.Window, cfg.ConsumptionMetric, cfg.Window)
 	surplus, err := c.query(ctx, avgSurplus)
 	if err != nil {
 		return Reading{}, fmt.Errorf("surplus query: %w", err)
 	}
-	r := Reading{Surplus: surplus}
+	r := Reading{Surplus: surplus * scale}
 
 	rawSurplus := fmt.Sprintf("sum(%s) - sum(%s)", cfg.ProductionMetric, cfg.ConsumptionMetric)
 	if raw, err := c.query(ctx, rawSurplus); err == nil {
-		r.SurplusRaw = raw
+		r.SurplusRaw = raw * scale
 	}
 
 	if cfg.BatteryMetric != "" {

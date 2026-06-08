@@ -47,6 +47,25 @@ func TestRead(t *testing.T) {
 	}
 }
 
+func TestReadPowerScale(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		// 860000 milliwatts of surplus.
+		_, _ = w.Write([]byte(`{"status":"success","data":{"resultType":"vector","result":[{"metric":{},"value":[1700000000,"860000"]}]}}`))
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL)
+	r, err := c.Read(context.Background(), config.Prometheus{
+		Window: "30m", ProductionMetric: "p", ConsumptionMetric: "c", PowerScale: 0.001,
+	})
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if r.Surplus != 860 || r.SurplusRaw != 860 {
+		t.Errorf("scaled surplus = %v / raw %v, want 860 W", r.Surplus, r.SurplusRaw)
+	}
+}
+
 func TestReadEmptyVector(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte(`{"status":"success","data":{"resultType":"vector","result":[]}}`))
