@@ -8,7 +8,7 @@ import (
 
 func TestIDSetContains(t *testing.T) {
 	var s IDSet
-	if err := yaml.Unmarshal([]byte(`[101, "300-309", 601]`), &s); err != nil {
+	if err := yaml.Unmarshal([]byte(`[101, "300-309", 601, "700"]`), &s); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
 	tests := []struct {
@@ -23,6 +23,8 @@ func TestIDSetContains(t *testing.T) {
 		{309, true},
 		{310, false},
 		{601, true},
+		{700, true}, // bare number as a string
+		{701, false},
 	}
 	for _, tt := range tests {
 		if got := s.Contains(tt.id); got != tt.want {

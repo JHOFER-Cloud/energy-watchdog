@@ -260,7 +260,16 @@ func (s *IDSet) UnmarshalYAML(value *yaml.Node) error {
 }
 
 func parseRange(s string) (lo, hi int, err error) {
-	parts := strings.SplitN(strings.TrimSpace(s), "-", 2)
+	s = strings.TrimSpace(s)
+	// A bare number string ("700") is a single id, not a range.
+	if !strings.Contains(s, "-") {
+		n, err := strconv.Atoi(s)
+		if err != nil {
+			return 0, 0, fmt.Errorf("invalid id %q: want a number or \"lo-hi\" range", s)
+		}
+		return n, n, nil
+	}
+	parts := strings.SplitN(s, "-", 2)
 	if len(parts) != 2 {
 		return 0, 0, fmt.Errorf("invalid id range %q: want \"lo-hi\"", s)
 	}
