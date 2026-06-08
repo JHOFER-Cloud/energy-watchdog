@@ -1,0 +1,31 @@
+# The watchdog persists its state (mode, stopped guests, silence id) in a ConfigMap in
+# its own namespace. This grants just enough to read and write that one ConfigMap.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: energy-watchdog
+  namespace: energy
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: energy-watchdog
+  namespace: energy
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "create", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: energy-watchdog
+  namespace: energy
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: energy-watchdog
+subjects:
+  - kind: ServiceAccount
+    name: energy-watchdog
+    namespace: energy

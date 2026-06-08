@@ -1,0 +1,47 @@
+# The watchdog config, mounted at /config/config.yaml. Ships with dryRun: true so the
+# first rollout only observes and logs. See config.example.yaml for every field.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: energy-watchdog
+  namespace: energy
+data:
+  config.yaml: |
+    interval: 60s
+    dryRun: true
+    metricsAddr: ":9333"
+
+    prometheus:
+      url: http://kube-prometheus-stack-prometheus.monitoring.svc.cluster.local:9090
+      window: 30m
+      headroomWatts: 1000
+      shedBelowWatts: 0
+      minBatteryPercent: 30
+      productionMetric: sonnenbatterie_production_mw
+      consumptionMetric: sonnenbatterie_consumption_mw
+      batteryMetric: sonnenbatterie_user_charge_level_percent
+
+    proxmox:
+      endpoint: https://pve.hla1.jhofer.lan
+      caCertPath: /etc/ssl/certs/jhc-ca.crt
+      insecureSkipVerify: false
+      node: pve-1
+      mac: "TODO:AA:BB:CC:DD:EE:FF"
+      wolBroadcastAddr: "10.1.1.255:9"
+      targetNodes: [pve-2, pve-3]
+
+    guests:
+      migrate: ["100-199"]
+      stop: ["300-399"]
+      gamingGuard: ["600-699"]
+
+    alertmanager:
+      url: http://kube-prometheus-stack-alertmanager.monitoring.svc.cluster.local:9093
+      comment: "p1 powered down by energy-watchdog (solar deficit)"
+      matchers:
+        - name: instance
+          value: "(pve-1|talos-.*-p1).*"
+          isRegex: true
+
+    state:
+      configMapName: energy-watchdog-state

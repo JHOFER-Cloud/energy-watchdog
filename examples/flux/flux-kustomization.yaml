@@ -1,0 +1,27 @@
+# Flux Kustomization that deploys the base in this directory. Apply it (or commit it to
+# the path Flux already watches) once the GitRepository source below exists.
+apiVersion: source.toolkit.fluxcd.io/v1
+kind: GitRepository
+metadata:
+  name: energy-watchdog
+  namespace: flux-system
+spec:
+  interval: 1h
+  url: https://github.com/JHOFER-Cloud/energy-watchdog
+  ref:
+    branch: main
+---
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: energy-watchdog
+  namespace: flux-system
+spec:
+  interval: 1h
+  # prune: false keeps Flux from deleting these resources if the source goes away.
+  prune: false
+  sourceRef:
+    kind: GitRepository
+    name: energy-watchdog
+  path: ./examples/flux
+  wait: true

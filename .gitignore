@@ -1,0 +1,7 @@
+/energy-watchdog
+/config.yaml
+*.tmp
+/dist/
+/.direnv/bin
+/.direnv
+/result

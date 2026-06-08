@@ -1,0 +1,13 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["github>JHOFER-Cloud/renovate-presets//default"],
+  "reviewers": ["ojsef39"],
+  "packageRules": [
+    {
+      "description": "Bump the go.mod directive and the golang build image together. CI reads go-version from go.mod, so it follows automatically.",
+      "groupName": "Go",
+      "matchDatasources": ["golang-version", "docker"],
+      "matchPackageNames": ["go", "golang"]
+    }
+  ]
+}

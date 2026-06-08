@@ -1,0 +1,111 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: energy-watchdog
+  namespace: energy
+  labels:
+    app: energy-watchdog
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate # single owner of host state; never run two at once
+  selector:
+    matchLabels:
+      app: energy-watchdog
+  template:
+    metadata:
+      labels:
+        app: energy-watchdog
+    spec:
+      serviceAccountName: energy-watchdog
+      # hostNetwork so the WoL magic packet reaches p1's broadcast domain.
+      # ClusterFirstWithHostNet keeps cluster DNS working (Prometheus, Alertmanager,
+      # kubernetes.default) while on the host network.
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      # Pin to an always-on node that shares p1's broadcast domain (a control-plane Pi).
+      nodeSelector:
+        kubernetes.io/hostname: TODO-always-on-node
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: energy-watchdog
+          image: ghcr.io/jhofer-cloud/energy-watchdog:latest # pin a version in real use
+          args: ["-config", "/config/config.yaml"]
+          envFrom:
+            - secretRef:
+                name: energy-watchdog # PROXMOX_TOKEN_ID / PROXMOX_TOKEN_SECRET
+          ports:
+            - name: metrics
+              containerPort: 9333
+          volumeMounts:
+            - name: config
+              mountPath: /config
+              readOnly: true
+            - name: ca
+              mountPath: /etc/ssl/certs/jhc-ca.crt
+              subPath: ca.crt
+              readOnly: true
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 9333
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 9333
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              memory: 64Mi
+      volumes:
+        - name: config
+          configMap:
+            name: energy-watchdog
+        # The internal CA the watchdog trusts for the Proxmox endpoint. Provide it
+        # however you already do (here: a ConfigMap with key ca.crt; internally this is
+        # populated from the jhc-ca image).
+        - name: ca
+          configMap:
+            name: jhc-ca
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: energy-watchdog
+  namespace: energy
+  labels:
+    app: energy-watchdog
+spec:
+  type: ClusterIP
+  selector:
+    app: energy-watchdog
+  ports:
+    - name: metrics
+      port: 9333
+      targetPort: metrics
+---
+# Optional: needs the Prometheus Operator. Remove this document if you don't run it.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: energy-watchdog
+  namespace: energy
+  labels:
+    app: energy-watchdog
+spec:
+  selector:
+    matchLabels:
+      app: energy-watchdog
+  endpoints:
+    - port: metrics
+      interval: 30s
+      path: /metrics

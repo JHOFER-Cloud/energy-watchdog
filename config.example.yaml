@@ -1,0 +1,71 @@
+# energy-watchdog configuration (JHC-504).
+#
+# Powers p1 down when solar production no longer covers consumption and wakes it back
+# up when surplus returns, shedding/restoring its guests around the cycle.
+
+interval: 60s
+
+# Start here. In dry-run the watchdog reads everything and LOGS the actions it would
+# take, but performs none of them. Flip to false only after a dry-run day looks right.
+dryRun: true
+
+metricsAddr: ":9333"
+
+prometheus:
+  url: http://kube-prometheus-stack-prometheus.monitoring.svc.cluster.local:9090
+  # avg_over_time window. The "base level" that stops a kitchen burst from triggering
+  # a shutdown.
+  window: 30m
+  # Surplus (production - consumption), sustained over the window, that must be cleared
+  # before waking p1. ~1kW covers p1+p2+p3 spinning up. Also the upper hysteresis edge.
+  headroomWatts: 1000
+  # Shed once surplus drops below this. 0 = shed when consumption exceeds production.
+  # The gap up to headroomWatts is the hysteresis band that prevents flapping.
+  shedBelowWatts: 0
+  # Don't treat surplus as "wake" unless the battery is at least this charged. Low on
+  # purpose: it only needs enough buffer to ride out short cloud cover.
+  minBatteryPercent: 20
+  productionMetric: sonnenbatterie_production_mw
+  consumptionMetric: sonnenbatterie_consumption_mw
+  batteryMetric: sonnenbatterie_user_charge_level_percent
+
+proxmox:
+  # The proxy fronts all three nodes, so it stays reachable while p1 is off as long as
+  # it routes to another node. Any node manages p1's guests cluster-internally.
+  endpoint: https://pve.hla1.jhofer.lan
+  # Trust the internal CA (mounted from the jhc-ca image) so TLS verifies properly.
+  caCertPath: /etc/ssl/certs/jhc-ca.crt
+  insecureSkipVerify: false
+  # tokenID / tokenSecret come from PROXMOX_TOKEN_ID / PROXMOX_TOKEN_SECRET (the synced
+  # 1Password secret) in-cluster; only set them here for local runs.
+  # tokenID: "energy-watchdog@pve!watchdog"
+  # tokenSecret: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+  node: pve-1
+  mac: "TODO:AA:BB:CC:DD:EE:FF" # p1's NIC MAC, for Wake-on-LAN
+  # Where the magic packet goes. A subnet-directed address is often more reliable from
+  # a hostNetwork pod than the all-ones broadcast. Defaults to 255.255.255.255:9.
+  wolBroadcastAddr: "10.1.1.255:9"
+  targetNodes: [pve-2, pve-3] # migration destinations, used round-robin
+  migrateTimeout: 15m
+  stopTimeout: 5m
+  wakeTimeout: 5m
+
+# Guest classes. Entries are int ids (601) or inclusive ranges ("600-699").
+# The three lists must not overlap.
+guests:
+  migrate: ["100-199"] # live-migrate off p1 before power-off; never migrated back
+  stop: ["300-399"] # graceful stop; recorded and restarted at good-morning
+  gamingGuard: ["600-699"] # any running -> keep p1 up (no power-off)
+
+alertmanager:
+  url: http://kube-prometheus-stack-alertmanager.monitoring.svc.cluster.local:9093
+  comment: "p1 powered down by energy-watchdog (solar deficit)"
+  matchers:
+    - name: instance
+      value: "(pve-1|talos-.*-p1).*"
+      isRegex: true
+
+state:
+  # In-cluster: persisted to this ConfigMap. Locally: the file below is used instead.
+  configMapName: energy-watchdog-state
+  filePath: /tmp/energy-watchdog-state.json

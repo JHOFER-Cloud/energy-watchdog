@@ -1,0 +1,11 @@
+# Kustomize base for energy-watchdog. The Flux Kustomization in
+# flux-kustomization.yaml points its `path` here.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: energy
+resources:
+  - namespace.yaml
+  - rbac.yaml
+  - secret.example.yaml
+  - configmap.yaml
+  - deployment.yaml
