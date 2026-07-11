@@ -33,11 +33,18 @@ type GuestRef struct {
 	Type string `json:"type"`
 }
 
+// SilenceRef ties a created silence to the Alertmanager it lives in, so it can be
+// deleted from the right one on wake.
+type SilenceRef struct {
+	URL string `json:"url"`
+	ID  string `json:"id"`
+}
+
 // State is the persisted controller state.
 type State struct {
-	Mode      Mode       `json:"mode"`
-	Stopped   []GuestRef `json:"stopped"`
-	SilenceID string     `json:"silenceID"`
+	Mode     Mode         `json:"mode"`
+	Stopped  []GuestRef   `json:"stopped"`
+	Silences []SilenceRef `json:"silences"`
 }
 
 // Store loads and saves State.

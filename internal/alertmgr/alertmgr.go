@@ -5,6 +5,7 @@ package alertmgr
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -20,9 +21,15 @@ type Client struct {
 	http *http.Client
 }
 
-// New builds an Alertmanager client for the given base URL.
-func New(base string) *Client {
-	return &Client{base: base, http: &http.Client{Timeout: 15 * time.Second}}
+// New builds an Alertmanager client for the given base URL. tlsConf is applied for
+// https bases (e.g. a cross-cluster Alertmanager fronted by an internal-CA ingress);
+// pass nil for plain-http in-cluster endpoints.
+func New(base string, tlsConf *tls.Config) *Client {
+	c := &http.Client{Timeout: 15 * time.Second}
+	if tlsConf != nil {
+		c.Transport = &http.Transport{TLSClientConfig: tlsConf}
+	}
+	return &Client{base: base, http: c}
 }
 
 type silenceMatcher struct {

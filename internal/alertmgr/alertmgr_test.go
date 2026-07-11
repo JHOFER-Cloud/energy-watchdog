@@ -29,7 +29,7 @@ func TestCreateAndDelete(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := New(srv.URL)
+	c := New(srv.URL, nil)
 	now := time.Date(2026, 6, 8, 22, 0, 0, 0, time.UTC)
 	id, err := c.Create(context.Background(),
 		[]config.Matcher{{Name: "instance", Value: "pve-1.*", IsRegex: true}},
@@ -57,7 +57,7 @@ func TestDeleteNotFoundIsOK(t *testing.T) {
 		w.WriteHeader(http.StatusNotFound)
 	}))
 	defer srv.Close()
-	if err := New(srv.URL).Delete(context.Background(), "gone"); err != nil {
+	if err := New(srv.URL, nil).Delete(context.Background(), "gone"); err != nil {
 		t.Errorf("Delete of missing silence should be nil, got %v", err)
 	}
 }

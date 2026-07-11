@@ -100,10 +100,18 @@ type Guests struct {
 	GamingGuard IDSet `yaml:"gamingGuard"`
 }
 
-// Alertmanager configures the silence created while the node is down.
+// Alertmanager configures the silences created while the node is down. Physical p1
+// hosts guests in more than one cluster, so URLs lists every Alertmanager that needs
+// silencing. Each Silence is created separately (per label dimension) so p1 is silenced
+// precisely instead of with one broad match.
 type Alertmanager struct {
-	URL      string    `yaml:"url"`
+	URLs     []string  `yaml:"urls"`
 	Comment  string    `yaml:"comment"`
+	Silences []Silence `yaml:"silences"`
+}
+
+// Silence is one Alertmanager silence; its matchers are AND-ed together.
+type Silence struct {
 	Matchers []Matcher `yaml:"matchers"`
 }
 
@@ -194,6 +202,8 @@ func (c *Config) validate() error {
 		return fmt.Errorf("proxmox.targetNodes must list at least one migration destination")
 	case c.Proxmox.TokenID == "" || c.Proxmox.TokenSecret == "":
 		return fmt.Errorf("proxmox token missing (set proxmox.tokenID/tokenSecret or PROXMOX_TOKEN_ID/PROXMOX_TOKEN_SECRET)")
+	case len(c.Alertmanager.URLs) > 0 && len(c.Alertmanager.Silences) == 0:
+		return fmt.Errorf("alertmanager.silences must be set when alertmanager.urls is configured")
 	}
 	if c.Prometheus.HeadroomWatts < c.Prometheus.ShedBelowWatts {
 		return fmt.Errorf("prometheus.headroomWatts (%v) must be >= shedBelowWatts (%v) for stable hysteresis",

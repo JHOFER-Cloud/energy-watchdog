@@ -21,9 +21,9 @@ func TestFileStoreRoundTrip(t *testing.T) {
 	}
 
 	want := State{
-		Mode:      ModeShed,
-		Stopped:   []GuestRef{{VMID: 301, Type: "qemu"}, {VMID: 311, Type: "lxc"}},
-		SilenceID: "sil-1",
+		Mode:     ModeShed,
+		Stopped:  []GuestRef{{VMID: 301, Type: "qemu"}, {VMID: 311, Type: "lxc"}},
+		Silences: []SilenceRef{{URL: "http://am", ID: "sil-1"}},
 	}
 	if err := s.Save(ctx, want); err != nil {
 		t.Fatal(err)
@@ -32,7 +32,7 @@ func TestFileStoreRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Mode != want.Mode || got.SilenceID != want.SilenceID || len(got.Stopped) != 2 {
+	if got.Mode != want.Mode || len(got.Silences) != 1 || got.Silences[0].ID != "sil-1" || len(got.Stopped) != 2 {
 		t.Errorf("round-trip = %+v, want %+v", got, want)
 	}
 	if got.Stopped[0].VMID != 301 || got.Stopped[1].Type != "lxc" {

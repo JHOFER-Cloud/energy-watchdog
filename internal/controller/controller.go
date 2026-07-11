@@ -21,15 +21,16 @@ type Controller struct {
 	cfg     *config.Config
 	prom    *prom.Client
 	px      *proxmox.Client
-	am      *alertmgr.Client
+	ams     map[string]*alertmgr.Client
 	store   state.Store
 	metrics *metrics.Metrics
 	log     *slog.Logger
 }
 
-// New builds a Controller.
-func New(cfg *config.Config, p *prom.Client, px *proxmox.Client, am *alertmgr.Client, store state.Store, m *metrics.Metrics, log *slog.Logger) *Controller {
-	return &Controller{cfg: cfg, prom: p, px: px, am: am, store: store, metrics: m, log: log}
+// New builds a Controller. ams is keyed by Alertmanager base URL so a persisted
+// silence can be deleted from the same Alertmanager it was created in.
+func New(cfg *config.Config, p *prom.Client, px *proxmox.Client, ams map[string]*alertmgr.Client, store state.Store, m *metrics.Metrics, log *slog.Logger) *Controller {
+	return &Controller{cfg: cfg, prom: p, px: px, ams: ams, store: store, metrics: m, log: log}
 }
 
 // Run reconciles immediately, then on every interval until ctx is cancelled.
@@ -128,8 +129,8 @@ func (c *Controller) logPlan(p Plan) {
 // execute applies the plan in a fixed, safe order and persists the resulting state.
 func (c *Controller) execute(ctx context.Context, p Plan, snap Snapshot) error {
 	st := state.State{Mode: snap.Mode, Stopped: snap.StoppedSet}
-	if id, err := c.currentSilence(ctx); err == nil {
-		st.SilenceID = id
+	if refs, err := c.currentSilences(ctx); err == nil {
+		st.Silences = refs
 	}
 
 	if len(p.Migrate) > 0 {
@@ -145,14 +146,13 @@ func (c *Controller) execute(ctx context.Context, p Plan, snap Snapshot) error {
 			return err
 		}
 	}
-	if p.Silence && st.SilenceID == "" {
-		id, err := c.am.Create(ctx, c.cfg.Alertmanager.Matchers, c.cfg.Alertmanager.Comment,
-			24*time.Hour, time.Now())
+	if p.Silence && len(st.Silences) == 0 {
+		refs, err := c.silenceAll(ctx)
+		st.Silences = refs
 		if err != nil {
+			_ = c.store.Save(ctx, st) // persist whatever we created so wake can clean it up
 			return err
 		}
-		st.SilenceID = id
-		c.log.Info("created alertmanager silence", "id", id)
 	}
 	if p.Wake {
 		if err := c.wake(ctx); err != nil {
@@ -171,12 +171,11 @@ func (c *Controller) execute(ctx context.Context, p Plan, snap Snapshot) error {
 			return err
 		}
 	}
-	if p.Unsilence && st.SilenceID != "" {
-		if err := c.am.Delete(ctx, st.SilenceID); err != nil {
+	if p.Unsilence && len(st.Silences) > 0 {
+		if err := c.unsilenceAll(ctx, st.Silences); err != nil {
 			return err
 		}
-		c.log.Info("removed alertmanager silence", "id", st.SilenceID)
-		st.SilenceID = ""
+		st.Silences = nil
 	}
 
 	st.Mode = p.NextMode
@@ -259,13 +258,47 @@ func (c *Controller) wake(ctx context.Context) error {
 	return c.px.WaitNodeUp(wctx, c.cfg.Proxmox.Node)
 }
 
-// currentSilence reloads the persisted silence id so execute doesn't double-create.
-func (c *Controller) currentSilence(ctx context.Context) (string, error) {
+// currentSilences reloads the persisted silence refs so execute doesn't double-create.
+func (c *Controller) currentSilences(ctx context.Context) ([]state.SilenceRef, error) {
 	st, err := c.store.Load(ctx)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
-	return st.SilenceID, nil
+	return st.Silences, nil
+}
+
+// silenceAll creates every configured silence in every configured Alertmanager and
+// returns a ref per (alertmanager, silence) so each can be deleted from the right one.
+func (c *Controller) silenceAll(ctx context.Context) ([]state.SilenceRef, error) {
+	var refs []state.SilenceRef
+	for _, url := range c.cfg.Alertmanager.URLs {
+		am := c.ams[url]
+		for _, s := range c.cfg.Alertmanager.Silences {
+			id, err := am.Create(ctx, s.Matchers, c.cfg.Alertmanager.Comment, 24*time.Hour, time.Now())
+			if err != nil {
+				return refs, err // return what we have so far so they can be cleaned up on wake
+			}
+			refs = append(refs, state.SilenceRef{URL: url, ID: id})
+			c.log.Info("created alertmanager silence", "url", url, "id", id)
+		}
+	}
+	return refs, nil
+}
+
+// unsilenceAll deletes each persisted silence from the Alertmanager it was created in.
+func (c *Controller) unsilenceAll(ctx context.Context, refs []state.SilenceRef) error {
+	for _, ref := range refs {
+		am := c.ams[ref.URL]
+		if am == nil {
+			c.log.Warn("no client for silenced alertmanager, skipping delete", "url", ref.URL, "id", ref.ID)
+			continue
+		}
+		if err := am.Delete(ctx, ref.ID); err != nil {
+			return err
+		}
+		c.log.Info("removed alertmanager silence", "url", ref.URL, "id", ref.ID)
+	}
+	return nil
 }
 
 func rotate[T any](s []T, n int) []T {

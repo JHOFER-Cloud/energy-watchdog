@@ -61,12 +61,19 @@ guests:
   gamingGuard: ["600-699"] # any running -> keep p1 up (no power-off)
 
 alertmanager:
-  url: http://kube-prometheus-stack-alertmanager.monitoring.svc.cluster.local:9093
+  # Every Alertmanager that needs silencing while p1 is down. If p1 hosts guests in more
+  # than one cluster, list each cluster's Alertmanager (https endpoints use the same
+  # internal CA as proxmox.caCertPath).
+  urls:
+    - http://kube-prometheus-stack-alertmanager.monitoring.svc.cluster.local:9093
   comment: "p1 powered down by energy-watchdog (solar deficit)"
-  matchers:
-    - name: instance
-      value: "(pve-1|talos-.*-p1).*"
-      isRegex: true
+  # Each entry is one silence (its matchers are AND-ed). Scope each to p1's own label
+  # values so an identical alert firing for another node isn't shadowed.
+  silences:
+    - matchers:
+        - name: node
+          value: ".*-p1"
+          isRegex: true
 
 state:
   # In-cluster: persisted to this ConfigMap. Locally: the file below is used instead.

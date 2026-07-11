@@ -49,13 +49,20 @@ func main() {
 		os.Exit(1)
 	}
 
+	// One client per Alertmanager. The internal-CA tls config (shared with Proxmox) lets
+	// the https cross-cluster endpoint verify; plain-http in-cluster endpoints ignore it.
+	ams := make(map[string]*alertmgr.Client, len(cfg.Alertmanager.URLs))
+	for _, url := range cfg.Alertmanager.URLs {
+		ams[url] = alertmgr.New(url, tlsConf)
+	}
+
 	m := metrics.New(cfg.DryRun)
 	m.SetThresholds(cfg.Prometheus.HeadroomWatts, cfg.Prometheus.ShedBelowWatts, cfg.Prometheus.MinBatteryPercent)
 	ctrl := controller.New(
 		cfg,
 		prom.New(cfg.Prometheus.URL),
 		proxmox.New(cfg.Proxmox.Endpoint, cfg.Proxmox.TokenID, cfg.Proxmox.TokenSecret, tlsConf),
-		alertmgr.New(cfg.Alertmanager.URL),
+		ams,
 		store,
 		m,
 		log,

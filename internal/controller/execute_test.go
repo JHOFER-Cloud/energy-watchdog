@@ -65,12 +65,15 @@ func TestExecuteShedCycle(t *testing.T) {
 			MigrateTimeout: config.Duration{Duration: time.Minute},
 			StopTimeout:    config.Duration{Duration: time.Minute},
 		},
-		Alertmanager: config.Alertmanager{Matchers: []config.Matcher{{Name: "instance", Value: "pve-1.*", IsRegex: true}}},
+		Alertmanager: config.Alertmanager{
+			URLs:     []string{am.URL},
+			Silences: []config.Silence{{Matchers: []config.Matcher{{Name: "node", Value: ".*-p1", IsRegex: true}}}},
+		},
 	}
 	c := New(cfg,
 		prom.New("http://unused"),
 		proxmox.New(px.URL, "u@pam!t", "s", nil),
-		alertmgr.New(am.URL),
+		map[string]*alertmgr.Client{am.URL: alertmgr.New(am.URL, nil)},
 		state.NewFileStore(statePath),
 		metrics.New(false),
 		slog.New(slog.NewTextHandler(io.Discard, nil)),
@@ -110,7 +113,7 @@ func TestExecuteShedCycle(t *testing.T) {
 	if len(st.Stopped) != 1 || st.Stopped[0].VMID != 301 {
 		t.Errorf("stopped = %+v, want [301]", st.Stopped)
 	}
-	if st.SilenceID != "sil-1" {
-		t.Errorf("silenceID = %q, want sil-1", st.SilenceID)
+	if len(st.Silences) != 1 || st.Silences[0].ID != "sil-1" || st.Silences[0].URL != am.URL {
+		t.Errorf("silences = %+v, want one sil-1 for %s", st.Silences, am.URL)
 	}
 }
