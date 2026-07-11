@@ -15,8 +15,9 @@ import (
 type Config struct {
 	// Interval is how often the reconcile loop runs.
 	Interval Duration `yaml:"interval"`
-	// DryRun logs the actions the watchdog would take without performing any of them.
-	DryRun bool `yaml:"dryRun"`
+	// DryRun controls how much the watchdog actually does: full operation, log-only, or
+	// alert-only (manage Alertmanager silences from p1's real power state, no Proxmox).
+	DryRun DryRunMode `yaml:"dryRun"`
 	// MetricsAddr is the listen address for the /metrics and /healthz endpoints.
 	MetricsAddr string `yaml:"metricsAddr"`
 
@@ -25,6 +26,59 @@ type Config struct {
 	Guests       Guests       `yaml:"guests"`
 	Alertmanager Alertmanager `yaml:"alertmanager"`
 	State        State        `yaml:"state"`
+}
+
+// DryRunMode is how much of the plan the watchdog carries out.
+type DryRunMode int
+
+const (
+	// DryRunFull performs everything (from yaml: false).
+	DryRunFull DryRunMode = iota
+	// DryRunLog logs the plan and touches nothing (from yaml: true).
+	DryRunLog
+	// DryRunAlert only creates/removes Alertmanager silences, driven by p1's actual
+	// power state - no migrate/stop/poweroff/wake. For running before WoL is ready so a
+	// manual p1 shutdown still gets silenced (from yaml: alert).
+	DryRunAlert
+)
+
+func (m DryRunMode) String() string {
+	switch m {
+	case DryRunLog:
+		return "log"
+	case DryRunAlert:
+		return "alert"
+	default:
+		return "full"
+	}
+}
+
+// UnmarshalYAML accepts a bool (false=full, true=log) or the string "alert".
+func (m *DryRunMode) UnmarshalYAML(value *yaml.Node) error {
+	var b bool
+	if err := value.Decode(&b); err == nil {
+		if b {
+			*m = DryRunLog
+		} else {
+			*m = DryRunFull
+		}
+		return nil
+	}
+	var s string
+	if err := value.Decode(&s); err != nil {
+		return fmt.Errorf("dryRun must be true, false, or \"alert\"")
+	}
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "alert":
+		*m = DryRunAlert
+	case "true":
+		*m = DryRunLog
+	case "false":
+		*m = DryRunFull
+	default:
+		return fmt.Errorf("dryRun: unknown value %q (want true, false, or alert)", s)
+	}
+	return nil
 }
 
 // Prometheus configures the solar-surplus decision queries.

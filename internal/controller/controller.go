@@ -68,10 +68,14 @@ func (c *Controller) reconcile(ctx context.Context) {
 	}
 	c.metrics.Update(sample)
 
+	if c.cfg.DryRun == config.DryRunAlert {
+		c.reconcileAlertOnly(ctx, snap)
+		return
+	}
 	if isNoop(plan, snap.Mode) {
 		return
 	}
-	if c.cfg.DryRun {
+	if c.cfg.DryRun == config.DryRunLog {
 		c.logPlan(plan)
 		return
 	}
@@ -267,6 +271,56 @@ func (c *Controller) currentSilences(ctx context.Context) ([]state.SilenceRef, e
 	return st.Silences, nil
 }
 
+// silenceTTL is how long each Alertmanager silence lasts. reconcileAlertOnly refreshes
+// them before this lapses, so a shutdown longer than the TTL stays covered; if the
+// watchdog itself dies, the silences self-expire within one TTL instead of lingering.
+const silenceTTL = 24 * time.Hour
+
+// reconcileAlertOnly drives Alertmanager silences purely from p1's real power state
+// (DryRunAlert mode): silence when the node is down, drop them when it is back, and
+// refresh before the TTL lapses so an indefinitely-long shutdown stays covered. It takes
+// no Proxmox actions, so it's safe to run before Wake-on-LAN is ready.
+func (c *Controller) reconcileAlertOnly(ctx context.Context, snap Snapshot) {
+	st, err := c.store.Load(ctx)
+	if err != nil {
+		c.log.Error("alert-only: load state", "err", err)
+		return
+	}
+	if snap.NodeUp {
+		if len(st.Silences) > 0 {
+			if err := c.unsilenceAll(ctx, st.Silences); err != nil {
+				c.log.Error("alert-only: unsilence", "err", err)
+				return
+			}
+			st.Silences, st.SilencedAt = nil, 0
+			if err := c.store.Save(ctx, st); err != nil {
+				c.log.Error("alert-only: save", "err", err)
+			}
+		}
+		return
+	}
+	// p1 is down: make sure a fresh silence set exists.
+	now := time.Now()
+	stale := len(st.Silences) > 0 && now.Unix()-st.SilencedAt > int64((silenceTTL-time.Hour).Seconds())
+	if len(st.Silences) > 0 && !stale {
+		return
+	}
+	old := st.Silences
+	refs, err := c.silenceAll(ctx)
+	st.Silences, st.SilencedAt = refs, now.Unix()
+	if err != nil {
+		c.log.Error("alert-only: silence", "err", err)
+	}
+	if err := c.store.Save(ctx, st); err != nil {
+		c.log.Error("alert-only: save", "err", err)
+	}
+	if len(old) > 0 { // a fresh set was created above; retire the superseded one
+		if err := c.unsilenceAll(ctx, old); err != nil {
+			c.log.Error("alert-only: retire stale silences", "err", err)
+		}
+	}
+}
+
 // silenceAll creates every configured silence in every configured Alertmanager and
 // returns a ref per (alertmanager, silence) so each can be deleted from the right one.
 func (c *Controller) silenceAll(ctx context.Context) ([]state.SilenceRef, error) {
@@ -274,7 +328,7 @@ func (c *Controller) silenceAll(ctx context.Context) ([]state.SilenceRef, error)
 	for _, url := range c.cfg.Alertmanager.URLs {
 		am := c.ams[url]
 		for _, s := range c.cfg.Alertmanager.Silences {
-			id, err := am.Create(ctx, s.Matchers, c.cfg.Alertmanager.Comment, 24*time.Hour, time.Now())
+			id, err := am.Create(ctx, s.Matchers, c.cfg.Alertmanager.Comment, silenceTTL, time.Now())
 			if err != nil {
 				return refs, err // return what we have so far so they can be cleaned up on wake
 			}

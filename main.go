@@ -33,8 +33,11 @@ func main() {
 		log.Error("load config", "err", err)
 		os.Exit(1)
 	}
-	if cfg.DryRun {
-		log.Warn("running in dry-run mode: no actions will be taken")
+	switch cfg.DryRun {
+	case config.DryRunLog:
+		log.Warn("dry-run (log): logging plans only, no actions will be taken")
+	case config.DryRunAlert:
+		log.Warn("dry-run (alert): managing Alertmanager silences from p1's power state only, no Proxmox actions")
 	}
 
 	store, err := newStore(cfg, log)
@@ -56,7 +59,7 @@ func main() {
 		ams[url] = alertmgr.New(url, tlsConf)
 	}
 
-	m := metrics.New(cfg.DryRun)
+	m := metrics.New(cfg.DryRun != config.DryRunFull)
 	m.SetThresholds(cfg.Prometheus.HeadroomWatts, cfg.Prometheus.ShedBelowWatts, cfg.Prometheus.MinBatteryPercent)
 	ctrl := controller.New(
 		cfg,
@@ -73,7 +76,7 @@ func main() {
 
 	go serveMetrics(ctx, cfg.MetricsAddr, m, log)
 
-	log.Info("energy-watchdog started", "interval", cfg.Interval.Duration, "node", cfg.Proxmox.Node, "dryRun", cfg.DryRun)
+	log.Info("energy-watchdog started", "interval", cfg.Interval.Duration, "node", cfg.Proxmox.Node, "dryRun", cfg.DryRun.String())
 	ctrl.Run(ctx)
 	log.Info("energy-watchdog stopped")
 }

@@ -45,6 +45,9 @@ type State struct {
 	Mode     Mode         `json:"mode"`
 	Stopped  []GuestRef   `json:"stopped"`
 	Silences []SilenceRef `json:"silences"`
+	// SilencedAt is the unix time the current silences were (re)created, so they can be
+	// refreshed before their TTL lapses during a long shutdown. 0 when not silenced.
+	SilencedAt int64 `json:"silencedAt,omitempty"`
 }
 
 // Store loads and saves State.

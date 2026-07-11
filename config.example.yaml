@@ -5,8 +5,10 @@
 
 interval: 60s
 
-# Start here. In dry-run the watchdog reads everything and LOGS the actions it would
-# take, but performs none of them. Flip to false only after a dry-run day looks right.
+# true: read everything and LOG the actions it would take, perform none.
+# alert: also create/remove Alertmanager silences from p1's real power state (so a manual
+#        shutdown is silenced), but still no Proxmox/WoL actions. Good before WoL is ready.
+# false: full operation. Flip here only after a dry-run day looks right.
 dryRun: true
 
 metricsAddr: ":9333"
