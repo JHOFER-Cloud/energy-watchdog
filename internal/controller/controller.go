@@ -4,6 +4,9 @@ package controller
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"log/slog"
 	"time"
 
@@ -299,17 +302,22 @@ func (c *Controller) reconcileAlertOnly(ctx context.Context, snap Snapshot) {
 		}
 		return
 	}
-	// p1 is down: make sure a fresh silence set exists.
+	// p1 is down: make sure a fresh silence set matching the current config exists.
 	now := time.Now()
+	want := silenceFingerprint(c.cfg.Alertmanager.URLs, c.cfg.Alertmanager.Silences)
 	stale := len(st.Silences) > 0 && now.Unix()-st.SilencedAt > int64((silenceTTL-time.Hour).Seconds())
-	if len(st.Silences) > 0 && !stale {
+	drifted := st.SilencesFingerprint != want // silence config changed since we last applied it
+	if len(st.Silences) > 0 && !stale && !drifted {
 		return
 	}
 	old := st.Silences
 	refs, err := c.silenceAll(ctx)
 	st.Silences, st.SilencedAt = refs, now.Unix()
 	if err != nil {
+		st.SilencesFingerprint = "" // partial set; force a retry on the next tick
 		c.log.Error("alert-only: silence", "err", err)
+	} else {
+		st.SilencesFingerprint = want
 	}
 	if err := c.store.Save(ctx, st); err != nil {
 		c.log.Error("alert-only: save", "err", err)
@@ -319,6 +327,18 @@ func (c *Controller) reconcileAlertOnly(ctx context.Context, snap Snapshot) {
 			c.log.Error("alert-only: retire stale silences", "err", err)
 		}
 	}
+}
+
+// silenceFingerprint is a stable digest of the desired silence set (the Alertmanager
+// URLs and every matcher). reconcileAlertOnly recreates silences when it changes, so a
+// config edit takes effect on the next tick instead of lingering until the TTL refresh.
+func silenceFingerprint(urls []string, silences []config.Silence) string {
+	h := sha256.New()
+	_ = json.NewEncoder(h).Encode(struct {
+		URLs     []string         `json:"urls"`
+		Silences []config.Silence `json:"silences"`
+	}{urls, silences})
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 // silenceAll creates every configured silence in every configured Alertmanager and

@@ -48,6 +48,9 @@ type State struct {
 	// SilencedAt is the unix time the current silences were (re)created, so they can be
 	// refreshed before their TTL lapses during a long shutdown. 0 when not silenced.
 	SilencedAt int64 `json:"silencedAt,omitempty"`
+	// SilencesFingerprint digests the config that produced the current silences, so a
+	// changed silence config is re-applied on the next tick instead of waiting out the TTL.
+	SilencesFingerprint string `json:"silencesFingerprint,omitempty"`
 }
 
 // Store loads and saves State.

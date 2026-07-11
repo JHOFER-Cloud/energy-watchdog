@@ -51,7 +51,8 @@ func TestReconcileAlertOnly(t *testing.T) {
 			Silences: []config.Silence{{Matchers: []config.Matcher{{Name: "node", Value: ".*-p1", IsRegex: true}}}},
 		},
 	}
-	c := New(cfg,
+	c := New(
+		cfg,
 		prom.New("http://unused"),
 		proxmox.New(am.URL, "u@pam!t", "s", nil),
 		map[string]*alertmgr.Client{am.URL: alertmgr.New(am.URL, nil)},
@@ -77,6 +78,15 @@ func TestReconcileAlertOnly(t *testing.T) {
 		t.Errorf("fresh silence should not refresh: creates=%d deletes=%d", cr, del)
 	}
 
+	// Silence config changes while still down: the new set is applied at once (not left
+	// until the TTL refresh), retiring the old one.
+	cfg.Alertmanager.Silences = append(cfg.Alertmanager.Silences,
+		config.Silence{Matchers: []config.Matcher{{Name: "instance", Value: "pve-1(\\..*)?", IsRegex: true}}})
+	c.reconcileAlertOnly(ctx, Snapshot{NodeUp: false})
+	if cr, del := count(); cr != 3 || del != 1 {
+		t.Errorf("drifted config should re-apply: creates=%d deletes=%d, want 3/1", cr, del)
+	}
+
 	// Force the silence to look near-expiry: it should refresh (new create, retire old).
 	st, _ := store.Load(ctx)
 	st.SilencedAt = time.Now().Add(-silenceTTL).Unix()
@@ -84,16 +94,16 @@ func TestReconcileAlertOnly(t *testing.T) {
 		t.Fatal(err)
 	}
 	c.reconcileAlertOnly(ctx, Snapshot{NodeUp: false})
-	if cr, del := count(); cr != 2 || del != 1 {
-		t.Errorf("stale silence should refresh: creates=%d deletes=%d, want 2/1", cr, del)
+	if cr, del := count(); cr != 5 || del != 3 {
+		t.Errorf("stale silence should refresh: creates=%d deletes=%d, want 5/3", cr, del)
 	}
 
-	// p1 comes back: silence removed, state cleared.
+	// p1 comes back: silences removed, state cleared.
 	c.reconcileAlertOnly(ctx, Snapshot{NodeUp: true})
 	if st, _ := store.Load(ctx); len(st.Silences) != 0 || st.SilencedAt != 0 {
 		t.Errorf("after wake: silences=%+v silencedAt=%d", st.Silences, st.SilencedAt)
 	}
-	if cr, del := count(); cr != 2 || del != 2 {
-		t.Errorf("after wake: creates=%d deletes=%d, want 2/2", cr, del)
+	if cr, del := count(); cr != 5 || del != 5 {
+		t.Errorf("after wake: creates=%d deletes=%d, want 5/5", cr, del)
 	}
 }
