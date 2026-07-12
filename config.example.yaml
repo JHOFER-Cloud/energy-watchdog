@@ -13,6 +13,11 @@ dryRun: true
 
 metricsAddr: ":9333"
 
+# How long p1 may stay up in a gaming session with no gaming guest running before it is
+# powered off. Covers manually waking p1 (the gaming VM won't autostart) so you have time
+# to launch one, and rides out GPU-passthrough/VM reboots mid-session. Default 10m.
+gamingGrace: 10m
+
 prometheus:
   url: http://kube-prometheus-stack-prometheus.monitoring.svc.cluster.local:9090
   # avg_over_time window. The "base level" that stops a kitchen burst from triggering

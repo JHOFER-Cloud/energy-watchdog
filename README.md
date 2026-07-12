@@ -35,10 +35,26 @@ Two things stop it thrashing:
 | `shed` | surplus is back | Wake-on-LAN, start the guests it stopped, drop the silence |
 | `shed` | host got powered on by hand | treat it as `gaming`, don't fight a manual wake |
 | `gaming` | surplus is back | start the stopped guests (host's already on) |
-| `gaming` | gaming's done, still a deficit | power off |
+| `gaming` | no gaming VM yet, within grace | leave the host on, wait for a VM |
+| `gaming` | no gaming VM once grace elapses, still a deficit | power off |
 
 Migrated guests don't come back on their own. They stay where they landed; moving them
 back is a manual call.
+
+### Gaming grace window
+
+When `p1` is on in `gaming` mode but no gaming guest is running yet, it isn't powered off
+immediately: a grace window (`gamingGrace`, default 10m) has to elapse first. This covers
+two cases:
+
+- You wake `p1` by hand in the middle of a deficit to game. The gaming VM won't autostart,
+  so the host would otherwise be seen with no gaming guest and shut straight back down
+  before you can launch one.
+- A gaming VM reboots mid-session (e.g. GPU-passthrough hiccups). The clock resets every
+  time a gaming guest is seen running, so a short reboot rides out the window instead of
+  cutting the session short.
+
+Once the window elapses with no gaming guest and no surplus, the host powers off.
 
 ## Guest classes
 

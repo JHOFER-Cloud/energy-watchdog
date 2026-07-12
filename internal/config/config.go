@@ -20,6 +20,11 @@ type Config struct {
 	DryRun DryRunMode `yaml:"dryRun"`
 	// MetricsAddr is the listen address for the /metrics and /healthz endpoints.
 	MetricsAddr string `yaml:"metricsAddr"`
+	// GamingGrace is how long p1 may stay up in a gaming session with no gaming guest
+	// running before it is powered off. It covers waking the host to start a VM (which
+	// won't autostart) and GPU-passthrough/VM reboots mid-session, so a short gap doesn't
+	// cut the session short. Default 10m.
+	GamingGrace Duration `yaml:"gamingGrace"`
 
 	Prometheus   Prometheus   `yaml:"prometheus"`
 	Proxmox      Proxmox      `yaml:"proxmox"`
@@ -214,6 +219,9 @@ func (c *Config) defaults() {
 	}
 	if c.MetricsAddr == "" {
 		c.MetricsAddr = ":9333"
+	}
+	if c.GamingGrace.Duration == 0 {
+		c.GamingGrace = Duration{10 * time.Minute}
 	}
 	if c.Prometheus.Window == "" {
 		c.Prometheus.Window = "30m"

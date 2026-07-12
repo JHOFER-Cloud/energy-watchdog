@@ -60,7 +60,7 @@ func (c *Controller) reconcile(ctx context.Context) {
 		return
 	}
 
-	plan := Decide(snap, c.cfg)
+	plan := Decide(snap, c.cfg, now)
 	c.log.Info("decision",
 		"mode", snap.Mode, "next", plan.NextMode,
 		"surplus", snap.Surplus, "surplusRaw", snap.SurplusRaw, "soc", snap.SoC,
@@ -75,7 +75,7 @@ func (c *Controller) reconcile(ctx context.Context) {
 		c.reconcileAlertOnly(ctx, snap)
 		return
 	}
-	if isNoop(plan, snap.Mode) {
+	if isNoop(plan, snap) {
 		return
 	}
 	if c.cfg.DryRun == config.DryRunLog {
@@ -117,12 +117,14 @@ func (c *Controller) observe(ctx context.Context) (Snapshot, bool, error) {
 		Guests:     guests,
 		Mode:       st.Mode,
 		StoppedSet: st.Stopped,
+		GraceSince: st.GraceSince,
 	}
 	return snap, nodeUp && gamingActive(guests, c.cfg.Guests.GamingGuard), nil
 }
 
-func isNoop(p Plan, current state.Mode) bool {
-	return p.NextMode == current && !p.Poweroff && !p.Wake && !p.Silence && !p.Unsilence &&
+func isNoop(p Plan, snap Snapshot) bool {
+	return p.NextMode == snap.Mode && p.GraceSince == snap.GraceSince &&
+		!p.Poweroff && !p.Wake && !p.Silence && !p.Unsilence &&
 		len(p.Migrate) == 0 && len(p.Stop) == 0 && len(p.Start) == 0
 }
 
@@ -135,7 +137,7 @@ func (c *Controller) logPlan(p Plan) {
 
 // execute applies the plan in a fixed, safe order and persists the resulting state.
 func (c *Controller) execute(ctx context.Context, p Plan, snap Snapshot) error {
-	st := state.State{Mode: snap.Mode, Stopped: snap.StoppedSet}
+	st := state.State{Mode: snap.Mode, Stopped: snap.StoppedSet, GraceSince: p.GraceSince}
 	if refs, err := c.currentSilences(ctx); err == nil {
 		st.Silences = refs
 	}
@@ -186,6 +188,7 @@ func (c *Controller) execute(ctx context.Context, p Plan, snap Snapshot) error {
 	}
 
 	st.Mode = p.NextMode
+	st.GraceSince = p.GraceSince
 	return c.store.Save(ctx, st)
 }
 

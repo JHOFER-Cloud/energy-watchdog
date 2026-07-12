@@ -2,6 +2,7 @@ package controller
 
 import (
 	"testing"
+	"time"
 
 	"gopkg.in/yaml.v3"
 
@@ -10,9 +11,12 @@ import (
 	"github.com/JHOFER-Cloud/energy-watchdog/internal/state"
 )
 
+// testNow is the fixed clock the decision tests decide against.
+var testNow = time.Unix(1_700_000_000, 0)
+
 // testCfg builds a config with the guest classes used across the decision tests:
 // migrate 100-199, stop 300-399, gamingGuard 600-699. Wake at +1000W (SoC>=20),
-// shed below 0W.
+// shed below 0W, with a 10m gaming grace window.
 func testCfg(t *testing.T) *config.Config {
 	t.Helper()
 	var g config.Guests
@@ -24,8 +28,9 @@ gamingGuard: ["600-699"]
 		t.Fatalf("unmarshal guests: %v", err)
 	}
 	return &config.Config{
-		Prometheus: config.Prometheus{HeadroomWatts: 1000, ShedBelowWatts: 0, MinBatteryPercent: 20},
-		Guests:     g,
+		Prometheus:  config.Prometheus{HeadroomWatts: 1000, ShedBelowWatts: 0, MinBatteryPercent: 20},
+		Guests:      g,
+		GamingGrace: config.Duration{Duration: 10 * time.Minute},
 	}
 }
 
@@ -56,6 +61,7 @@ func TestDecide(t *testing.T) {
 		wantWake    bool
 		wantSilence bool
 		wantUnsil   bool
+		wantGrace   int64
 	}{
 		{
 			name:     "running, surplus, holds",
@@ -99,9 +105,15 @@ func TestDecide(t *testing.T) {
 			wantMode: state.ModeShed,
 		},
 		{
-			name:     "shed, node manually powered on -> adopt as gaming",
+			name:     "shed, node manually powered on with VM up -> adopt, clock stopped",
 			snap:     Snapshot{Surplus: -100, SoC: 80, NodeUp: true, Guests: []proxmox.Guest{qemu(601, true)}, Mode: state.ModeShed},
 			wantMode: state.ModeGaming,
+		},
+		{
+			name:      "shed, node manually powered on, no VM yet -> adopt, start grace clock",
+			snap:      Snapshot{Surplus: -100, SoC: 80, NodeUp: true, Guests: []proxmox.Guest{qemu(601, false)}, Mode: state.ModeShed},
+			wantMode:  state.ModeGaming,
+			wantGrace: testNow.Unix(),
 		},
 		{
 			name:      "gaming, surplus -> restart stopped, no wake",
@@ -111,18 +123,42 @@ func TestDecide(t *testing.T) {
 			wantUnsil: true,
 		},
 		{
-			name:      "gaming ends, still deficit -> poweroff",
+			// The bug fix: a freshly-woken host with no VM yet must NOT be powered off; it
+			// starts the grace clock instead.
+			name:      "gaming, no VM yet, clock idle -> start grace, no poweroff",
 			snap:      Snapshot{Surplus: -100, SoC: 80, NodeUp: true, Guests: []proxmox.Guest{qemu(601, false)}, Mode: state.ModeGaming},
+			wantMode:  state.ModeGaming,
+			wantGrace: testNow.Unix(),
+		},
+		{
+			name:      "gaming, no VM, within grace window -> hold, no poweroff",
+			snap:      Snapshot{Surplus: -100, SoC: 80, NodeUp: true, Guests: []proxmox.Guest{qemu(601, false)}, Mode: state.ModeGaming, GraceSince: testNow.Add(-5 * time.Minute).Unix()},
+			wantMode:  state.ModeGaming,
+			wantGrace: testNow.Add(-5 * time.Minute).Unix(),
+		},
+		{
+			name:      "gaming, no VM, grace elapsed -> poweroff",
+			snap:      Snapshot{Surplus: -100, SoC: 80, NodeUp: true, Guests: []proxmox.Guest{qemu(601, false)}, Mode: state.ModeGaming, GraceSince: testNow.Add(-11 * time.Minute).Unix()},
 			wantMode:  state.ModeShed,
 			wantPower: true,
+		},
+		{
+			// Mid-session VM/GPU reboot: the guest reappears while the clock was ticking, so
+			// the clock resets and the host is kept up.
+			name:     "gaming, VM back after reboot -> reset clock, keep host",
+			snap:     Snapshot{Surplus: -100, SoC: 80, NodeUp: true, Guests: []proxmox.Guest{qemu(601, true)}, Mode: state.ModeGaming, GraceSince: testNow.Add(-3 * time.Minute).Unix()},
+			wantMode: state.ModeGaming,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			p := Decide(tt.snap, cfg)
+			p := Decide(tt.snap, cfg, testNow)
 			if p.NextMode != tt.wantMode {
 				t.Errorf("mode = %q, want %q (%s)", p.NextMode, tt.wantMode, p.Reason)
+			}
+			if p.GraceSince != tt.wantGrace {
+				t.Errorf("graceSince = %d, want %d (%s)", p.GraceSince, tt.wantGrace, p.Reason)
 			}
 			if !equal(ids(p.Migrate), tt.wantMigrate) {
 				t.Errorf("migrate = %v, want %v", ids(p.Migrate), tt.wantMigrate)
