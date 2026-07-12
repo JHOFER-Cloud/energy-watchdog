@@ -4,9 +4,7 @@ package controller
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
-	"encoding/json"
+	"fmt"
 	"log/slog"
 	"time"
 
@@ -136,9 +134,6 @@ func (c *Controller) logPlan(p Plan) {
 // execute applies the plan in a fixed, safe order and persists the resulting state.
 func (c *Controller) execute(ctx context.Context, p Plan, snap Snapshot) error {
 	st := state.State{Mode: snap.Mode, Stopped: snap.StoppedSet}
-	if refs, err := c.currentSilences(ctx); err == nil {
-		st.Silences = refs
-	}
 
 	if len(p.Migrate) > 0 {
 		if err := c.migrateAll(ctx, p.Migrate); err != nil {
@@ -153,11 +148,8 @@ func (c *Controller) execute(ctx context.Context, p Plan, snap Snapshot) error {
 			return err
 		}
 	}
-	if p.Silence && len(st.Silences) == 0 {
-		refs, err := c.silenceAll(ctx)
-		st.Silences = refs
-		if err != nil {
-			_ = c.store.Save(ctx, st) // persist whatever we created so wake can clean it up
+	if p.Silence {
+		if err := c.reconcileSilences(ctx, true); err != nil {
 			return err
 		}
 	}
@@ -178,11 +170,10 @@ func (c *Controller) execute(ctx context.Context, p Plan, snap Snapshot) error {
 			return err
 		}
 	}
-	if p.Unsilence && len(st.Silences) > 0 {
-		if err := c.unsilenceAll(ctx, st.Silences); err != nil {
+	if p.Unsilence {
+		if err := c.reconcileSilences(ctx, false); err != nil {
 			return err
 		}
-		st.Silences = nil
 	}
 
 	st.Mode = p.NextMode
@@ -265,112 +256,118 @@ func (c *Controller) wake(ctx context.Context) error {
 	return c.px.WaitNodeUp(wctx, c.cfg.Proxmox.Node)
 }
 
-// currentSilences reloads the persisted silence refs so execute doesn't double-create.
-func (c *Controller) currentSilences(ctx context.Context) ([]state.SilenceRef, error) {
-	st, err := c.store.Load(ctx)
-	if err != nil {
-		return nil, err
-	}
-	return st.Silences, nil
-}
-
-// silenceTTL is how long each Alertmanager silence lasts. reconcileAlertOnly refreshes
-// them before this lapses, so a shutdown longer than the TTL stays covered; if the
-// watchdog itself dies, the silences self-expire within one TTL instead of lingering.
-const silenceTTL = 24 * time.Hour
+// silenceTTL is how long each Alertmanager silence lasts before it self-expires. The
+// controller extends a silence before this lapses, so an arbitrarily long shutdown stays
+// covered; if the watchdog itself dies, its silences self-expire within one TTL instead of
+// lingering. silenceRefresh is how close to expiry a silence may drift before it's extended.
+const (
+	silenceTTL     = 24 * time.Hour
+	silenceRefresh = time.Hour
+)
 
 // reconcileAlertOnly drives Alertmanager silences purely from p1's real power state
-// (DryRunAlert mode): silence when the node is down, drop them when it is back, and
-// refresh before the TTL lapses so an indefinitely-long shutdown stays covered. It takes
-// no Proxmox actions, so it's safe to run before Wake-on-LAN is ready.
+// (DryRunAlert mode): silence when the node is down, drop them when it's back. It takes no
+// Proxmox actions, so it's safe to run before Wake-on-LAN is ready.
 func (c *Controller) reconcileAlertOnly(ctx context.Context, snap Snapshot) {
-	st, err := c.store.Load(ctx)
-	if err != nil {
-		c.log.Error("alert-only: load state", "err", err)
-		return
-	}
-	if snap.NodeUp {
-		if len(st.Silences) > 0 {
-			if err := c.unsilenceAll(ctx, st.Silences); err != nil {
-				c.log.Error("alert-only: unsilence", "err", err)
-				return
-			}
-			st.Silences, st.SilencedAt = nil, 0
-			if err := c.store.Save(ctx, st); err != nil {
-				c.log.Error("alert-only: save", "err", err)
-			}
-		}
-		return
-	}
-	// p1 is down: make sure a fresh silence set matching the current config exists.
-	now := time.Now()
-	want := silenceFingerprint(c.cfg.Alertmanager.URLs, c.cfg.Alertmanager.Silences)
-	stale := len(st.Silences) > 0 && now.Unix()-st.SilencedAt > int64((silenceTTL-time.Hour).Seconds())
-	drifted := st.SilencesFingerprint != want // silence config changed since we last applied it
-	if len(st.Silences) > 0 && !stale && !drifted {
-		return
-	}
-	old := st.Silences
-	refs, err := c.silenceAll(ctx)
-	st.Silences, st.SilencedAt = refs, now.Unix()
-	if err != nil {
-		st.SilencesFingerprint = "" // partial set; force a retry on the next tick
-		c.log.Error("alert-only: silence", "err", err)
-	} else {
-		st.SilencesFingerprint = want
-	}
-	if err := c.store.Save(ctx, st); err != nil {
-		c.log.Error("alert-only: save", "err", err)
-	}
-	if len(old) > 0 { // a fresh set was created above; retire the superseded one
-		if err := c.unsilenceAll(ctx, old); err != nil {
-			c.log.Error("alert-only: retire stale silences", "err", err)
-		}
+	if err := c.reconcileSilences(ctx, !snap.NodeUp); err != nil {
+		c.log.Error("alert-only: reconcile silences", "err", err)
 	}
 }
 
-// silenceFingerprint is a stable digest of the desired silence set (the Alertmanager
-// URLs and every matcher). reconcileAlertOnly recreates silences when it changes, so a
-// config edit takes effect on the next tick instead of lingering until the TTL refresh.
-func silenceFingerprint(urls []string, silences []config.Silence) string {
-	h := sha256.New()
-	_ = json.NewEncoder(h).Encode(struct {
-		URLs     []string         `json:"urls"`
-		Silences []config.Silence `json:"silences"`
-	}{urls, silences})
-	return hex.EncodeToString(h.Sum(nil))
-}
-
-// silenceAll creates every configured silence in every configured Alertmanager and
-// returns a ref per (alertmanager, silence) so each can be deleted from the right one.
-func (c *Controller) silenceAll(ctx context.Context) ([]state.SilenceRef, error) {
-	var refs []state.SilenceRef
+// reconcileSilences makes the energy-watchdog silences in every configured Alertmanager
+// match the desired set: the configured silences when silence is true (p1 down), or none
+// when false (p1 up). It never persists silence ids - it recognises its own silences by
+// createdBy on each Alertmanager - so a lost or stale ConfigMap can't orphan them, and any
+// orphans from an earlier run are cleaned up here. Each Alertmanager is reconciled
+// independently, so one being unreachable doesn't disturb the others.
+func (c *Controller) reconcileSilences(ctx context.Context, silence bool) error {
+	var desired []config.Silence
+	if silence {
+		desired = c.cfg.Alertmanager.Silences
+	}
+	var firstErr error
 	for _, url := range c.cfg.Alertmanager.URLs {
-		am := c.ams[url]
-		for _, s := range c.cfg.Alertmanager.Silences {
-			id, err := am.Create(ctx, s.Matchers, c.cfg.Alertmanager.Comment, silenceTTL, time.Now())
-			if err != nil {
-				return refs, err // return what we have so far so they can be cleaned up on wake
+		if err := c.reconcileSilencesAt(ctx, url, desired); err != nil {
+			c.log.Error("reconcile silences", "url", url, "err", err)
+			if firstErr == nil {
+				firstErr = err
 			}
-			refs = append(refs, state.SilenceRef{URL: url, ID: id})
-			c.log.Info("created alertmanager silence", "url", url, "id", id)
 		}
 	}
-	return refs, nil
+	return firstErr
 }
 
-// unsilenceAll deletes each persisted silence from the Alertmanager it was created in.
-func (c *Controller) unsilenceAll(ctx context.Context, refs []state.SilenceRef) error {
-	for _, ref := range refs {
-		am := c.ams[ref.URL]
-		if am == nil {
-			c.log.Warn("no client for silenced alertmanager, skipping delete", "url", ref.URL, "id", ref.ID)
+// reconcileSilencesAt converges one Alertmanager to `desired`: it creates any desired
+// silence that's missing, extends one that's drifting toward expiry, and deletes every
+// other silence of ours (duplicates left by the old create-every-tick behaviour, silences
+// from a since-changed config, or all of them when p1 is back up). Coverage is never
+// dropped mid-run: creates and extensions happen before any delete.
+func (c *Controller) reconcileSilencesAt(ctx context.Context, url string, desired []config.Silence) error {
+	am := c.ams[url]
+	if am == nil {
+		return fmt.Errorf("no client for alertmanager %s", url)
+	}
+	existing, err := am.List(ctx)
+	if err != nil {
+		return err
+	}
+	now := time.Now()
+
+	// Index our live silences by canonical key, keeping the latest-expiring one per key and
+	// marking any others (duplicates) for deletion.
+	ours := map[string]alertmgr.Silence{}
+	var surplus []alertmgr.Silence
+	for _, s := range existing {
+		if s.CreatedBy != alertmgr.CreatedBy || (s.Status.State != "active" && s.Status.State != "pending") {
 			continue
 		}
-		if err := am.Delete(ctx, ref.ID); err != nil {
+		if cur, ok := ours[s.Key()]; ok {
+			if s.EndsAt.After(cur.EndsAt) {
+				surplus = append(surplus, cur)
+				ours[s.Key()] = s
+			} else {
+				surplus = append(surplus, s)
+			}
+		} else {
+			ours[s.Key()] = s
+		}
+	}
+
+	// Ensure each desired silence exists and isn't about to expire.
+	wanted := map[string]bool{}
+	for _, d := range desired {
+		key := alertmgr.DesiredKey(c.cfg.Alertmanager.Comment, d.Matchers)
+		wanted[key] = true
+		switch s, ok := ours[key]; {
+		case !ok:
+			id, err := am.Create(ctx, d.Matchers, c.cfg.Alertmanager.Comment, silenceTTL, now)
+			if err != nil {
+				return err
+			}
+			c.log.Info("created alertmanager silence", "url", url, "id", id)
+		case s.EndsAt.Sub(now) < silenceRefresh:
+			if _, err := am.Update(ctx, s.ID, d.Matchers, c.cfg.Alertmanager.Comment, silenceTTL, now); err != nil {
+				return err
+			}
+			c.log.Info("extended alertmanager silence", "url", url, "id", s.ID)
+		}
+	}
+
+	// Retire duplicates and anything of ours that's no longer wanted.
+	for _, s := range surplus {
+		if err := am.Delete(ctx, s.ID); err != nil {
 			return err
 		}
-		c.log.Info("removed alertmanager silence", "url", ref.URL, "id", ref.ID)
+		c.log.Info("removed duplicate alertmanager silence", "url", url, "id", s.ID)
+	}
+	for key, s := range ours {
+		if wanted[key] {
+			continue
+		}
+		if err := am.Delete(ctx, s.ID); err != nil {
+			return err
+		}
+		c.log.Info("removed alertmanager silence", "url", url, "id", s.ID)
 	}
 	return nil
 }

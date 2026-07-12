@@ -51,6 +51,10 @@ func TestExecuteShedCycle(t *testing.T) {
 	defer px.Close()
 
 	am := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet { // List during reconcile: no silences yet.
+			_, _ = w.Write([]byte(`[]`))
+			return
+		}
 		record("silence")
 		_, _ = io.Copy(io.Discard, r.Body)
 		_, _ = w.Write([]byte(`{"silenceID":"sil-1"}`))
@@ -102,7 +106,8 @@ func TestExecuteShedCycle(t *testing.T) {
 		}
 	}
 
-	// State persisted: shed mode, 301 recorded as stopped, silence id stored.
+	// State persisted: shed mode and 301 recorded as stopped. Silences are no longer
+	// tracked in state - they're reconciled against Alertmanager by createdBy.
 	st, err := state.NewFileStore(statePath).Load(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -112,8 +117,5 @@ func TestExecuteShedCycle(t *testing.T) {
 	}
 	if len(st.Stopped) != 1 || st.Stopped[0].VMID != 301 {
 		t.Errorf("stopped = %+v, want [301]", st.Stopped)
-	}
-	if len(st.Silences) != 1 || st.Silences[0].ID != "sil-1" || st.Silences[0].URL != am.URL {
-		t.Errorf("silences = %+v, want one sil-1 for %s", st.Silences, am.URL)
 	}
 }

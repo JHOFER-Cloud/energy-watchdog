@@ -10,10 +10,16 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/JHOFER-Cloud/energy-watchdog/internal/config"
 )
+
+// CreatedBy is stamped as the createdBy of every silence this client creates, and is how
+// the controller recognises its own silences when reconciling (without persisting ids).
+const CreatedBy = "energy-watchdog"
 
 // Client is a minimal Alertmanager v2 silences client.
 type Client struct {
@@ -39,8 +45,78 @@ type silenceMatcher struct {
 	IsEqual bool   `json:"isEqual"`
 }
 
-// Create posts a silence active until now+ttl and returns its id.
+// Silence is an existing silence as returned by Alertmanager, carrying just the fields
+// the controller needs to recognise its own silences and reconcile them.
+type Silence struct {
+	ID        string           `json:"id"`
+	CreatedBy string           `json:"createdBy"`
+	Comment   string           `json:"comment"`
+	Matchers  []silenceMatcher `json:"matchers"`
+	EndsAt    time.Time        `json:"endsAt"`
+	Status    struct {
+		State string `json:"state"` // "active", "pending" or "expired"
+	} `json:"status"`
+}
+
+// Key is a canonical, order-independent digest of this silence's comment and matchers.
+// Two silences with the same Key are considered the same silence, so the controller can
+// recognise the ones it created (matching a DesiredKey) regardless of their id.
+func (s Silence) Key() string {
+	parts := make([]string, len(s.Matchers))
+	for i, m := range s.Matchers {
+		parts[i] = fmt.Sprintf("%s\x1f%s\x1f%t\x1f%t", m.Name, m.Value, m.IsRegex, m.IsEqual)
+	}
+	sort.Strings(parts)
+	return s.Comment + "\x1e" + strings.Join(parts, "\x1d")
+}
+
+// DesiredKey builds the same canonical digest as Silence.Key for a configured silence, so
+// a desired silence and an existing one can be compared by string. Configured matchers are
+// always equality matchers (isEqual=true), mirroring what Create posts.
+func DesiredKey(comment string, matchers []config.Matcher) string {
+	s := Silence{Comment: comment, Matchers: make([]silenceMatcher, len(matchers))}
+	for i, m := range matchers {
+		s.Matchers[i] = silenceMatcher{Name: m.Name, Value: m.Value, IsRegex: m.IsRegex, IsEqual: true}
+	}
+	return s.Key()
+}
+
+// List returns every silence Alertmanager currently holds (active, pending and expired).
+func (c *Client) List(ctx context.Context) ([]Silence, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.base+"/api/v2/silences", nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	data, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= http.StatusMultipleChoices {
+		return nil, fmt.Errorf("list silences: %s: %s", resp.Status, data)
+	}
+	var out []Silence
+	if err := json.Unmarshal(data, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// Create posts a new silence active until now+ttl and returns its id.
 func (c *Client) Create(ctx context.Context, matchers []config.Matcher, comment string, ttl time.Duration, now time.Time) (string, error) {
+	return c.post(ctx, "", matchers, comment, ttl, now)
+}
+
+// Update extends an existing silence (by id) to now+ttl, reusing it instead of creating a
+// fresh one. Alertmanager treats a POST that carries an id as an in-place update, so a
+// long shutdown just pushes the same silence's endsAt out rather than churning ids.
+func (c *Client) Update(ctx context.Context, id string, matchers []config.Matcher, comment string, ttl time.Duration, now time.Time) (string, error) {
+	return c.post(ctx, id, matchers, comment, ttl, now)
+}
+
+// post creates (id == "") or updates (id != "") a silence and returns its id.
+func (c *Client) post(ctx context.Context, id string, matchers []config.Matcher, comment string, ttl time.Duration, now time.Time) (string, error) {
 	ms := make([]silenceMatcher, 0, len(matchers))
 	for _, m := range matchers {
 		ms = append(ms, silenceMatcher{Name: m.Name, Value: m.Value, IsRegex: m.IsRegex, IsEqual: true})
@@ -49,8 +125,11 @@ func (c *Client) Create(ctx context.Context, matchers []config.Matcher, comment 
 		"matchers":  ms,
 		"startsAt":  now.UTC().Format(time.RFC3339),
 		"endsAt":    now.Add(ttl).UTC().Format(time.RFC3339),
-		"createdBy": "energy-watchdog",
+		"createdBy": CreatedBy,
 		"comment":   comment,
+	}
+	if id != "" {
+		payload["id"] = id
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {
@@ -68,7 +147,7 @@ func (c *Client) Create(ctx context.Context, matchers []config.Matcher, comment 
 	defer resp.Body.Close()
 	data, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode >= http.StatusMultipleChoices {
-		return "", fmt.Errorf("create silence: %s: %s", resp.Status, data)
+		return "", fmt.Errorf("post silence: %s: %s", resp.Status, data)
 	}
 	var out struct {
 		SilenceID string `json:"silenceID"`
@@ -81,7 +160,7 @@ func (c *Client) Create(ctx context.Context, matchers []config.Matcher, comment 
 
 // Delete removes a silence by id. A 404 is treated as already-gone.
 func (c *Client) Delete(ctx context.Context, id string) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, c.base+"/api/v2/silences/"+id, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, c.base+"/api/v2/silence/"+id, nil)
 	if err != nil {
 		return err
 	}
