@@ -33,24 +33,12 @@ type GuestRef struct {
 	Type string `json:"type"`
 }
 
-// SilenceRef ties a created silence to the Alertmanager it lives in, so it can be
-// deleted from the right one on wake.
-type SilenceRef struct {
-	URL string `json:"url"`
-	ID  string `json:"id"`
-}
-
-// State is the persisted controller state.
+// State is the persisted controller state. Silences are deliberately not tracked here:
+// they're reconciled directly against Alertmanager (identified by their createdBy), so a
+// lost or stale ConfigMap can't orphan them.
 type State struct {
-	Mode     Mode         `json:"mode"`
-	Stopped  []GuestRef   `json:"stopped"`
-	Silences []SilenceRef `json:"silences"`
-	// SilencedAt is the unix time the current silences were (re)created, so they can be
-	// refreshed before their TTL lapses during a long shutdown. 0 when not silenced.
-	SilencedAt int64 `json:"silencedAt,omitempty"`
-	// SilencesFingerprint digests the config that produced the current silences, so a
-	// changed silence config is re-applied on the next tick instead of waiting out the TTL.
-	SilencesFingerprint string `json:"silencesFingerprint,omitempty"`
+	Mode    Mode       `json:"mode"`
+	Stopped []GuestRef `json:"stopped"`
 	// GraceSince is the unix time the gaming-session grace clock started ticking: it is
 	// set when p1 is up in ModeGaming with no gaming guest running, and reset to 0 the
 	// moment a gaming guest is seen (or the session ends). p1 isn't powered off until the

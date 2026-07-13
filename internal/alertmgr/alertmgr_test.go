@@ -21,7 +21,7 @@ func TestCreateAndDelete(t *testing.T) {
 			_ = json.Unmarshal(body, &gotBody)
 			_, _ = w.Write([]byte(`{"silenceID":"abc-123"}`))
 		case http.MethodDelete:
-			if r.URL.Path != "/api/v2/silences/abc-123" {
+			if r.URL.Path != "/api/v2/silence/abc-123" {
 				t.Errorf("delete path = %s", r.URL.Path)
 			}
 			w.WriteHeader(http.StatusOK)
@@ -49,6 +49,49 @@ func TestCreateAndDelete(t *testing.T) {
 
 	if err := c.Delete(context.Background(), "abc-123"); err != nil {
 		t.Errorf("Delete: %v", err)
+	}
+}
+
+func TestUpdateCarriesID(t *testing.T) {
+	var gotBody map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(body, &gotBody)
+		_, _ = w.Write([]byte(`{"silenceID":"abc-123"}`))
+	}))
+	defer srv.Close()
+
+	now := time.Date(2026, 6, 8, 22, 0, 0, 0, time.UTC)
+	id, err := New(srv.URL, nil).Update(context.Background(), "abc-123",
+		[]config.Matcher{{Name: "node", Value: ".*-p1", IsRegex: true}}, "shutdown", time.Hour, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id != "abc-123" {
+		t.Errorf("id = %q, want abc-123", id)
+	}
+	if gotBody["id"] != "abc-123" {
+		t.Errorf("update must carry the id in the body, got %v", gotBody["id"])
+	}
+}
+
+func TestList(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`[{"id":"s1","createdBy":"energy-watchdog","comment":"c",
+			"endsAt":"2026-06-09T22:00:00Z","status":{"state":"active"},
+			"matchers":[{"name":"node","value":".*-p1","isRegex":true,"isEqual":true}]}]`))
+	}))
+	defer srv.Close()
+
+	sils, err := New(srv.URL, nil).List(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sils) != 1 || sils[0].ID != "s1" || sils[0].CreatedBy != CreatedBy {
+		t.Fatalf("List = %+v", sils)
+	}
+	if sils[0].Key() != DesiredKey("c", []config.Matcher{{Name: "node", Value: ".*-p1", IsRegex: true}}) {
+		t.Errorf("Key should match DesiredKey for the same comment+matchers")
 	}
 }
 

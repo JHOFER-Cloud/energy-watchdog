@@ -77,8 +77,10 @@ nodes. It stays reachable while `p1` is off because it routes to another node, a
 node can manage `p1`'s guests cluster-internally. TLS verifies against the internal CA
 via `caCertPath` (mounted from the jhc-ca image), so `insecureSkipVerify` stays off.
 
-State (the mode, the guests it stopped, the silence id) goes in a ConfigMap in-cluster,
-or a local file when you run it by hand.
+State (the mode and the guests it stopped) goes in a ConfigMap in-cluster, or a local file
+when you run it by hand. Alertmanager silences are not stored there: each reconcile lists
+the silences it owns (by their `createdBy`) straight from Alertmanager and converges them to
+the set it wants, so a lost or stale ConfigMap can never orphan a silence.
 
 ## Rolling it out
 
