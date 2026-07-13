@@ -39,6 +39,12 @@ type GuestRef struct {
 type State struct {
 	Mode    Mode       `json:"mode"`
 	Stopped []GuestRef `json:"stopped"`
+	// GraceSince is the unix time the gaming-session grace clock started ticking: it is
+	// set when p1 is up in ModeGaming with no gaming guest running, and reset to 0 the
+	// moment a gaming guest is seen (or the session ends). p1 isn't powered off until the
+	// clock exceeds the grace window, so a freshly-woken host with no VM yet, or a
+	// GPU-passthrough/VM reboot mid-session, isn't cut short. 0 when the clock isn't running.
+	GraceSince int64 `json:"graceSince,omitempty"`
 }
 
 // Store loads and saves State.
