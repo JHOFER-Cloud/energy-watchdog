@@ -36,7 +36,7 @@ Two things stop it thrashing:
 | `shed` | host got powered on by hand | treat it as `gaming`, don't fight a manual wake |
 | `gaming` | surplus is back | start the stopped guests (host's already on) |
 | `gaming` | no gaming VM yet, within grace | leave the host on, wait for a VM |
-| `gaming` | no gaming VM once grace elapses, still a deficit | power off |
+| `gaming` | no gaming VM once grace elapses, still no surplus | power off |
 
 Migrated guests don't come back on their own. They stay where they landed; moving them
 back is a manual call.
