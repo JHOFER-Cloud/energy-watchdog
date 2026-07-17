@@ -33,3 +33,28 @@ func TestHandler(t *testing.T) {
 		}
 	}
 }
+
+// TestMarkStaleKeepsLastGood: a failed tick must not zero the gauges. Only the success flag
+// (and tick) move, so a transient observe error doesn't flap surplus/mode on the dashboard.
+func TestMarkStaleKeepsLastGood(t *testing.T) {
+	m := New(false)
+	m.Update(Sample{Surplus: 1800, SoC: 73.5, NodeUp: true, Mode: "running", Tick: 1700000000, OK: true})
+	m.MarkStale(1700000060)
+
+	rr := httptest.NewRecorder()
+	m.Handler()(rr, httptest.NewRequest("GET", "/metrics", nil))
+	body := rr.Body.String()
+
+	for _, want := range []string{
+		"energy_watchdog_surplus_watts 1800",       // preserved, not zeroed
+		"energy_watchdog_battery_percent 73.5",     // preserved
+		"energy_watchdog_node_up 1",                // preserved
+		`energy_watchdog_mode{mode="running"} 1`,   // preserved
+		"energy_watchdog_last_reconcile_success 0", // the failure is visible
+		"energy_watchdog_last_reconcile_timestamp_seconds 1700000060",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("after MarkStale, metrics missing %q\n--- got ---\n%s", want, body)
+		}
+	}
+}

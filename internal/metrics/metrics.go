@@ -61,6 +61,17 @@ func (m *Metrics) Update(s Sample) {
 	m.mode, m.lastTick, m.lastOK = s.Mode, s.Tick, s.OK
 }
 
+// MarkStale records that a reconcile tick failed, without overwriting the last good
+// reading. The surplus/mode/node gauges keep their previous values so a transient observe
+// error (e.g. a single Proxmox 502) doesn't flap them to zero on the dashboard; only the
+// tick time and the success flag move, so failures are still observable via
+// energy_watchdog_last_reconcile_success.
+func (m *Metrics) MarkStale(tick int64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.lastTick, m.lastOK = tick, false
+}
+
 func b2f(b bool) float64 {
 	if b {
 		return 1

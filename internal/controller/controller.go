@@ -1,5 +1,7 @@
 // Package controller runs the reconcile loop: observe solar + Proxmox, Decide a Plan,
-// then (unless dry-run) execute it and persist state.
+// then apply it. Full mode executes the physical actions and persists the new state; the
+// dry-run modes persist the decision (so the mode still latches) but take no physical action,
+// which makes a dry run a faithful preview of what live would decide.
 package controller
 
 import (
@@ -26,7 +28,13 @@ type Controller struct {
 	store   state.Store
 	metrics *metrics.Metrics
 	log     *slog.Logger
+
+	observeFailures int // consecutive failed observes, for log-level escalation
 }
+
+// observeFailEscalate is how many back-to-back failed observes are tolerated at warn before
+// the failure is logged at error: a transient blip stays quiet, a sustained outage gets loud.
+const observeFailEscalate = 5
 
 // New builds a Controller. ams is keyed by Alertmanager base URL so a persisted
 // silence can be deleted from the same Alertmanager it was created in.
@@ -53,10 +61,21 @@ func (c *Controller) reconcile(ctx context.Context) {
 	now := time.Now()
 	snap, gaming, err := c.observe(ctx)
 	if err != nil {
-		c.log.Error("observe failed", "err", err)
-		c.metrics.Update(metrics.Sample{Mode: string(snap.Mode), Tick: now.Unix(), OK: false})
+		// A failed observe is tolerated: the tick is skipped and the last good reading is kept
+		// (publishing a zeroed sample here made a single transient Proxmox 502 flap
+		// surplus/mode to zero on the dashboard), with the failure still visible via
+		// energy_watchdog_last_reconcile_success. Transient blips are expected, so log at warn
+		// and only escalate to error once they're clearly sustained.
+		c.observeFailures++
+		if c.observeFailures >= observeFailEscalate {
+			c.log.Error("observe failing repeatedly", "err", err, "consecutive", c.observeFailures)
+		} else {
+			c.log.Warn("observe failed", "err", err, "consecutive", c.observeFailures)
+		}
+		c.metrics.MarkStale(now.Unix())
 		return
 	}
+	c.observeFailures = 0
 
 	plan := Decide(snap, c.cfg, now)
 	c.log.Info("decision",
@@ -69,22 +88,43 @@ func (c *Controller) reconcile(ctx context.Context) {
 	}
 	c.metrics.Update(sample)
 
-	if c.cfg.DryRun == config.DryRunAlert {
-		c.reconcileAlertOnly(ctx, snap)
-		return
-	}
-	if isNoop(plan, snap) {
-		return
-	}
-	if c.cfg.DryRun == config.DryRunLog {
-		c.logPlan(plan)
-		return
-	}
-	if err := c.execute(ctx, plan, snap); err != nil {
-		c.log.Error("execute failed", "err", err)
+	if err := c.apply(ctx, plan, snap); err != nil {
+		c.log.Error("apply failed", "err", err)
 		sample.Mode, sample.OK = string(snap.Mode), false
 		c.metrics.Update(sample)
 	}
+}
+
+// apply carries out the plan at the configured dry-run level. The physical Proxmox/WoL
+// actions run only in full mode; alert additionally reconciles Alertmanager silences from
+// p1's real power state. The state machine is advanced and persisted in *every* mode:
+// skipping the physical actions must not skip the bookkeeping, or the mode never latches and
+// a dry run can't preview what live would decide. Alert's silences track the real node state,
+// independent of the (possibly simulated) mode, so they reconcile every tick.
+func (c *Controller) apply(ctx context.Context, p Plan, snap Snapshot) error {
+	if c.cfg.DryRun == config.DryRunAlert {
+		c.reconcileAlertOnly(ctx, snap)
+	}
+	if isNoop(p, snap) {
+		return nil
+	}
+	if c.cfg.DryRun == config.DryRunFull {
+		return c.execute(ctx, p, snap) // physical actions + plan-driven silences + persist
+	}
+	// log / alert: advance the state machine, but take no physical action.
+	c.logPlan(p)
+	return c.persist(ctx, p, snap)
+}
+
+// persist advances the stored state to the plan's mode and grace clock without taking any
+// physical action - used by the dry-run modes so the state machine latches tick to tick just
+// as live would. The stopped-guest set carries through unchanged (nothing was stopped).
+func (c *Controller) persist(ctx context.Context, p Plan, snap Snapshot) error {
+	return c.store.Save(ctx, state.State{
+		Mode:       p.NextMode,
+		Stopped:    snap.StoppedSet,
+		GraceSince: p.GraceSince,
+	})
 }
 
 // observe gathers the snapshot and reports whether a gaming guest is running.
