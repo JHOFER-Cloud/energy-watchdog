@@ -119,3 +119,56 @@ func TestExecuteShedCycle(t *testing.T) {
 		t.Errorf("stopped = %+v, want [301]", st.Stopped)
 	}
 }
+
+// TestApplyPersistsDryRunTransition: in a dry-run mode the state machine must still advance
+// and persist (only the physical actions are skipped), so the mode latches tick to tick and
+// the dashboard previews what live would decide.
+func TestApplyPersistsDryRunTransition(t *testing.T) {
+	statePath := filepath.Join(t.TempDir(), "state.json")
+	c := dryRunController(t, config.DryRunLog, statePath)
+
+	// RUNNING->SHED with the physical intents set; log mode persists the transition but must
+	// touch no Proxmox/WoL (the clients point at unused URLs, so any call would error).
+	plan := Plan{Poweroff: true, NextMode: state.ModeShed}
+	if err := c.apply(context.Background(), plan, Snapshot{Mode: state.ModeRunning}); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	st, err := state.NewFileStore(statePath).Load(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Mode != state.ModeShed {
+		t.Errorf("mode = %q, want shed (dry-run must advance + persist state)", st.Mode)
+	}
+}
+
+// TestApplyNoopDoesNotPersist: when the plan changes nothing there must be no write, so the
+// state ConfigMap doesn't churn every tick. A store left unwritten loads the default mode.
+func TestApplyNoopDoesNotPersist(t *testing.T) {
+	statePath := filepath.Join(t.TempDir(), "state.json")
+	c := dryRunController(t, config.DryRunLog, statePath)
+
+	if err := c.apply(context.Background(), Plan{NextMode: state.ModeShed}, Snapshot{Mode: state.ModeShed}); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	st, err := state.NewFileStore(statePath).Load(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Mode != state.ModeRunning { // default; proves nothing was written
+		t.Errorf("mode = %q, want running (noop must not persist)", st.Mode)
+	}
+}
+
+func dryRunController(t *testing.T, dry config.DryRunMode, statePath string) *Controller {
+	t.Helper()
+	return New(
+		&config.Config{DryRun: dry},
+		prom.New("http://unused"),
+		proxmox.New("http://unused", "u@pam!t", "s", nil),
+		map[string]*alertmgr.Client{},
+		state.NewFileStore(statePath),
+		metrics.New(true),
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+	)
+}
