@@ -74,6 +74,11 @@ alertmanager:
   urls:
     - http://kube-prometheus-stack-alertmanager.monitoring.svc.cluster.local:9093
   comment: "p1 powered down by energy-watchdog (solar deficit)"
+  # How long a silence is left to lapse once p1's node reports up, instead of being dropped
+  # the instant it does. The node coming back doesn't mean the guests hosted on it are up too
+  # (a Talos cluster takes a while to boot), so this window keeps their alerts suppressed
+  # until they've had a chance to come back. Default 15m.
+  unsilenceGrace: 15m
   # Each entry is one silence (its matchers are AND-ed). Scope each to p1's own label
   # values so an identical alert firing for another node isn't shadowed.
   silences:

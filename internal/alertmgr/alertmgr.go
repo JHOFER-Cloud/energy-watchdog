@@ -105,22 +105,34 @@ func (c *Client) List(ctx context.Context) ([]Silence, error) {
 
 // Create posts a new silence active until now+ttl and returns its id.
 func (c *Client) Create(ctx context.Context, matchers []config.Matcher, comment string, ttl time.Duration, now time.Time) (string, error) {
-	return c.post(ctx, "", matchers, comment, ttl, now)
+	return c.post(ctx, "", toMatchers(matchers), comment, ttl, now)
 }
 
 // Update extends an existing silence (by id) to now+ttl, reusing it instead of creating a
 // fresh one. Alertmanager treats a POST that carries an id as an in-place update, so a
 // long shutdown just pushes the same silence's endsAt out rather than churning ids.
 func (c *Client) Update(ctx context.Context, id string, matchers []config.Matcher, comment string, ttl time.Duration, now time.Time) (string, error) {
-	return c.post(ctx, id, matchers, comment, ttl, now)
+	return c.post(ctx, id, toMatchers(matchers), comment, ttl, now)
+}
+
+// Reschedule reposts an existing silence unchanged except for its window, moving it to
+// [now, now+ttl]. It's used to shorten a silence to a short grace window instead of deleting
+// it outright, so coverage lapses gently rather than vanishing in one tick. It reuses the
+// silence's own matchers and comment, so the caller needn't reconstruct them.
+func (c *Client) Reschedule(ctx context.Context, s Silence, ttl time.Duration, now time.Time) (string, error) {
+	return c.post(ctx, s.ID, s.Matchers, s.Comment, ttl, now)
+}
+
+func toMatchers(ms []config.Matcher) []silenceMatcher {
+	out := make([]silenceMatcher, 0, len(ms))
+	for _, m := range ms {
+		out = append(out, silenceMatcher{Name: m.Name, Value: m.Value, IsRegex: m.IsRegex, IsEqual: true})
+	}
+	return out
 }
 
 // post creates (id == "") or updates (id != "") a silence and returns its id.
-func (c *Client) post(ctx context.Context, id string, matchers []config.Matcher, comment string, ttl time.Duration, now time.Time) (string, error) {
-	ms := make([]silenceMatcher, 0, len(matchers))
-	for _, m := range matchers {
-		ms = append(ms, silenceMatcher{Name: m.Name, Value: m.Value, IsRegex: m.IsRegex, IsEqual: true})
-	}
+func (c *Client) post(ctx context.Context, id string, ms []silenceMatcher, comment string, ttl time.Duration, now time.Time) (string, error) {
 	payload := map[string]any{
 		"matchers":  ms,
 		"startsAt":  now.UTC().Format(time.RFC3339),

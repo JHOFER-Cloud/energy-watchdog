@@ -164,9 +164,10 @@ type Guests struct {
 // silencing. Each Silence is created separately (per label dimension) so p1 is silenced
 // precisely instead of with one broad match.
 type Alertmanager struct {
-	URLs     []string  `yaml:"urls"`
-	Comment  string    `yaml:"comment"`
-	Silences []Silence `yaml:"silences"`
+	URLs           []string  `yaml:"urls"`
+	Comment        string    `yaml:"comment"`
+	UnsilenceGrace Duration  `yaml:"unsilenceGrace"`
+	Silences       []Silence `yaml:"silences"`
 }
 
 // Silence is one Alertmanager silence; its matchers are AND-ed together.
@@ -222,6 +223,9 @@ func (c *Config) defaults() {
 	}
 	if c.GamingGrace.Duration == 0 {
 		c.GamingGrace = Duration{10 * time.Minute}
+	}
+	if c.Alertmanager.UnsilenceGrace.Duration == 0 {
+		c.Alertmanager.UnsilenceGrace = Duration{15 * time.Minute}
 	}
 	if c.Prometheus.Window == "" {
 		c.Prometheus.Window = "30m"

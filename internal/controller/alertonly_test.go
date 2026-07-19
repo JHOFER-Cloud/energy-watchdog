@@ -38,9 +38,10 @@ func alertCfg(am string, silences ...config.Silence) *config.Config {
 	return &config.Config{
 		DryRun: config.DryRunAlert,
 		Alertmanager: config.Alertmanager{
-			URLs:     []string{am},
-			Comment:  "p1 down",
-			Silences: silences,
+			URLs:           []string{am},
+			Comment:        "p1 down",
+			UnsilenceGrace: config.Duration{Duration: 30 * time.Minute},
+			Silences:       silences,
 		},
 	}
 }
@@ -51,7 +52,7 @@ func sil(name, value string) config.Silence {
 
 // TestReconcileAlertOnlyLifecycle covers DryRunAlert: a silence set is created when p1 goes
 // down, left untouched while it's healthy (no churn), grown when the config gains a silence,
-// and fully cleared when p1 comes back.
+// and grace-expired (not dropped outright) when p1 comes back.
 func TestReconcileAlertOnlyLifecycle(t *testing.T) {
 	am := newFakeAM()
 	defer am.Close()
@@ -84,13 +85,57 @@ func TestReconcileAlertOnlyLifecycle(t *testing.T) {
 		t.Errorf("active silences = %d, want 3", am.activeOurs())
 	}
 
-	// p1 back up: every silence of ours is removed.
+	// p1 back up: coverage isn't dropped outright but each silence is shortened to the grace
+	// window (an in-place update), so it stays active for now and lapses on its own later.
 	c.reconcileAlertOnly(ctx, Snapshot{NodeUp: true})
-	if _, _, del := am.counts(); del != 3 {
-		t.Errorf("after wake: deletes=%d, want 3", del)
+	if cr, up, del := am.counts(); cr != 3 || up != 3 || del != 0 {
+		t.Errorf("after wake: creates=%d updates=%d deletes=%d, want 3/3/0 (grace-expired, not deleted)", cr, up, del)
 	}
-	if am.activeOurs() != 0 {
-		t.Errorf("active silences after wake = %d, want 0", am.activeOurs())
+	if am.activeOurs() != 3 {
+		t.Errorf("active silences after wake = %d, want 3 (still within grace)", am.activeOurs())
+	}
+}
+
+// TestReconcileUnsilenceGrace: when p1 comes back up, a silence is shortened to the grace
+// window and left to lapse rather than deleted; it isn't pushed out again on later up-ticks
+// (which would keep it alive forever); and if p1 drops again inside the window it's extended
+// back out to restore coverage.
+func TestReconcileUnsilenceGrace(t *testing.T) {
+	am := newFakeAM()
+	defer am.Close()
+	c := ctlWithAMs(alertCfg(am.URL(), sil("node", ".*-p1")), am.URL())
+	ctx := context.Background()
+
+	// p1 down: create the silence (ends ~24h out).
+	c.reconcileAlertOnly(ctx, Snapshot{NodeUp: false})
+	if cr, _, _ := am.counts(); cr != 1 {
+		t.Fatalf("creates=%d, want 1", cr)
+	}
+
+	// p1 back up: shorten to the grace window (an update), don't delete.
+	c.reconcileAlertOnly(ctx, Snapshot{NodeUp: true})
+	if cr, up, del := am.counts(); cr != 1 || up != 1 || del != 0 {
+		t.Fatalf("first wake: creates=%d updates=%d deletes=%d, want 1/1/0", cr, up, del)
+	}
+	if am.activeOurs() != 1 {
+		t.Fatalf("silence should stay active within grace, activeOurs=%d", am.activeOurs())
+	}
+
+	// Still up: the silence now ends inside the grace window, so it's left to lapse - no further
+	// write (the bug would re-shorten it every tick and it would never expire).
+	c.reconcileAlertOnly(ctx, Snapshot{NodeUp: true})
+	if cr, up, del := am.counts(); cr != 1 || up != 1 || del != 0 {
+		t.Errorf("second wake churned the grace window: creates=%d updates=%d deletes=%d, want 1/1/0", cr, up, del)
+	}
+
+	// p1 drops again inside the window: the same silence is extended back out (it ends < the 1h
+	// refresh window), restoring full coverage.
+	c.reconcileAlertOnly(ctx, Snapshot{NodeUp: false})
+	if cr, up, del := am.counts(); cr != 1 || up != 2 || del != 0 {
+		t.Errorf("re-silence during grace: creates=%d updates=%d deletes=%d, want 1/2/0", cr, up, del)
+	}
+	if am.activeOurs() != 1 {
+		t.Errorf("activeOurs=%d, want 1", am.activeOurs())
 	}
 }
 
