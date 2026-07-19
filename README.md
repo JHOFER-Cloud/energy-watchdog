@@ -82,6 +82,12 @@ when you run it by hand. Alertmanager silences are not stored there: each reconc
 the silences it owns (by their `createdBy`) straight from Alertmanager and converges them to
 the set it wants, so a lost or stale ConfigMap can never orphan a silence.
 
+When `p1` comes back, its silences aren't dropped the instant the node reports up — the
+guests hosted on it (a Talos cluster) take a while to boot, and dropping coverage that early
+un-suppresses every one of their still-firing alerts at once. Instead each silence is
+shortened to a grace window (`unsilenceGrace`, default 15m) and left to lapse on its own; if
+`p1` drops again inside the window the silence is simply extended back out.
+
 ## Rolling it out
 
 It ships with `dryRun: true`. In that mode it reads everything and logs what it would

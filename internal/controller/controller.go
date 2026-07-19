@@ -330,7 +330,10 @@ func (c *Controller) reconcileSilences(ctx context.Context, silence bool) error 
 	}
 	var firstErr error
 	for _, url := range c.cfg.Alertmanager.URLs {
-		if err := c.reconcileSilencesAt(ctx, url, desired); err != nil {
+		// When silencing, anything of ours that isn't desired is a stale-config orphan and is
+		// removed at once. When unsilencing (p1 back up), drop coverage via the grace window
+		// instead, so guests still booting on the node aren't un-suppressed the same tick.
+		if err := c.reconcileSilencesAt(ctx, url, desired, !silence); err != nil {
 			c.log.Error("reconcile silences", "url", url, "err", err)
 			if firstErr == nil {
 				firstErr = err
@@ -341,11 +344,13 @@ func (c *Controller) reconcileSilences(ctx context.Context, silence bool) error 
 }
 
 // reconcileSilencesAt converges one Alertmanager to `desired`: it creates any desired
-// silence that's missing, extends one that's drifting toward expiry, and deletes every
+// silence that's missing, extends one that's drifting toward expiry, and retires every
 // other silence of ours (duplicates left by the old create-every-tick behaviour, silences
 // from a since-changed config, or all of them when p1 is back up). Coverage is never
-// dropped mid-run: creates and extensions happen before any delete.
-func (c *Controller) reconcileSilencesAt(ctx context.Context, url string, desired []config.Silence) error {
+// dropped mid-run: creates and extensions happen before any retire. When graceDrop is set
+// (p1 back up), a no-longer-wanted silence isn't deleted outright but shortened to the grace
+// window and left to lapse, so alerts from guests still booting on the node stay suppressed.
+func (c *Controller) reconcileSilencesAt(ctx context.Context, url string, desired []config.Silence, graceDrop bool) error {
 	am := c.ams[url]
 	if am == nil {
 		return fmt.Errorf("no client for alertmanager %s", url)
@@ -405,6 +410,19 @@ func (c *Controller) reconcileSilencesAt(ctx context.Context, url string, desire
 	}
 	for key, s := range ours {
 		if wanted[key] {
+			continue
+		}
+		if graceDrop {
+			// Let the silence lapse after the grace window rather than dropping it now. Only
+			// shorten one that still ends beyond the window, so once it's inside the window it's
+			// left to expire on its own instead of being pushed out again every tick.
+			grace := c.cfg.Alertmanager.UnsilenceGrace.Duration
+			if s.EndsAt.After(now.Add(grace)) {
+				if _, err := am.Reschedule(ctx, s, grace, now); err != nil {
+					return err
+				}
+				c.log.Info("grace-expiring alertmanager silence", "url", url, "id", s.ID, "grace", grace)
+			}
 			continue
 		}
 		if err := am.Delete(ctx, s.ID); err != nil {
