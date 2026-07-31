@@ -156,7 +156,7 @@ func (c *Controller) observe(ctx context.Context) (Snapshot, bool, error) {
 	// Proxmox drops uptime from /nodes when the token lacks Sys.Audit, and an uptime of 0 reads
 	// as freshly booted, so the fresh-boot window silently stops filtering anything.
 	if nodeUp && uptime == 0 && !c.warnedNoUptime {
-		c.log.Warn("node reports no uptime: adopting any online node, token needs Sys.Audit on /nodes",
+		c.log.Warn("node online but reports no uptime: adopting any online node, most likely the token lacks Sys.Audit on /nodes",
 			"node", c.cfg.Proxmox.Node)
 		c.warnedNoUptime = true
 	}
