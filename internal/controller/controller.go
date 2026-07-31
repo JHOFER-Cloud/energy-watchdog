@@ -30,7 +30,8 @@ type Controller struct {
 	metrics *metrics.Metrics
 	log     *slog.Logger
 
-	observeFailures int // consecutive failed observes, for log-level escalation
+	observeFailures int  // consecutive failed observes, for log-level escalation
+	warnedNoUptime  bool // the missing-uptime warning is logged once, not every tick
 }
 
 // observeFailEscalate is how many back-to-back failed observes are tolerated at warn before
@@ -151,6 +152,13 @@ func (c *Controller) observe(ctx context.Context) (Snapshot, bool, error) {
 	nodeUp, uptime, err := c.px.NodeState(ctx, c.cfg.Proxmox.Node)
 	if err != nil {
 		return Snapshot{Mode: st.Mode}, false, err
+	}
+	// Proxmox drops uptime from /nodes when the token lacks Sys.Audit, and an uptime of 0 reads
+	// as freshly booted, so the fresh-boot window silently stops filtering anything.
+	if nodeUp && uptime == 0 && !c.warnedNoUptime {
+		c.log.Warn("node online but reports no uptime: adopting any online node, most likely the token lacks Sys.Audit on /nodes",
+			"node", c.cfg.Proxmox.Node)
+		c.warnedNoUptime = true
 	}
 	var guests []proxmox.Guest
 	if nodeUp {
