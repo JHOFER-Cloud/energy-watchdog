@@ -41,6 +41,11 @@ func TestExecuteShedCycle(t *testing.T) {
 			_, _ = w.Write([]byte(`{"data":"UPID:stop-301"}`))
 		case strings.Contains(p, "/tasks/"):
 			_, _ = w.Write([]byte(`{"data":{"status":"stopped","exitstatus":"OK"}}`))
+		case p == "/api2/json/cluster/replication":
+			_, _ = w.Write([]byte(`{"data":[{"id":"104-0","source":"pve-2","target":"pve-1"}]}`))
+		case strings.HasPrefix(p, "/api2/json/cluster/replication/"):
+			record("repl-disable-104-0")
+			_, _ = w.Write([]byte(`{"data":null}`))
 		case strings.Contains(p, "/nodes/pve-1/status"):
 			record("poweroff")
 			_, _ = w.Write([]byte(`{"data":null}`))
@@ -95,8 +100,9 @@ func TestExecuteShedCycle(t *testing.T) {
 		t.Fatalf("execute: %v", err)
 	}
 
-	// Order: migrate before stop before silence before poweroff.
-	want := []string{"migrate-101", "stop-301", "silence", "poweroff"}
+	// Order: migrate before stop before silence, then replication is disabled before the
+	// poweroff so no run can land inside the shutdown window (JHC-538).
+	want := []string{"migrate-101", "stop-301", "silence", "repl-disable-104-0", "poweroff"}
 	if len(calls) != len(want) {
 		t.Fatalf("calls = %v, want %v", calls, want)
 	}

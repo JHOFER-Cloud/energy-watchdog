@@ -16,7 +16,8 @@ type Config struct {
 	// Interval is how often the reconcile loop runs.
 	Interval Duration `yaml:"interval"`
 	// DryRun controls how much the watchdog actually does: full operation, log-only, or
-	// alert-only (manage Alertmanager silences from p1's real power state, no Proxmox).
+	// alert-only (suppress the noise a down p1 causes - Alertmanager silences and its
+	// replication jobs - from p1's real power state, without moving any guests).
 	DryRun DryRunMode `yaml:"dryRun"`
 	// MetricsAddr is the listen address for the /metrics and /healthz endpoints.
 	MetricsAddr string `yaml:"metricsAddr"`
@@ -41,9 +42,11 @@ const (
 	DryRunFull DryRunMode = iota
 	// DryRunLog logs the plan and touches nothing (from yaml: true).
 	DryRunLog
-	// DryRunAlert only creates/removes Alertmanager silences, driven by p1's actual
-	// power state - no migrate/stop/poweroff/wake. For running before WoL is ready so a
-	// manual p1 shutdown still gets silenced (from yaml: alert).
+	// DryRunAlert suppresses the noise a down p1 makes, driven by p1's actual power state:
+	// Alertmanager silences and (unless manageReplication is off) the replication jobs
+	// targeting it. Still no migrate/stop/poweroff/wake - no guest is moved and the host is
+	// never powered. For running before WoL is ready, so a manual p1 shutdown still gets
+	// silenced and doesn't mail about failed replication (from yaml: alert).
 	DryRunAlert
 )
 
@@ -137,12 +140,25 @@ type Proxmox struct {
 	// "255.255.255.255:9"; a subnet-directed address ("10.1.1.255:9") is often more
 	// reliable from a hostNetwork pod with several interfaces.
 	WoLBroadcastAddr string `yaml:"wolBroadcastAddr"`
-	// TargetNodes are the destinations the migrate guests are spread across.
+	// TargetNodes are the destinations the migrate guests are spread across. Unrelated to a
+	// replication job's own "target" field, which is matched against Node, not this list.
 	TargetNodes []string `yaml:"targetNodes"`
+	// ManageReplication disables the cluster replication jobs that replicate *into* Node
+	// while it is powered down, and re-enables them when it is back, so the other nodes stop
+	// attempting (and mailing about) replication runs to a host that is off on purpose.
+	// Unset means enabled; set it to false if the API token lacks VM.Replicate on the
+	// replicated guests, which would otherwise make every reconcile log an error.
+	ManageReplication *bool `yaml:"manageReplication"`
 
 	MigrateTimeout Duration `yaml:"migrateTimeout"`
 	StopTimeout    Duration `yaml:"stopTimeout"`
 	WakeTimeout    Duration `yaml:"wakeTimeout"`
+}
+
+// ReplicationManaged reports whether replication jobs targeting Node should be disabled
+// while it is down. It is nil-safe so a zero Proxmox still reads as the default: on.
+func (p Proxmox) ReplicationManaged() bool {
+	return p.ManageReplication == nil || *p.ManageReplication
 }
 
 // Guests classifies the guests on the managed node. Each list entry is either an

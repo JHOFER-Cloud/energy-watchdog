@@ -1,5 +1,6 @@
 // Package proxmox is a thin Proxmox VE API client covering only what the watchdog
-// needs: listing guests, migrating, stopping, starting, and shutting a node down.
+// needs: listing guests, migrating, stopping, starting, shutting a node down, and
+// enabling/disabling cluster replication jobs.
 package proxmox
 
 import (
@@ -181,6 +182,81 @@ func (c *Client) Stop(ctx context.Context, node string, g Guest) (string, error)
 // Start boots a guest. Returns the task UPID.
 func (c *Client) Start(ctx context.Context, node string, g Guest) (string, error) {
 	return c.task(ctx, http.MethodPost, fmt.Sprintf("/nodes/%s/%s/%d/status/start", node, g.Type, g.VMID), nil)
+}
+
+// ReplicationJob is one entry of the cluster's replication config.
+type ReplicationJob struct {
+	ID       string // "<guest>-<jobnum>", e.g. "104-0"
+	Source   string // node replicated from
+	Target   string // node replicated to
+	Comment  string
+	Disabled bool
+}
+
+// ReplicationJobs lists the cluster's replication jobs. Note that the API silently omits
+// jobs whose guest the token has no VM.Audit permission on, so a short list means a token
+// permission problem rather than an empty replication config.
+func (c *Client) ReplicationJobs(ctx context.Context) ([]ReplicationJob, error) {
+	data, err := c.do(ctx, http.MethodGet, "/cluster/replication", nil)
+	if err != nil {
+		return nil, err
+	}
+	var items []struct {
+		ID      string `json:"id"`
+		Source  string `json:"source"`
+		Target  string `json:"target"`
+		Comment string `json:"comment"`
+		Disable any    `json:"disable"`
+	}
+	if err := json.Unmarshal(data, &items); err != nil {
+		return nil, err
+	}
+	out := make([]ReplicationJob, 0, len(items))
+	for _, it := range items {
+		out = append(out, ReplicationJob{
+			ID:       it.ID,
+			Source:   it.Source,
+			Target:   it.Target,
+			Comment:  it.Comment,
+			Disabled: pveBool(it.Disable),
+		})
+	}
+	return out, nil
+}
+
+// SetReplicationJob enables or disables a replication job and sets its comment. This is
+// Proxmox's own disable flag - what "pvesr enable/disable" and the GUI's Enabled checkbox
+// set - so the job, its schedule and its accumulated replication state all stay in place
+// and re-enabling resumes incrementally instead of re-syncing from scratch. An empty
+// comment is deleted from the job rather than stored as an empty string.
+func (c *Client) SetReplicationJob(ctx context.Context, id, comment string, disable bool) error {
+	v := url.Values{}
+	if disable {
+		v.Set("disable", "1")
+	} else {
+		v.Set("disable", "0")
+	}
+	if comment == "" {
+		v.Set("delete", "comment")
+	} else {
+		v.Set("comment", comment)
+	}
+	_, err := c.do(ctx, http.MethodPut, "/cluster/replication/"+url.PathEscape(id), v)
+	return err
+}
+
+// pveBool reads a Proxmox boolean, which the replication config passes through as a raw
+// number, string or JSON bool depending on how it was written.
+func pveBool(v any) bool {
+	switch t := v.(type) {
+	case bool:
+		return t
+	case float64:
+		return t != 0
+	case string:
+		return t == "1" || strings.EqualFold(t, "true")
+	}
+	return false
 }
 
 // ShutdownNode powers off a whole node.
