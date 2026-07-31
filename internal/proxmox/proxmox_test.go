@@ -31,7 +31,10 @@ func TestNodeState(t *testing.T) {
 	if up || uptime != 0 {
 		t.Errorf("pve-1 = up %v, uptime %v; want offline with no uptime", up, uptime)
 	}
-	up, uptime, _ = c.NodeState(context.Background(), "pve-2")
+	up, uptime, err = c.NodeState(context.Background(), "pve-2")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !up {
 		t.Error("pve-2 should be online")
 	}

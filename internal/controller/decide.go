@@ -23,7 +23,7 @@ type Snapshot struct {
 	SurplusRaw float64 // instantaneous surplus, for metrics only; not a decision input
 	SoC        float64
 	NodeUp     bool
-	NodeUptime time.Duration // how long the node has been up; 0 when it's down
+	NodeUptime time.Duration   // 0 when the node is down, or when the token can't read uptime
 	Guests     []proxmox.Guest // guests currently on the managed node ("" if it's down)
 	Mode       state.Mode
 	StoppedSet []state.GuestRef
@@ -132,6 +132,8 @@ func Decide(s Snapshot, cfg *config.Config, now time.Time) Plan {
 		case s.NodeUp && s.NodeUptime < cfg.Proxmox.FreshBootWindow.Duration:
 			// p1 came up on its own: the user woke it to game. Don't fight it - adopt as a
 			// gaming session and start the grace clock so they have time to launch a VM.
+			// Without Sys.Audit uptime reads 0, so this adopts every online node, as it did
+			// before the window existed.
 			p.NextMode = state.ModeGaming
 			p.GraceSince = graceStart()
 			p.Reason = "p1 powered on during deficit: adopt as a gaming session"
