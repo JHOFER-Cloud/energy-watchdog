@@ -69,6 +69,12 @@ proxmox:
   migrateTimeout: 15m
   stopTimeout: 5m
   wakeTimeout: 5m
+  # How recently `node` must have booted to count as powered on by hand. Proxmox reports a
+  # node that is shutting down as online (its status is only online/offline/unknown), so
+  # uptime is what tells a real power-on from one of ours on its way down. Keep it above the
+  # uptime the node reports when it first shows up online - cluster join happens well after
+  # kernel boot - and below the uptime it has when the watchdog sheds it. Defaults to 5m.
+  freshBootWindow: 5m
 
 # Guest classes. Entries are int ids (601) or inclusive ranges ("600-699").
 # The three lists must not overlap.

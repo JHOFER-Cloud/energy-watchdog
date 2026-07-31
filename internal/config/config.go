@@ -153,6 +153,12 @@ type Proxmox struct {
 	MigrateTimeout Duration `yaml:"migrateTimeout"`
 	StopTimeout    Duration `yaml:"stopTimeout"`
 	WakeTimeout    Duration `yaml:"wakeTimeout"`
+	// FreshBootWindow is how recently Node must have booted to count as powered on by hand:
+	// Proxmox reports a node that is shutting down as online, and only its uptime tells the
+	// two apart. It has to be longer than the uptime Node reports when it first shows up
+	// online (cluster join is well after kernel boot) and shorter than the uptime it has when
+	// the watchdog sheds it. Default 5m.
+	FreshBootWindow Duration `yaml:"freshBootWindow"`
 }
 
 // ReplicationManaged reports whether replication jobs targeting Node should be disabled
@@ -254,6 +260,9 @@ func (c *Config) defaults() {
 	}
 	if c.Proxmox.WakeTimeout.Duration == 0 {
 		c.Proxmox.WakeTimeout = Duration{5 * time.Minute}
+	}
+	if c.Proxmox.FreshBootWindow.Duration == 0 {
+		c.Proxmox.FreshBootWindow = Duration{5 * time.Minute}
 	}
 	if c.Proxmox.WoLBroadcastAddr == "" {
 		c.Proxmox.WoLBroadcastAddr = "255.255.255.255:9"

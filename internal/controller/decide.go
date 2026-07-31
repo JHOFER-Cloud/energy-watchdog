@@ -23,6 +23,7 @@ type Snapshot struct {
 	SurplusRaw float64 // instantaneous surplus, for metrics only; not a decision input
 	SoC        float64
 	NodeUp     bool
+	NodeUptime time.Duration   // 0 when the node is down, or when the token can't read uptime
 	Guests     []proxmox.Guest // guests currently on the managed node ("" if it's down)
 	Mode       state.Mode
 	StoppedSet []state.GuestRef
@@ -113,7 +114,9 @@ func Decide(s Snapshot, cfg *config.Config, now time.Time) Plan {
 			p.GraceSince = graceStart()
 			p.Reason = "deficit with a gaming guest running: shed load, keep p1 up"
 		} else {
-			p.Poweroff = true
+			// Never plan a power-off for a node that's already off: the call fails, and a failed
+			// apply never persists the mode, so the same impossible plan is retried every tick.
+			p.Poweroff = s.NodeUp
 			p.NextMode = state.ModeShed
 			p.Reason = "deficit and no gaming guest: shed load and power off p1"
 		}
@@ -126,9 +129,11 @@ func Decide(s Snapshot, cfg *config.Config, now time.Time) Plan {
 			p.Unsilence = true
 			p.NextMode = state.ModeRunning
 			p.Reason = "surplus returned: wake p1 and restart the guests we stopped"
-		case s.NodeUp:
+		case s.NodeUp && s.NodeUptime < cfg.Proxmox.FreshBootWindow.Duration:
 			// p1 came up on its own: the user woke it to game. Don't fight it - adopt as a
 			// gaming session and start the grace clock so they have time to launch a VM.
+			// Without Sys.Audit uptime reads 0, so this adopts every online node, as it did
+			// before the window existed.
 			p.NextMode = state.ModeGaming
 			p.GraceSince = graceStart()
 			p.Reason = "p1 powered on during deficit: adopt as a gaming session"
@@ -136,6 +141,12 @@ func Decide(s Snapshot, cfg *config.Config, now time.Time) Plan {
 
 	case state.ModeGaming:
 		switch {
+		case !s.NodeUp:
+			// Gaming means p1 is up; if it went away mid-session there's nothing left to shed.
+			// Correct the mode now so ModeShed handles the wake, instead of running the clock out.
+			p.NextMode = state.ModeShed
+			p.GraceSince = 0
+			p.Reason = "p1 went down during a gaming session: back to shed"
 		case sig == sigSurplus:
 			// Good morning. p1 is already up; restore what we stopped. Criticals stay
 			// where they were migrated. Nothing migrates back automatically.
