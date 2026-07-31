@@ -56,6 +56,34 @@ two cases:
 
 Once the window elapses with no gaming guest and no surplus, the host powers off.
 
+### Replication
+
+`p2` and `p3` replicate guests to `p1`. While `p1` is intentionally off those runs fail every
+schedule tick and Proxmox mails about each one, so the watchdog disables the replication jobs
+that target `p1` for as long as it's down, and re-enables them when it's back (JHC-538).
+
+It flips Proxmox's own `disable` flag — the same thing `pvesr disable` and the GUI's *Enabled*
+checkbox set. The job, its schedule and its accumulated replication state all stay put, so
+re-enabling picks up incrementally instead of re-syncing from scratch. Nothing is ever
+deleted.
+
+Only jobs whose `target` is `proxmox.node` are touched. Jobs *sourced* from `p1` need nothing:
+`pvesr` runs on the source node, so while `p1` is off they don't run at all. (A replication
+job's `target` is unrelated to `proxmox.targetNodes`, which is only about migration
+destinations.)
+
+Which jobs get re-enabled is decided from the jobs themselves, not from stored ids — the same
+trick as the silences. On disabling a job the watchdog prefixes its comment with
+`[energy-watchdog]`, keeping whatever comment was there behind it, and on the way back up it
+only re-enables jobs carrying that prefix, restoring the original comment. So a job you
+disabled by hand is never silently switched back on, and a lost state ConfigMap can't strand
+replication in the disabled state either.
+
+This runs in `dryRun: alert` too, alongside the silences and for the same reason — that mode
+exists to stop a down `p1` making noise. It's the one Proxmox *write* that mode does; it still
+moves no guests and never powers the host. `dryRun: true` only logs what it would change. Set
+`proxmox.manageReplication: false` to leave replication alone entirely; it defaults to on.
+
 ## Guest classes
 
 Three lists. Each entry is a single id (`601`) or a range (`"600-699"`):
@@ -105,7 +133,11 @@ calls.
   watchdog owns their lifecycle, so nothing else should bring them back. Otherwise, if
   you power `p1` on at night yourself, autostart (or HA) would boot the very VMs the
   watchdog just shut down, and it would have to stop them all over again.
-- An API token with `VM.Audit`, `VM.Migrate`, `VM.PowerMgmt` and `Sys.PowerMgmt`.
+- An API token with `VM.Audit`, `VM.Migrate`, `VM.PowerMgmt`, `Sys.PowerMgmt` and — for the
+  replication handling — `VM.Replicate` on the replicated guests. Note that
+  `GET /cluster/replication` silently omits jobs whose guest the token can't `VM.Audit`, so a
+  token that's short on permissions looks like "no replication jobs" rather than an error.
+  If you'd rather not grant `VM.Replicate`, set `proxmox.manageReplication: false`.
 
 ## Metrics and dashboard
 

@@ -60,6 +60,30 @@ func TestIDSetOverlap(t *testing.T) {
 	}
 }
 
+// TestReplicationManagedDefault: omitting manageReplication means on, and the zero Proxmox
+// reads the same way, so nothing has to remember to call defaults() for this.
+func TestReplicationManagedDefault(t *testing.T) {
+	if !(Proxmox{}).ReplicationManaged() {
+		t.Error("zero Proxmox should manage replication")
+	}
+	for _, tc := range []struct {
+		yaml string
+		want bool
+	}{
+		{"node: pve-1", true},
+		{"node: pve-1\nmanageReplication: true", true},
+		{"node: pve-1\nmanageReplication: false", false},
+	} {
+		var p Proxmox
+		if err := yaml.Unmarshal([]byte(tc.yaml), &p); err != nil {
+			t.Fatalf("unmarshal %q: %v", tc.yaml, err)
+		}
+		if got := p.ReplicationManaged(); got != tc.want {
+			t.Errorf("%q: ReplicationManaged() = %v, want %v", tc.yaml, got, tc.want)
+		}
+	}
+}
+
 func TestValidateRejectsOverlap(t *testing.T) {
 	c := &Config{}
 	if err := yaml.Unmarshal([]byte(`

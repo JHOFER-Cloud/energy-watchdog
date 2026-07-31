@@ -8,6 +8,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/JHOFER-Cloud/energy-watchdog/internal/alertmgr"
@@ -102,6 +103,16 @@ func (c *Controller) reconcile(ctx context.Context) {
 // a dry run can't preview what live would decide. Alert's silences track the real node state,
 // independent of the (possibly simulated) mode, so they reconcile every tick.
 func (c *Controller) apply(ctx context.Context, p Plan, snap Snapshot) error {
+	// Replication into the managed node tracks its real power state in every mode, for the
+	// same reason the alert-only silences do: while p1 is off, p2/p3 must not keep trying to
+	// replicate to it and mailing about every failed run (JHC-538). Driving this from the
+	// observed node state rather than from the plan also covers the cases no mode transition
+	// produces - a p1 powered on by hand, or one already off when the watchdog starts. A
+	// failure is logged, not returned: worst case the mails come back, which beats blocking
+	// the whole shed on a replication API problem.
+	if err := c.reconcileReplication(ctx, !snap.NodeUp); err != nil {
+		c.log.Error("reconcile replication", "err", err)
+	}
 	if c.cfg.DryRun == config.DryRunAlert {
 		c.reconcileAlertOnly(ctx, snap)
 	}
@@ -207,6 +218,14 @@ func (c *Controller) execute(ctx context.Context, p Plan, snap Snapshot) error {
 		st.Stopped = nil
 	}
 	if p.Poweroff {
+		// Disable replication ahead of the power-off instead of waiting for the next tick to
+		// observe the node as down: a run landing inside the shutdown window is exactly the
+		// failed run we're trying to avoid. Re-enabling needs no such treatment - the first
+		// tick after the node reports up handles it, and replication staying off for one more
+		// interval is harmless.
+		if err := c.reconcileReplication(ctx, true); err != nil {
+			c.log.Error("disable replication before power-off", "err", err)
+		}
 		c.log.Warn("powering off node", "node", c.cfg.Proxmox.Node)
 		if err := c.px.ShutdownNode(ctx, c.cfg.Proxmox.Node); err != nil {
 			return err
@@ -297,6 +316,85 @@ func (c *Controller) wake(ctx context.Context) error {
 	wctx, cancel := context.WithTimeout(ctx, c.cfg.Proxmox.WakeTimeout.Duration)
 	defer cancel()
 	return c.px.WaitNodeUp(wctx, c.cfg.Proxmox.Node)
+}
+
+// replicationMarker prefixes the comment of every replication job the watchdog disables. It
+// is how a job is recognised as ours when the node comes back: one that was disabled by hand
+// carries no marker and is therefore never re-enabled by us. Recognising our own work from
+// the remote object rather than from persisted ids is the same approach as the Alertmanager
+// silences, and it means a lost or stale state ConfigMap can never strand replication in the
+// disabled state. Whatever comment the job already had is kept after the marker and restored
+// verbatim when the job is re-enabled.
+const replicationMarker = "[energy-watchdog]"
+
+// markComment is the comment stored on a job we disable: our marker, then the job's own
+// comment. It is the inverse of unmarkComment.
+func markComment(orig string) string {
+	return strings.TrimSpace(replicationMarker + " " + orig)
+}
+
+// unmarkComment recovers the job's original comment, reporting whether the job carried our
+// marker at all. Anything unmarked is not ours to touch.
+func unmarkComment(comment string) (orig string, ours bool) {
+	rest, ok := strings.CutPrefix(comment, replicationMarker)
+	if !ok {
+		return "", false
+	}
+	return strings.TrimSpace(rest), true
+}
+
+// reconcileReplication makes the cluster replication jobs that target the managed node match
+// its power state: disabled while it is down, enabled while it is up. Only the jobs that
+// replicate *into* the node are touched; jobs sourced from it need nothing, because pvesr
+// runs on the source node and so they simply don't run while it is off.
+//
+// A job is claimed only by disabling one that is currently enabled, and only a claimed job -
+// identified by replicationMarker in its comment - is ever re-enabled. A job someone
+// disabled by hand is therefore left alone in both directions. Writes happen only where a
+// job isn't already in the wanted state, so a steady-state tick makes no write calls at all.
+func (c *Controller) reconcileReplication(ctx context.Context, disable bool) error {
+	if !c.cfg.Proxmox.ReplicationManaged() {
+		return nil
+	}
+	jobs, err := c.px.ReplicationJobs(ctx)
+	if err != nil {
+		return err
+	}
+	var firstErr error
+	for _, j := range jobs {
+		if j.Target != c.cfg.Proxmox.Node {
+			continue
+		}
+		orig, ours := unmarkComment(j.Comment)
+		if !ours {
+			if !disable || j.Disabled {
+				continue // not ours, and not an enabled job we want off: leave it entirely alone
+			}
+			orig = j.Comment
+		}
+		comment := orig
+		if disable {
+			comment = markComment(orig)
+		}
+		if j.Disabled == disable && j.Comment == comment {
+			continue
+		}
+		if c.cfg.DryRun == config.DryRunLog {
+			c.log.Info("[dry-run] would set replication job",
+				"id", j.ID, "source", j.Source, "target", j.Target, "disabled", disable)
+			continue
+		}
+		if err := c.px.SetReplicationJob(ctx, j.ID, comment, disable); err != nil {
+			c.log.Error("set replication job", "id", j.ID, "disabled", disable, "err", err)
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		c.log.Info("set replication job",
+			"id", j.ID, "source", j.Source, "target", j.Target, "disabled", disable)
+	}
+	return firstErr
 }
 
 // silenceTTL is how long each Alertmanager silence lasts before it self-expires. The
