@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 func newTestServer(t *testing.T, h http.HandlerFunc) *Client {
@@ -16,23 +17,26 @@ func newTestServer(t *testing.T, h http.HandlerFunc) *Client {
 	return c
 }
 
-func TestNodeUp(t *testing.T) {
+func TestNodeState(t *testing.T) {
 	c := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
 		if got := r.Header.Get("Authorization"); got != "PVEAPIToken=user@pam!tok=secret" {
 			t.Errorf("auth header = %q", got)
 		}
-		_, _ = w.Write([]byte(`{"data":[{"node":"pve-1","status":"offline"},{"node":"pve-2","status":"online"}]}`))
+		_, _ = w.Write([]byte(`{"data":[{"node":"pve-1","status":"offline"},{"node":"pve-2","status":"online","uptime":25903}]}`))
 	})
-	up, err := c.NodeUp(context.Background(), "pve-1")
+	up, uptime, err := c.NodeState(context.Background(), "pve-1")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if up {
-		t.Error("pve-1 should be offline")
+	if up || uptime != 0 {
+		t.Errorf("pve-1 = up %v, uptime %v; want offline with no uptime", up, uptime)
 	}
-	up, _ = c.NodeUp(context.Background(), "pve-2")
+	up, uptime, _ = c.NodeState(context.Background(), "pve-2")
 	if !up {
 		t.Error("pve-2 should be online")
+	}
+	if uptime != 25903*time.Second {
+		t.Errorf("pve-2 uptime = %v, want %v", uptime, 25903*time.Second)
 	}
 }
 
@@ -210,7 +214,7 @@ func TestErrorStatus(t *testing.T) {
 		w.WriteHeader(http.StatusForbidden)
 		_, _ = w.Write([]byte(`permission denied`))
 	})
-	if _, err := c.NodeUp(context.Background(), "pve-1"); err == nil {
+	if _, _, err := c.NodeState(context.Background(), "pve-1"); err == nil {
 		t.Fatal("expected error on 403, got nil")
 	}
 }

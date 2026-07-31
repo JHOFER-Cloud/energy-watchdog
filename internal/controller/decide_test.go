@@ -92,6 +92,15 @@ func TestDecide(t *testing.T) {
 			wantSilence: true,
 		},
 		{
+			// A power-off of an already-off node fails, and a failed apply never persists the
+			// mode - so the same impossible plan would be retried every tick.
+			name:        "running, deficit, p1 already down -> shed without poweroff",
+			snap:        Snapshot{Surplus: -300, SoC: 80, NodeUp: false, Mode: state.ModeRunning},
+			wantMode:    state.ModeShed,
+			wantPower:   false,
+			wantSilence: true,
+		},
+		{
 			name:      "shed, surplus -> wake + restart stopped",
 			snap:      Snapshot{Surplus: 1500, SoC: 80, NodeUp: false, Mode: state.ModeShed, StoppedSet: []state.GuestRef{{VMID: 301, Type: "qemu"}}},
 			wantMode:  state.ModeRunning,
@@ -106,14 +115,21 @@ func TestDecide(t *testing.T) {
 		},
 		{
 			name:     "shed, node manually powered on with VM up -> adopt, clock stopped",
-			snap:     Snapshot{Surplus: -100, SoC: 80, NodeUp: true, Guests: []proxmox.Guest{qemu(601, true)}, Mode: state.ModeShed},
+			snap:     Snapshot{Surplus: -100, SoC: 80, NodeUp: true, NodeUptime: time.Minute, Guests: []proxmox.Guest{qemu(601, true)}, Mode: state.ModeShed},
 			wantMode: state.ModeGaming,
 		},
 		{
 			name:      "shed, node manually powered on, no VM yet -> adopt, start grace clock",
-			snap:      Snapshot{Surplus: -100, SoC: 80, NodeUp: true, Guests: []proxmox.Guest{qemu(601, false)}, Mode: state.ModeShed},
+			snap:      Snapshot{Surplus: -100, SoC: 80, NodeUp: true, NodeUptime: time.Minute, Guests: []proxmox.Guest{qemu(601, false)}, Mode: state.ModeShed},
 			wantMode:  state.ModeGaming,
 			wantGrace: testNow.Unix(),
+		},
+		{
+			// The node we just shed still reports online while it shuts down. Its uptime gives
+			// it away, so it must not be adopted as a gaming session.
+			name:     "shed, node still shutting down -> no adopt",
+			snap:     Snapshot{Surplus: -100, SoC: 80, NodeUp: true, NodeUptime: 9 * time.Hour, Mode: state.ModeShed},
+			wantMode: state.ModeShed,
 		},
 		{
 			name:      "gaming, surplus -> restart stopped, no wake",
@@ -148,6 +164,20 @@ func TestDecide(t *testing.T) {
 			name:     "gaming, VM back after reboot -> reset clock, keep host",
 			snap:     Snapshot{Surplus: -100, SoC: 80, NodeUp: true, Guests: []proxmox.Guest{qemu(601, true)}, Mode: state.ModeGaming, GraceSince: testNow.Add(-3 * time.Minute).Unix()},
 			wantMode: state.ModeGaming,
+		},
+		{
+			// p1 shut down by hand (or lost) mid-session: correct the mode instead of waiting
+			// out the clock and then trying to power off a node that's already off.
+			name:     "gaming, p1 gone -> back to shed, clock cleared",
+			snap:     Snapshot{Surplus: -100, SoC: 80, NodeUp: false, Mode: state.ModeGaming, GraceSince: testNow.Add(-3 * time.Minute).Unix()},
+			wantMode: state.ModeShed,
+		},
+		{
+			// Surplus with p1 gone must not start guests on a dead node: shed first, and the
+			// next tick wakes it via the ModeShed path.
+			name:     "gaming, p1 gone, surplus -> shed first, no start",
+			snap:     Snapshot{Surplus: 1500, SoC: 80, NodeUp: false, Mode: state.ModeGaming, StoppedSet: []state.GuestRef{{VMID: 301, Type: "qemu"}}},
+			wantMode: state.ModeShed,
 		},
 	}
 

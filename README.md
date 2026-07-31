@@ -133,8 +133,10 @@ calls.
   watchdog owns their lifecycle, so nothing else should bring them back. Otherwise, if
   you power `p1` on at night yourself, autostart (or HA) would boot the very VMs the
   watchdog just shut down, and it would have to stop them all over again.
-- An API token with `VM.Audit`, `VM.Migrate`, `VM.PowerMgmt`, `Sys.PowerMgmt` and — for the
-  replication handling — `VM.Replicate` on the replicated guests. Note that
+- An API token with `VM.Audit`, `VM.Migrate`, `VM.PowerMgmt`, `Sys.PowerMgmt`, `Sys.Audit` on
+  `/nodes` and — for the replication handling — `VM.Replicate` on the replicated guests.
+  `Sys.Audit` is what puts `uptime` in `GET /nodes`; without it the field is silently dropped
+  and a node still shutting down looks like one you just powered on. Note that
   `GET /cluster/replication` silently omits jobs whose guest the token can't `VM.Audit`, so a
   token that's short on permissions looks like "no replication jobs" rather than an error.
   If you'd rather not grant `VM.Replicate`, set `proxmox.manageReplication: false`.

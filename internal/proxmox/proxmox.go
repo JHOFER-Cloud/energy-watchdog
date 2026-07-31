@@ -113,25 +113,27 @@ func (c *Client) do(ctx context.Context, method, path string, body url.Values) (
 	return env.Data, nil
 }
 
-// NodeUp reports whether node is online, as seen from the cluster API.
-func (c *Client) NodeUp(ctx context.Context, node string) (bool, error) {
+// NodeState reports whether node is online and how long it has been up, as seen from the
+// cluster API. Uptime needs Sys.Audit on /nodes; without it the field is dropped and reads 0.
+func (c *Client) NodeState(ctx context.Context, node string) (up bool, uptime time.Duration, err error) {
 	data, err := c.do(ctx, http.MethodGet, "/nodes", nil)
 	if err != nil {
-		return false, err
+		return false, 0, err
 	}
 	var nodes []struct {
 		Node   string `json:"node"`
 		Status string `json:"status"`
+		Uptime int64  `json:"uptime"`
 	}
 	if err := json.Unmarshal(data, &nodes); err != nil {
-		return false, err
+		return false, 0, err
 	}
 	for _, n := range nodes {
 		if n.Node == node {
-			return n.Status == "online", nil
+			return n.Status == "online", time.Duration(n.Uptime) * time.Second, nil
 		}
 	}
-	return false, fmt.Errorf("node %q not found in cluster", node)
+	return false, 0, fmt.Errorf("node %q not found in cluster", node)
 }
 
 // Guests lists the VMs and containers on a node.
@@ -310,7 +312,7 @@ func (c *Client) WaitTask(ctx context.Context, node, upid string) error {
 // WaitNodeUp blocks until node reports online or ctx expires.
 func (c *Client) WaitNodeUp(ctx context.Context, node string) error {
 	for {
-		if up, err := c.NodeUp(ctx, node); err == nil && up {
+		if up, _, err := c.NodeState(ctx, node); err == nil && up {
 			return nil
 		}
 		select {

@@ -148,7 +148,7 @@ func (c *Controller) observe(ctx context.Context) (Snapshot, bool, error) {
 	if err != nil {
 		return Snapshot{Mode: st.Mode}, false, err
 	}
-	nodeUp, err := c.px.NodeUp(ctx, c.cfg.Proxmox.Node)
+	nodeUp, uptime, err := c.px.NodeState(ctx, c.cfg.Proxmox.Node)
 	if err != nil {
 		return Snapshot{Mode: st.Mode}, false, err
 	}
@@ -163,6 +163,7 @@ func (c *Controller) observe(ctx context.Context) (Snapshot, bool, error) {
 		SurplusRaw: reading.SurplusRaw,
 		SoC:        reading.SoC,
 		NodeUp:     nodeUp,
+		NodeUptime: uptime,
 		Guests:     guests,
 		Mode:       st.Mode,
 		StoppedSet: st.Stopped,

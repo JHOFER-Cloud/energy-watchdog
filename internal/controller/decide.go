@@ -17,12 +17,18 @@ const (
 	sigSurplus               // production clears the wake headroom: wake
 )
 
+// freshBoot is how recently a node must have booted to count as powered on by hand rather
+// than as one of ours still shutting down: a node keeps reporting online for ~a minute after
+// it accepts a shutdown, and a tick sees a real power-on within one interval.
+const freshBoot = 5 * time.Minute
+
 // Snapshot is everything decide needs: fully observable, no side effects.
 type Snapshot struct {
 	Surplus    float64
 	SurplusRaw float64 // instantaneous surplus, for metrics only; not a decision input
 	SoC        float64
 	NodeUp     bool
+	NodeUptime time.Duration // how long the node has been up; 0 when it's down
 	Guests     []proxmox.Guest // guests currently on the managed node ("" if it's down)
 	Mode       state.Mode
 	StoppedSet []state.GuestRef
@@ -113,7 +119,9 @@ func Decide(s Snapshot, cfg *config.Config, now time.Time) Plan {
 			p.GraceSince = graceStart()
 			p.Reason = "deficit with a gaming guest running: shed load, keep p1 up"
 		} else {
-			p.Poweroff = true
+			// Never plan a power-off for a node that's already off: the call fails, and a failed
+			// apply never persists the mode, so the same impossible plan is retried every tick.
+			p.Poweroff = s.NodeUp
 			p.NextMode = state.ModeShed
 			p.Reason = "deficit and no gaming guest: shed load and power off p1"
 		}
@@ -126,7 +134,7 @@ func Decide(s Snapshot, cfg *config.Config, now time.Time) Plan {
 			p.Unsilence = true
 			p.NextMode = state.ModeRunning
 			p.Reason = "surplus returned: wake p1 and restart the guests we stopped"
-		case s.NodeUp:
+		case s.NodeUp && s.NodeUptime < freshBoot:
 			// p1 came up on its own: the user woke it to game. Don't fight it - adopt as a
 			// gaming session and start the grace clock so they have time to launch a VM.
 			p.NextMode = state.ModeGaming
@@ -136,6 +144,12 @@ func Decide(s Snapshot, cfg *config.Config, now time.Time) Plan {
 
 	case state.ModeGaming:
 		switch {
+		case !s.NodeUp:
+			// Gaming means p1 is up; if it went away mid-session there's nothing left to shed.
+			// Correct the mode now so ModeShed handles the wake, instead of running the clock out.
+			p.NextMode = state.ModeShed
+			p.GraceSince = 0
+			p.Reason = "p1 went down during a gaming session: back to shed"
 		case sig == sigSurplus:
 			// Good morning. p1 is already up; restore what we stopped. Criticals stay
 			// where they were migrated. Nothing migrates back automatically.
