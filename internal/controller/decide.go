@@ -17,11 +17,6 @@ const (
 	sigSurplus               // production clears the wake headroom: wake
 )
 
-// freshBoot is how recently a node must have booted to count as powered on by hand rather
-// than as one of ours still shutting down: a node keeps reporting online for ~a minute after
-// it accepts a shutdown, and a tick sees a real power-on within one interval.
-const freshBoot = 5 * time.Minute
-
 // Snapshot is everything decide needs: fully observable, no side effects.
 type Snapshot struct {
 	Surplus    float64
@@ -134,7 +129,7 @@ func Decide(s Snapshot, cfg *config.Config, now time.Time) Plan {
 			p.Unsilence = true
 			p.NextMode = state.ModeRunning
 			p.Reason = "surplus returned: wake p1 and restart the guests we stopped"
-		case s.NodeUp && s.NodeUptime < freshBoot:
+		case s.NodeUp && s.NodeUptime < cfg.Proxmox.FreshBootWindow.Duration:
 			// p1 came up on its own: the user woke it to game. Don't fight it - adopt as a
 			// gaming session and start the grace clock so they have time to launch a VM.
 			p.NextMode = state.ModeGaming

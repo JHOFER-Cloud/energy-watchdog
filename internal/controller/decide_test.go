@@ -16,7 +16,7 @@ var testNow = time.Unix(1_700_000_000, 0)
 
 // testCfg builds a config with the guest classes used across the decision tests:
 // migrate 100-199, stop 300-399, gamingGuard 600-699. Wake at +1000W (SoC>=20),
-// shed below 0W, with a 10m gaming grace window.
+// shed below 0W, with a 10m gaming grace and a 5m fresh-boot window.
 func testCfg(t *testing.T) *config.Config {
 	t.Helper()
 	var g config.Guests
@@ -31,6 +31,7 @@ gamingGuard: ["600-699"]
 		Prometheus:  config.Prometheus{HeadroomWatts: 1000, ShedBelowWatts: 0, MinBatteryPercent: 20},
 		Guests:      g,
 		GamingGrace: config.Duration{Duration: 10 * time.Minute},
+		Proxmox:     config.Proxmox{FreshBootWindow: config.Duration{Duration: 5 * time.Minute}},
 	}
 }
 
