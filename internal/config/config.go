@@ -3,6 +3,7 @@ package config
 
 import (
 	"fmt"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -40,13 +41,22 @@ type Config struct {
 type SelfService struct {
 	// Addr is the listen address for the UI and its API. Empty disables the whole feature.
 	Addr string `yaml:"addr"`
-	// IssuerURL is the authentik OIDC issuer. Signing keys are fetched from its discovery
-	// document and never from the request: the forwarded X-authentik-meta-jwks header is
-	// attacker-controlled in exactly the case we are defending against.
+	// IssuerURL is the authentik OIDC issuer. The app runs the authorization-code flow
+	// against it itself, the same way every other service in the fleet does.
 	IssuerURL string `yaml:"issuerURL"`
-	// ClientID is the authentik provider's client id, checked as the token audience.
-	ClientID string `yaml:"clientID"`
-	// AdminGroups may toggle the manual shed. Membership comes from the verified token.
+	// ClientID / ClientSecret identify this app to authentik. The secret is usually injected
+	// via SELFSERVICE_CLIENT_SECRET, which overrides whatever is in the file.
+	ClientID     string `yaml:"clientID"`
+	ClientSecret string `yaml:"clientSecret"`
+	// SessionKey signs the session cookie. Injected via SELFSERVICE_SESSION_KEY. Changing it
+	// invalidates everyone's session, which is the intended way to force a re-login.
+	SessionKey string `yaml:"sessionKey"`
+	// ExternalURL is how a browser reaches this UI. The OIDC redirect is built from it, so it
+	// has to match the redirect URI registered on the authentik provider.
+	ExternalURL string `yaml:"externalURL"`
+	// SessionTTL is how long a login lasts. Default 12h.
+	SessionTTL Duration `yaml:"sessionTTL"`
+	// AdminGroups may toggle the manual shed. Membership comes from the id_token.
 	AdminGroups []string `yaml:"adminGroups"`
 	// VMs are the desktop VMs offered, each with the groups allowed to control it.
 	VMs []SelfServiceVM `yaml:"vms"`
@@ -62,8 +72,17 @@ type SelfServiceVM struct {
 	StreamHost string `yaml:"streamHost"`
 }
 
+// minSessionKeyLen is the shortest session key worth signing with; anything shorter is a
+// placeholder someone forgot to replace.
+const minSessionKeyLen = 16
+
 // Enabled reports whether the self-service UI should be served.
 func (s SelfService) Enabled() bool { return s.Addr != "" }
+
+// RedirectURL is the OIDC callback, derived from ExternalURL so the two can't disagree.
+func (s SelfService) RedirectURL() string {
+	return strings.TrimRight(s.ExternalURL, "/") + "/auth/callback"
+}
 
 // Allowed reports the VMs these groups may control.
 func (s SelfService) Allowed(groups []string) []SelfServiceVM {
@@ -277,6 +296,12 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("parse config %s: %w", path, err)
 	}
 
+	if s := os.Getenv("SELFSERVICE_CLIENT_SECRET"); s != "" {
+		c.SelfService.ClientSecret = s
+	}
+	if s := os.Getenv("SELFSERVICE_SESSION_KEY"); s != "" {
+		c.SelfService.SessionKey = s
+	}
 	if id := os.Getenv("PROXMOX_TOKEN_ID"); id != "" {
 		c.Proxmox.TokenID = id
 	}
@@ -297,6 +322,9 @@ func (c *Config) defaults() {
 	}
 	if c.MetricsAddr == "" {
 		c.MetricsAddr = ":9333"
+	}
+	if c.SelfService.SessionTTL.Duration == 0 {
+		c.SelfService.SessionTTL = Duration{12 * time.Hour}
 	}
 	if c.GamingGrace.Duration == 0 {
 		c.GamingGrace = Duration{10 * time.Minute}
@@ -356,6 +384,29 @@ func (c *Config) validate() error {
 			return fmt.Errorf("selfService.issuerURL is required when selfService.addr is set")
 		case c.SelfService.ClientID == "":
 			return fmt.Errorf("selfService.clientID is required when selfService.addr is set")
+		case c.SelfService.ClientSecret == "":
+			return fmt.Errorf("selfService.clientSecret is required (or set SELFSERVICE_CLIENT_SECRET)")
+		case c.SelfService.SessionKey == "":
+			return fmt.Errorf("selfService.sessionKey is required (or set SELFSERVICE_SESSION_KEY)")
+		case c.SelfService.ExternalURL == "":
+			return fmt.Errorf("selfService.externalURL is required: the OIDC redirect URI is built from it")
+		case len(c.SelfService.SessionKey) < minSessionKeyLen:
+			return fmt.Errorf("selfService.sessionKey must be at least %d characters: it signs the session cookie", minSessionKeyLen)
+		case c.SelfService.SessionTTL.Duration <= 0:
+			return fmt.Errorf("selfService.sessionTTL must be positive, got %v", c.SelfService.SessionTTL.Duration)
+		}
+		// Catch a malformed externalURL at startup rather than as a confusing redirect_uri
+		// mismatch from authentik on someone's first login.
+		u, err := url.Parse(c.SelfService.ExternalURL)
+		switch {
+		case err != nil:
+			return fmt.Errorf("selfService.externalURL is not a URL: %w", err)
+		case u.Scheme != "http" && u.Scheme != "https":
+			return fmt.Errorf("selfService.externalURL needs an http:// or https:// scheme, got %q", c.SelfService.ExternalURL)
+		case u.Host == "":
+			return fmt.Errorf("selfService.externalURL has no host: %q", c.SelfService.ExternalURL)
+		case u.RawQuery != "" || u.Fragment != "":
+			return fmt.Errorf("selfService.externalURL must be a bare origin, not %q", c.SelfService.ExternalURL)
 		}
 		// A self-service VM outside gamingGuard would be started and then powered off under
 		// it, since nothing would hold p1 up for it.

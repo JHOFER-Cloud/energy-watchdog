@@ -114,20 +114,36 @@ The loop picks it up on the next tick. Set `false` to hand control back to the s
 
 ## Authentication
 
-The API trusts nothing it isn't given a signature for.
+energy-watchdog does its own OIDC login against authentik — the authorization-code flow with
+PKCE — exactly like every other service in the fleet. There is no forward-auth proxy in the
+request path, so nothing has to be trusted to inject identity headers.
 
-Authentik's forward-auth middleware (`fleet-auth`, `default-traefik-middleware.yaml`) injects
-`X-authentik-username` and `X-authentik-groups`, but **those are ignored** — anything able to
-reach the pod could set them. Identity comes only from the signed `X-authentik-Jwt`, verified
-with go-oidc against authentik's published keys.
+After a successful login the app issues its own session cookie: `payload.HMAC-SHA256(payload)`,
+signed with `selfService.sessionKey`. It is stateless, so a restart doesn't sign everyone out,
+and it can't be edited to change the user or their groups without invalidating the signature.
+Rotating `sessionKey` is how you force a global re-login.
 
-**The signing keys are fetched from the issuer's discovery document, never from the request.**
-The middleware also forwards `X-authentik-meta-jwks`, and verifying a token against a JWKS
-taken from the same request is worthless — a forger supplies both. `selfService.issuerURL` is
-the trust anchor.
+Two things the callback checks before it will issue a session, both in `completeLogin`:
+
+- **state** — compared against the value in the (signed) flow cookie, so a third party can't
+  feed us an authorization code of their choosing.
+- **expiry** — a half-finished login is only good for `flowTTL` (10m).
+
+The redirect URI is derived from `selfService.externalURL` as `<externalURL>/auth/callback`,
+so the app and the authentik provider can't drift apart. `redirect_uris` in the blueprint has
+to match it exactly.
 
 OIDC discovery runs in the background with backoff, not at startup, so authentik being down
-degrades the API to 503 while the reconcile loop keeps shedding and waking p1 normally.
+degrades the UI to 503 while the reconcile loop keeps shedding and waking p1 normally.
+
+### Why not forward-auth
+
+An earlier version used a proxy provider and the `default-authentik` Traefik middleware. It
+was the wrong call: nothing else in the fleet used that middleware, and it dragged in an
+authentik-managed Ingress competing for the hostname, an outpost assignment whose `providers`
+list is a full replacement, and a hard dependency on Traefik being able to resolve cluster
+DNS — which it can't, since it runs with `dnsPolicy: None` pointed at the LAN resolver.
+In-app OIDC needs none of that.
 
 ## Testing
 
