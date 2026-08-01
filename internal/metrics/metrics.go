@@ -16,6 +16,7 @@ type Metrics struct {
 	soc        float64
 	nodeUp     bool
 	gaming     bool
+	manualShed bool
 	dryRun     bool
 	mode       string
 	lastTick   int64
@@ -48,6 +49,7 @@ type Sample struct {
 	SoC        float64
 	NodeUp     bool
 	Gaming     bool
+	ManualShed bool
 	Tick       int64
 }
 
@@ -56,7 +58,7 @@ func (m *Metrics) Update(s Sample) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.surplus, m.surplusRaw, m.soc = s.Surplus, s.SurplusRaw, s.SoC
-	m.nodeUp, m.gaming = s.NodeUp, s.Gaming
+	m.nodeUp, m.gaming, m.manualShed = s.NodeUp, s.Gaming, s.ManualShed
 	m.lastTick = s.Tick
 }
 
@@ -107,9 +109,15 @@ func (m *Metrics) Handler() http.HandlerFunc {
 		fmt.Fprintf(w, "# HELP energy_watchdog_gaming_active Whether a gaming-guard guest is running.\n")
 		fmt.Fprintf(w, "# TYPE energy_watchdog_gaming_active gauge\n")
 		fmt.Fprintf(w, "energy_watchdog_gaming_active %g\n", b2f(m.gaming))
+		fmt.Fprintf(w, "# HELP energy_watchdog_manual_shed Whether the node is held shed by hand rather than by the solar signal.\n")
+		fmt.Fprintf(w, "# TYPE energy_watchdog_manual_shed gauge\n")
+		fmt.Fprintf(w, "energy_watchdog_manual_shed %g\n", b2f(m.manualShed))
 		fmt.Fprintf(w, "# HELP energy_watchdog_dry_run Whether the watchdog is in dry-run mode.\n")
 		fmt.Fprintf(w, "# TYPE energy_watchdog_dry_run gauge\n")
 		fmt.Fprintf(w, "energy_watchdog_dry_run %g\n", b2f(m.dryRun))
+		// A manual shed deliberately does NOT get its own mode label: nut-dog inhibits its
+		// wake on energy_watchdog_mode{mode="shed"} == 1, so the real mode has to keep
+		// reporting shed. Dashboards join energy_watchdog_manual_shed for the "why".
 		fmt.Fprintf(w, "# HELP energy_watchdog_mode Current mode (1 for the active mode).\n")
 		fmt.Fprintf(w, "# TYPE energy_watchdog_mode gauge\n")
 		for _, mode := range []string{"running", "shed", "gaming"} {
