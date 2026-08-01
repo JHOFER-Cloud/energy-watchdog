@@ -41,6 +41,37 @@ Two things stop it thrashing:
 Migrated guests don't come back on their own. They stay where they landed; moving them
 back is a manual call.
 
+### Holding p1 off by hand
+
+Sometimes there's plenty of sun and you still don't want the machine on — a heatwave, or
+maintenance. Setting the manual shed holds `p1` down regardless of surplus, via the admin
+button in the self-service UI or a ConfigMap key (see below).
+
+It isn't a fourth mode. `Decide` treats it as a permanent deficit, so every rule above
+applies unchanged: the gaming guard still keeps the host up, the grace window still runs,
+powering `p1` on by hand is still adopted as a gaming session, and a self-service VM request
+still wakes it. The one thing that changes is that returning surplus can no longer wake it.
+
+Clearing it hands control straight back to the sun on the next tick.
+
+`energy_watchdog_mode` keeps reporting `shed` while it's on — nut-dog's wake inhibit depends
+on that — and `energy_watchdog_manual_shed` says whether it was solar or a person who
+decided.
+
+### Desktop VMs (self-service)
+
+Optional UI on `:8080` for starting a desktop VM without touching Proxmox: it wakes `p1`
+first if it's off, starts the VM, and hands you a Moonlight link. Identity comes from
+authentik, and each VM lists the groups allowed to start it.
+
+The UI never touches `p1` itself. It records intent and the reconcile loop acts on it, so
+there's still exactly one owner of the host's power state — a click while a shed is halfway
+through migrating guests can't fight it. A request that lands during a shutdown simply stays
+outstanding until the shutdown finishes, and the loop then wakes the host.
+
+Off unless `selfService.addr` is set. See [DEVELOPMENT.md](./DEVELOPMENT.md) for how it fits
+together and how to run the whole thing locally.
+
 ### Gaming grace window
 
 When `p1` is on in `gaming` mode but no gaming guest is running yet, it isn't powered off
@@ -164,6 +195,10 @@ adapt, not a drop-in.
 go test ./...
 go build .
 ```
+
+To run the whole thing — reconcile loop, API and UI — against a fake Proxmox on your laptop,
+see [DEVELOPMENT.md](./DEVELOPMENT.md). It also covers the state/intent split, the
+single-owner invariant and how the token verification works.
 
 The image gets built and pushed to `ghcr.io/jhofer-cloud/energy-watchdog` (multi-arch,
 arm64 included) by semantic-release when something lands on `main`.

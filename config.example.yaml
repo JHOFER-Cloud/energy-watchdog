@@ -105,3 +105,26 @@ state:
   # In-cluster: persisted to this ConfigMap. Locally: the file below is used instead.
   configMapName: energy-watchdog-state
   filePath: /tmp/energy-watchdog-state.json
+
+# Self-service desktop-VM UI (JHC-548). Omit the whole block, or leave addr empty, to
+# disable it. The UI never touches p1 itself: it records intent and the reconcile loop
+# acts on it, so there is still exactly one owner of p1's power state.
+selfService:
+  addr: ":8080"
+  # Authentik OIDC issuer. Signing keys are fetched from its discovery document - the
+  # X-authentik-meta-jwks header the outpost forwards is deliberately NOT trusted, since a
+  # forged request would just supply its own key alongside its own token.
+  issuerURL: https://auth.jhofer.de/application/o/energy-watchdog/
+  # The authentik provider's client id, checked as the token audience.
+  clientID: energy-watchdog
+  # Groups allowed to hold p1 off regardless of solar surplus (heatwave, maintenance).
+  adminGroups: [jhc-admins]
+  # Each VM and the authentik groups whose members may start it. Every vmid must fall in
+  # guests.gamingGuard, or p1 would be powered off out from under the VM; this is checked
+  # at startup.
+  vms:
+    - vmid: 601
+      name: josef-desktop
+      groups: [deskvm-josef]
+      # Optional: handed to Moonlight via a moonlight:// link once the VM is up.
+      streamHost: p1.host.hla1.jhofer.lan
