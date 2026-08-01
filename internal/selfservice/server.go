@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -44,9 +45,11 @@ type Server struct {
 	cached clusterView
 }
 
-// New builds a Server verifying tokens against authentik.
+// New builds a Server that signs users in against authentik itself.
 func New(ctx context.Context, cfg *config.Config, cluster Cluster, store Store, nudge Nudger, log *slog.Logger) *Server {
-	auth := NewAuthenticator(ctx, cfg.SelfService.IssuerURL, cfg.SelfService.ClientID, log)
+	ss := cfg.SelfService
+	auth := newOIDCAuth(ctx, ss.IssuerURL, ss.ClientID, ss.ClientSecret, ss.RedirectURL(),
+		[]byte(ss.SessionKey), ss.SessionTTL.Duration, log)
 	return &Server{cfg: cfg, auth: auth, cluster: cluster, store: store, nudge: nudge, log: log}
 }
 
@@ -64,6 +67,11 @@ func NewDev(cfg *config.Config, cluster Cluster, store Store, nudge Nudger, log 
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /{$}", s.handlePage)
+	mux.HandleFunc("GET /auth/login", func(w http.ResponseWriter, r *http.Request) {
+		s.auth.startLogin(w, r, r.URL.Query().Get("return"))
+	})
+	mux.HandleFunc("GET /auth/callback", s.auth.completeLogin)
+	mux.HandleFunc("POST /auth/logout", s.auth.logout)
 	mux.HandleFunc("GET /api/status", s.handleStatus)
 	mux.HandleFunc("POST /api/vms/{vmid}/start", s.handleStart)
 	mux.HandleFunc("POST /api/admin/shed", s.handleShed)
@@ -302,19 +310,33 @@ func (s *Server) handleShed(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"manualShed": intent.Shed})
 }
 
-// identify authenticates the caller, writing the error response itself when it fails.
+// identify authenticates the caller, writing the error response itself when it fails. A
+// browser hitting the page gets sent to the login; an API call gets a 401 to handle, since
+// redirecting fetch() to authentik would just fail CORS and look like a hang.
 func (s *Server) identify(w http.ResponseWriter, r *http.Request) (Identity, bool) {
 	id, err := s.auth.Authenticate(r)
-	if err != nil {
-		if errors.Is(err, errNotReady) {
-			http.Error(w, "authentication not ready", http.StatusServiceUnavailable)
-			return Identity{}, false
-		}
-		s.log.Warn("self-service: rejected request", "err", err, "remote", r.RemoteAddr)
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
+	if err == nil {
+		return id, true
+	}
+	if errors.Is(err, errNotReady) || !s.auth.Ready() {
+		http.Error(w, "authentication not ready", http.StatusServiceUnavailable)
 		return Identity{}, false
 	}
-	return id, true
+	if !errors.Is(err, errNoSession) {
+		s.log.Warn("self-service: rejected request", "err", err, "remote", r.RemoteAddr)
+	}
+	if isPageRequest(r) {
+		s.auth.startLogin(w, r, r.URL.RequestURI())
+		return Identity{}, false
+	}
+	http.Error(w, "not signed in", http.StatusUnauthorized)
+	return Identity{}, false
+}
+
+// isPageRequest reports whether this is a browser navigating, rather than the page's own
+// fetch() calls.
+func isPageRequest(r *http.Request) bool {
+	return r.Method == http.MethodGet && !strings.HasPrefix(r.URL.Path, "/api/")
 }
 
 func (s *Server) fail(w http.ResponseWriter, code int, what string, err error) {

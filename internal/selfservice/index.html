@@ -58,13 +58,23 @@
   .warn { color: var(--warn); font-size: .85rem; margin: .8rem 0 0; }
   button.danger { background: #b3261e; color: #fff; border-color: transparent; }
   .host { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .85rem; }
+  button.linkish {
+    background: none; border: none; color: var(--muted); font-size: .85rem;
+    padding: 0 0 0 .6rem; cursor: pointer; text-decoration: underline;
+  }
+  button.linkish:hover { color: var(--fg); }
 </style>
 </head>
 <body>
 <main>
   <header>
     <h1>Desktop VMs</h1>
-    <span class="who" id="who"></span>
+    <span class="who">
+      <span id="who"></span>
+      <form method="post" action="/auth/logout" style="display:inline">
+        <button type="submit" class="linkish">Sign out</button>
+      </form>
+    </span>
   </header>
 
   <div class="banner" id="shedBanner">

@@ -111,12 +111,18 @@ state:
 # acts on it, so there is still exactly one owner of p1's power state.
 selfService:
   addr: ":8080"
-  # Authentik OIDC issuer. Signing keys are fetched from its discovery document - the
-  # X-authentik-meta-jwks header the outpost forwards is deliberately NOT trusted, since a
-  # forged request would just supply its own key alongside its own token.
+  # Authentik OIDC issuer. The app runs the authorization-code flow against it itself,
+  # the same way the rest of the fleet does - no forward-auth proxy in the request path.
   issuerURL: https://auth.jhofer.de/application/o/energy-watchdog/
-  # The authentik provider's client id, checked as the token audience.
   clientID: energy-watchdog
+  # Usually injected via SELFSERVICE_CLIENT_SECRET / SELFSERVICE_SESSION_KEY, which override
+  # whatever is here. sessionKey signs the session cookie; changing it logs everyone out.
+  clientSecret: ""
+  sessionKey: ""
+  # How a browser reaches this UI. The OIDC redirect URI is <externalURL>/auth/callback and
+  # must match the one registered on the authentik provider.
+  externalURL: https://deskvms.example.lan
+  sessionTTL: 12h
   # Groups allowed to hold p1 off regardless of solar surplus (heatwave, maintenance).
   adminGroups: [jhc-admins]
   # Each VM and the authentik groups whose members may start it. Every vmid must fall in

@@ -61,8 +61,9 @@ decided.
 ### Desktop VMs (self-service)
 
 Optional UI on `:8080` for starting a desktop VM without touching Proxmox: it wakes `p1`
-first if it's off, starts the VM, and shows you the host to connect to once it's up.
-Identity comes from authentik, and each VM lists the groups allowed to start it.
+first if it's off, starts the VM, and shows you the host to connect to once it's up. It signs
+you in against authentik over OIDC and keeps its own session; each VM lists the authentik
+groups allowed to start it.
 
 There's no one-click hand-off to Moonlight, because no such thing exists: Moonlight has no
 URL scheme to launch it with ([moonlight-qt#1874](https://github.com/moonlight-stream/moonlight-qt/issues/1874)

@@ -49,14 +49,23 @@ type fakeNudge struct{ n int }
 
 func (f *fakeNudge) Nudge() { f.n++ }
 
-// denyAuth stands in for a request that failed token verification.
+// denyAuth stands in for a caller with no valid session.
 type denyAuth struct{}
 
 func (denyAuth) Ready() bool { return true }
 
 func (denyAuth) Authenticate(*http.Request) (Identity, error) {
-	return Identity{}, fmt.Errorf("bad token")
+	return Identity{}, errNoSession
 }
+
+// Page requests get bounced to the login; the tests assert on that separately.
+func (denyAuth) startLogin(w http.ResponseWriter, r *http.Request, _ string) {
+	http.Redirect(w, r, "https://auth.example/authorize", http.StatusFound)
+}
+
+func (denyAuth) completeLogin(w http.ResponseWriter, r *http.Request) {}
+
+func (denyAuth) logout(w http.ResponseWriter, r *http.Request) {}
 
 func testServer(t *testing.T, auth authenticator, cluster *fakeCluster, store *fakeStore) (*Server, *fakeNudge) {
 	t.Helper()
@@ -188,19 +197,24 @@ func TestShedToggleIsAdminOnly(t *testing.T) {
 	}
 }
 
-// A rejected token must not reach any handler, including the page itself.
+// No session means no handler runs. A browser navigating gets sent to the login; the page's
+// own fetch() calls get a 401 they can surface, since redirecting those to authentik would
+// fail CORS and just look like a hang.
 func TestUnauthenticatedIsRejectedEverywhere(t *testing.T) {
 	store := &fakeStore{}
 	s, nudge := testServer(t, denyAuth{}, &fakeCluster{up: true}, store)
 
-	for _, tc := range []struct{ method, path, body string }{
-		{http.MethodGet, "/", ""},
-		{http.MethodGet, "/api/status", ""},
-		{http.MethodPost, "/api/vms/601/start", ""},
-		{http.MethodPost, "/api/admin/shed", `{"shed":true}`},
+	for _, tc := range []struct {
+		method, path, body string
+		want               int
+	}{
+		{http.MethodGet, "/", "", http.StatusFound},
+		{http.MethodGet, "/api/status", "", http.StatusUnauthorized},
+		{http.MethodPost, "/api/vms/601/start", "", http.StatusUnauthorized},
+		{http.MethodPost, "/api/admin/shed", `{"shed":true}`, http.StatusUnauthorized},
 	} {
-		if w := do(t, s, tc.method, tc.path, tc.body); w.Code != http.StatusUnauthorized {
-			t.Errorf("%s %s = %d, want 401", tc.method, tc.path, w.Code)
+		if w := do(t, s, tc.method, tc.path, tc.body); w.Code != tc.want {
+			t.Errorf("%s %s = %d, want %d", tc.method, tc.path, w.Code, tc.want)
 		}
 	}
 	if store.saves != 0 || nudge.n != 0 {
