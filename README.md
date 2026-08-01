@@ -30,7 +30,7 @@ Two things stop it thrashing:
 
 | From | Trigger | What happens |
 |------|---------|--------------|
-| `running` | deficit, nothing gaming | migrate criticals, stop the rest, silence alerts, power off |
+| `running` | deficit, nothing gaming | silence alerts, migrate criticals, stop the rest, power off |
 | `running` | deficit, a gaming VM is up | migrate and stop, but leave the host on |
 | `shed` | surplus is back | Wake-on-LAN, start the guests it stopped, drop the silence |
 | `shed` | host got powered on by hand | treat it as `gaming`, don't fight a manual wake |
@@ -144,6 +144,11 @@ State (the mode and the guests it stopped) goes in a ConfigMap in-cluster, or a 
 when you run it by hand. Alertmanager silences are not stored there: each reconcile lists
 the silences it owns (by their `createdBy`) straight from Alertmanager and converges them to
 the set it wants, so a lost or stale ConfigMap can never orphan a silence.
+
+The silence goes up *before* the shed starts, not just before the power-off. Migrating and
+stopping the guests is itself what makes their alerts fire, and with `migrateTimeout` +
+`stopTimeout` that window runs to tens of minutes, so silencing afterwards would mean every
+one of them had already gone off.
 
 When `p1` comes back, its silences aren't dropped the instant the node reports up — the
 guests hosted on it (a Talos cluster) take a while to boot, and dropping coverage that early
