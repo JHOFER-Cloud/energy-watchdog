@@ -31,6 +31,18 @@ type Controller struct {
 
 	observeFailures int  // consecutive failed observes, for log-level escalation
 	warnedNoUptime  bool // the missing-uptime warning is logged once, not every tick
+
+	nudge chan struct{} // out-of-band reconcile requests from the self-service API
+}
+
+// Nudge asks for a reconcile now instead of at the next tick, coalescing with any request
+// already pending. The API calls it after writing intent so a button press feels immediate
+// without the API ever touching p1 itself.
+func (c *Controller) Nudge() {
+	select {
+	case c.nudge <- struct{}{}:
+	default: // one already queued; a second changes nothing
+	}
 }
 
 // observeFailEscalate is how many back-to-back failed observes are tolerated at warn before
@@ -40,7 +52,8 @@ const observeFailEscalate = 5
 // New builds a Controller. ams is keyed by Alertmanager base URL so a persisted
 // silence can be deleted from the same Alertmanager it was created in.
 func New(cfg *config.Config, p *prom.Client, px *proxmox.Client, ams map[string]*alertmgr.Client, store state.Store, m *metrics.Metrics, log *slog.Logger) *Controller {
-	return &Controller{cfg: cfg, prom: p, px: px, ams: ams, store: store, metrics: m, log: log}
+	return &Controller{cfg: cfg, prom: p, px: px, ams: ams, store: store, metrics: m, log: log,
+		nudge: make(chan struct{}, 1)}
 }
 
 // Run reconciles immediately, then on every interval until ctx is cancelled.
@@ -54,13 +67,15 @@ func (c *Controller) Run(ctx context.Context) {
 			return
 		case <-t.C:
 			c.reconcile(ctx)
+		case <-c.nudge:
+			c.reconcile(ctx)
 		}
 	}
 }
 
 func (c *Controller) reconcile(ctx context.Context) {
 	now := time.Now()
-	snap, gaming, err := c.observe(ctx)
+	snap, gaming, err := c.observe(ctx, now)
 	if err != nil {
 		// A failed observe is tolerated: the tick is skipped and the last good reading is kept
 		// (publishing a zeroed sample here made a single transient Proxmox 502 flap
@@ -87,7 +102,7 @@ func (c *Controller) reconcile(ctx context.Context) {
 	// minutes, and reporting its mode and success up front hid every failing apply.
 	c.metrics.Update(metrics.Sample{
 		Surplus: snap.Surplus, SurplusRaw: snap.SurplusRaw, SoC: snap.SoC,
-		NodeUp: snap.NodeUp, Gaming: gaming, Tick: now.Unix(),
+		NodeUp: snap.NodeUp, Gaming: gaming, ManualShed: snap.ManualShed, Tick: now.Unix(),
 	})
 
 	if err := c.apply(ctx, plan, snap); err != nil {
@@ -141,10 +156,14 @@ func (c *Controller) persist(ctx context.Context, p Plan, snap Snapshot) error {
 }
 
 // observe gathers the snapshot and reports whether a gaming guest is running.
-func (c *Controller) observe(ctx context.Context) (Snapshot, bool, error) {
+func (c *Controller) observe(ctx context.Context, now time.Time) (Snapshot, bool, error) {
 	st, err := c.store.Load(ctx)
 	if err != nil {
 		return Snapshot{}, false, err
+	}
+	intent, err := c.store.LoadIntent(ctx)
+	if err != nil {
+		return Snapshot{Mode: st.Mode}, false, err
 	}
 	reading, err := c.prom.Read(ctx, c.cfg.Prometheus)
 	if err != nil {
@@ -177,19 +196,37 @@ func (c *Controller) observe(ctx context.Context) (Snapshot, bool, error) {
 		Mode:       st.Mode,
 		StoppedSet: st.Stopped,
 		GraceSince: st.GraceSince,
+		ManualShed: intent.Shed,
+		WakeVMIDs:  c.requestedVMIDs(intent, now),
 	}
 	return snap, nodeUp && gamingActive(guests, c.cfg.Guests.GamingGuard), nil
+}
+
+// requestedVMIDs is the live wake requests, restricted to the gaming-guard block. The API
+// authorises callers already; this makes a hand-edited intent unable to start, say, a Talos
+// node VM, and stops a request keeping p1 up for a guest the guard would never hold it for.
+func (c *Controller) requestedVMIDs(intent state.Intent, now time.Time) []int {
+	var out []int
+	for _, w := range intent.LiveWake(now, c.cfg.GamingGrace.Duration) {
+		if !c.cfg.Guests.GamingGuard.Contains(w.VMID) {
+			c.log.Warn("ignoring wake request outside the gaming-guard range", "vmid", w.VMID, "user", w.User)
+			continue
+		}
+		out = append(out, w.VMID)
+	}
+	return out
 }
 
 func isNoop(p Plan, snap Snapshot) bool {
 	return p.NextMode == snap.Mode && p.GraceSince == snap.GraceSince &&
 		!p.Poweroff && !p.Wake && !p.Silence && !p.Unsilence &&
-		len(p.Migrate) == 0 && len(p.Stop) == 0 && len(p.Start) == 0
+		len(p.Migrate) == 0 && len(p.Stop) == 0 && len(p.Start) == 0 && len(p.StartRequested) == 0
 }
 
 func (c *Controller) logPlan(p Plan) {
 	c.log.Info("[dry-run] would act",
 		"migrate", guestIDs(p.Migrate), "stop", guestIDs(p.Stop), "start", refIDs(p.Start),
+		"startRequested", p.StartRequested,
 		"poweroff", p.Poweroff, "wake", p.Wake, "silence", p.Silence, "unsilence", p.Unsilence,
 		"nextMode", p.NextMode)
 }
@@ -226,6 +263,13 @@ func (c *Controller) execute(ctx context.Context, p Plan, snap Snapshot) error {
 			return err
 		}
 		st.Stopped = nil
+	}
+	if len(p.StartRequested) > 0 {
+		// Best-effort: a desktop VM that won't boot is the user's problem, and failing the
+		// reconcile here would roll back the mode the wake just established.
+		if err := c.startRequested(ctx, p.StartRequested); err != nil {
+			c.log.Warn("start requested desktop VMs", "err", err)
+		}
 	}
 	if p.Poweroff {
 		// Disable replication ahead of the power-off instead of waiting for the next tick to
@@ -314,6 +358,40 @@ func (c *Controller) startAll(ctx context.Context, guests []state.GuestRef) erro
 			continue // best-effort; one stuck guest shouldn't block the others
 		}
 		c.log.Info("started guest", "vmid", ref.VMID, "type", ref.Type)
+	}
+	return nil
+}
+
+// startRequested boots the desktop VMs a self-service request asked for. The ids come from
+// Decide without a guest type, because the node may still have been down then; now that it is
+// up its guest list resolves them.
+func (c *Controller) startRequested(ctx context.Context, ids []int) error {
+	guests, err := c.px.Guests(ctx, c.cfg.Proxmox.Node)
+	if err != nil {
+		return err
+	}
+	byID := make(map[int]proxmox.Guest, len(guests))
+	for _, g := range guests {
+		byID[g.VMID] = g
+	}
+	for _, id := range ids {
+		g, ok := byID[id]
+		if !ok {
+			c.log.Warn("requested guest is not on the node", "vmid", id, "node", c.cfg.Proxmox.Node)
+			continue
+		}
+		if g.Running {
+			continue
+		}
+		upid, err := c.px.Start(ctx, c.cfg.Proxmox.Node, g)
+		if err == nil {
+			err = c.px.WaitTask(ctx, c.cfg.Proxmox.Node, upid)
+		}
+		if err != nil {
+			c.log.Warn("failed to start requested guest", "vmid", id, "err", err)
+			continue
+		}
+		c.log.Info("started requested guest", "vmid", id, "type", g.Type)
 	}
 	return nil
 }
