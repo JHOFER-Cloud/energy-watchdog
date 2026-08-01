@@ -32,6 +32,67 @@ type Config struct {
 	Guests       Guests       `yaml:"guests"`
 	Alertmanager Alertmanager `yaml:"alertmanager"`
 	State        State        `yaml:"state"`
+	SelfService  SelfService  `yaml:"selfService"`
+}
+
+// SelfService configures the desktop-VM self-service UI (JHC-548). It is off unless addr is
+// set. The UI only ever records intent; the reconcile loop remains the sole owner of p1.
+type SelfService struct {
+	// Addr is the listen address for the UI and its API. Empty disables the whole feature.
+	Addr string `yaml:"addr"`
+	// IssuerURL is the authentik OIDC issuer. Signing keys are fetched from its discovery
+	// document and never from the request: the forwarded X-authentik-meta-jwks header is
+	// attacker-controlled in exactly the case we are defending against.
+	IssuerURL string `yaml:"issuerURL"`
+	// ClientID is the authentik provider's client id, checked as the token audience.
+	ClientID string `yaml:"clientID"`
+	// AdminGroups may toggle the manual shed. Membership comes from the verified token.
+	AdminGroups []string `yaml:"adminGroups"`
+	// VMs are the desktop VMs offered, each with the groups allowed to control it.
+	VMs []SelfServiceVM `yaml:"vms"`
+}
+
+// SelfServiceVM is one desktop VM and who may start it.
+type SelfServiceVM struct {
+	VMID int    `yaml:"vmid"`
+	Name string `yaml:"name"`
+	// Groups are authentik groups whose members may start this VM.
+	Groups []string `yaml:"groups"`
+	// StreamHost is the host the UI hands to Moonlight once the VM is up. Optional.
+	StreamHost string `yaml:"streamHost"`
+}
+
+// Enabled reports whether the self-service UI should be served.
+func (s SelfService) Enabled() bool { return s.Addr != "" }
+
+// Allowed reports the VMs these groups may control.
+func (s SelfService) Allowed(groups []string) []SelfServiceVM {
+	has := make(map[string]bool, len(groups))
+	for _, g := range groups {
+		has[g] = true
+	}
+	var out []SelfServiceVM
+	for _, vm := range s.VMs {
+		for _, g := range vm.Groups {
+			if has[g] {
+				out = append(out, vm)
+				break
+			}
+		}
+	}
+	return out
+}
+
+// IsAdmin reports whether any of these groups may toggle the manual shed.
+func (s SelfService) IsAdmin(groups []string) bool {
+	for _, g := range groups {
+		for _, a := range s.AdminGroups {
+			if g == a {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // DryRunMode is how much of the plan the watchdog carries out.
@@ -288,6 +349,21 @@ func (c *Config) validate() error {
 	if c.Prometheus.HeadroomWatts < c.Prometheus.ShedBelowWatts {
 		return fmt.Errorf("prometheus.headroomWatts (%v) must be >= shedBelowWatts (%v) for stable hysteresis",
 			c.Prometheus.HeadroomWatts, c.Prometheus.ShedBelowWatts)
+	}
+	if c.SelfService.Enabled() {
+		switch {
+		case c.SelfService.IssuerURL == "":
+			return fmt.Errorf("selfService.issuerURL is required when selfService.addr is set")
+		case c.SelfService.ClientID == "":
+			return fmt.Errorf("selfService.clientID is required when selfService.addr is set")
+		}
+		// A self-service VM outside gamingGuard would be started and then powered off under
+		// it, since nothing would hold p1 up for it.
+		for _, vm := range c.SelfService.VMs {
+			if !c.Guests.GamingGuard.Contains(vm.VMID) {
+				return fmt.Errorf("selfService.vms: %d is not in guests.gamingGuard, so p1 would not stay up for it", vm.VMID)
+			}
+		}
 	}
 	for _, o := range []struct {
 		a, b string

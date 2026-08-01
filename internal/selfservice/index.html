@@ -1,0 +1,243 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Desktop VMs</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #f6f7f9; --card: #fff; --fg: #16181d; --muted: #6b7280;
+    --line: #e3e6ea; --accent: #2f6feb; --ok: #16794a; --warn: #9a5b00;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #101216; --card: #181b21; --fg: #e9ecf1; --muted: #9aa3af;
+      --line: #262b33; --accent: #5b8cf5; --ok: #4ac088; --warn: #e0a458;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 2rem 1rem; background: var(--bg); color: var(--fg);
+    font: 15px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  main { max-width: 44rem; margin: 0 auto; }
+  header { display: flex; align-items: baseline; justify-content: space-between; gap: 1rem; margin-bottom: 1.5rem; }
+  h1 { font-size: 1.35rem; margin: 0; letter-spacing: -0.01em; }
+  .who { color: var(--muted); font-size: .85rem; }
+  .banner {
+    display: none; padding: .7rem .9rem; border-radius: .5rem; margin-bottom: 1rem;
+    border: 1px solid var(--line); background: var(--card); font-size: .9rem;
+  }
+  .banner.on { display: block; }
+  .banner b { color: var(--warn); }
+  .vm {
+    display: flex; align-items: center; gap: 1rem; padding: 1rem;
+    background: var(--card); border: 1px solid var(--line); border-radius: .6rem; margin-bottom: .75rem;
+  }
+  .vm .info { flex: 1; min-width: 0; }
+  .vm .name { font-weight: 600; }
+  .vm .state { color: var(--muted); font-size: .85rem; display: flex; align-items: center; gap: .4rem; }
+  .dot { width: .5rem; height: .5rem; border-radius: 50%; background: var(--muted); flex: none; }
+  .dot.ready { background: var(--ok); }
+  .dot.busy { background: var(--warn); animation: pulse 1.4s ease-in-out infinite; }
+  @keyframes pulse { 0%,100% { opacity: 1 } 50% { opacity: .3 } }
+  button {
+    font: inherit; font-weight: 550; padding: .5rem 1rem; border-radius: .45rem;
+    border: 1px solid transparent; background: var(--accent); color: #fff; cursor: pointer;
+  }
+  button:disabled { opacity: .5; cursor: default; }
+  button.secondary { background: transparent; border-color: var(--line); color: var(--fg); }
+  a.stream { text-decoration: none; }
+  .admin { margin-top: 2rem; padding-top: 1.25rem; border-top: 1px solid var(--line); display: none; }
+  .admin.on { display: block; }
+  .admin h2 { font-size: .95rem; margin: 0 0 .6rem; }
+  .admin p { color: var(--muted); font-size: .85rem; margin: 0 0 .8rem; }
+  .row { display: flex; align-items: center; gap: .75rem; }
+  .err { color: var(--warn); font-size: .85rem; min-height: 1.2em; margin-top: 1rem; }
+  .warn { color: var(--warn); font-size: .85rem; margin: .8rem 0 0; }
+  button.danger { background: #b3261e; color: #fff; border-color: transparent; }
+  .host { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .85rem; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Desktop VMs</h1>
+    <span class="who" id="who"></span>
+  </header>
+
+  <div class="banner" id="shedBanner">
+    <b>Manual shed is on.</b> p1 is being held off on purpose. Starting a desktop VM still
+    works and will wake it.
+  </div>
+
+  <div id="vms"></div>
+  <div class="err" id="err"></div>
+
+  <section class="admin" id="admin">
+    <h2>Admin</h2>
+    <p>Hold p1 off regardless of solar surplus &mdash; for a heatwave or maintenance. Gaming
+       still works: a desktop VM request wakes it anyway.</p>
+    <div class="row">
+      <button id="shedBtn" class="secondary"></button>
+      <button id="shedCancel" class="secondary" hidden>Cancel</button>
+      <span class="who" id="shedState"></span>
+    </div>
+    <p id="shedWarn" class="warn" hidden></p>
+  </section>
+</main>
+
+<script>
+const PHASES = {
+  off:      { text: "Off",                                          dot: "" },
+  waking:   { text: "Waking the server…",                      dot: "busy" },
+  starting: { text: "Server up, starting the VM…",             dot: "busy" },
+  ready:    { text: "Running",                                      dot: "ready" },
+};
+// Shown instead of "waking" when the host is on its way down: the request stays live and the
+// watchdog wakes it again once the shutdown finishes, so this resolves on its own.
+const SHUTTING_DOWN = "Server was shutting down — waiting for it to come back up…";
+
+let lastNodeUp = null, sawShutdown = false, busy = new Set();
+
+async function api(path, opts) {
+  const res = await fetch(path, opts);
+  if (!res.ok) throw new Error(await res.text() || res.statusText);
+  return res.status === 204 ? null : res.json();
+}
+
+function render(s) {
+  document.getElementById("who").textContent = s.user;
+  document.getElementById("shedBanner").classList.toggle("on", s.manualShed);
+  document.getElementById("admin").classList.toggle("on", s.admin);
+  if (s.admin) {
+    lastImpact = s.impact || null;
+    manualShed = s.manualShed;
+    if (!confirming) paintShedButton();
+    document.getElementById("shedState").textContent = s.manualShed ? "manual" : "following solar";
+  }
+
+  // If p1 disappeared while a request was outstanding, the loop is mid-shutdown. Say so.
+  if (lastNodeUp === true && s.nodeUp === false && s.vms.some(v => v.requested)) sawShutdown = true;
+  if (s.nodeUp) sawShutdown = false;
+  lastNodeUp = s.nodeUp;
+
+  const host = document.getElementById("vms");
+  host.replaceChildren(...s.vms.map(vm => {
+    const p = PHASES[vm.phase] || PHASES.off;
+    const text = (vm.phase === "waking" && sawShutdown) ? SHUTTING_DOWN : p.text;
+
+    const el = document.createElement("div");
+    el.className = "vm";
+    el.innerHTML = `
+      <div class="info">
+        <div class="name"></div>
+        <div class="state"><span class="dot ${p.dot}"></span><span class="phase"></span></div>
+      </div>`;
+    el.querySelector(".name").textContent = vm.name || ("VM " + vm.vmid);
+    el.querySelector(".phase").textContent = text;
+
+    // Moonlight has no URL scheme to hand off to (moonlight-stream/moonlight-qt#1874 is
+    // still open), so the useful thing is the host itself, ready to paste into the client.
+    if (vm.phase === "ready" && vm.streamHost) {
+      const b = document.createElement("button");
+      b.className = "secondary";
+      b.textContent = "Copy host";
+      b.onclick = async () => {
+        try {
+          await navigator.clipboard.writeText(vm.streamHost);
+          b.textContent = "Copied";
+          setTimeout(() => { b.textContent = "Copy host"; }, 1500);
+        } catch { show("Clipboard blocked — the host is " + vm.streamHost); }
+      };
+      el.querySelector(".state").insertAdjacentHTML("beforeend",
+        `<span class="host"></span>`);
+      el.querySelector(".host").textContent = "· " + vm.streamHost;
+      el.appendChild(b);
+    } else {
+      const b = document.createElement("button");
+      const working = vm.requested || busy.has(vm.vmid);
+      b.textContent = working ? "Starting…" : "Start";
+      b.disabled = working || vm.phase === "ready";
+      b.onclick = async () => {
+        busy.add(vm.vmid); b.disabled = true; b.textContent = "Starting…";
+        try { await api(`/api/vms/${vm.vmid}/start`, { method: "POST" }); }
+        catch (e) { show(e.message); busy.delete(vm.vmid); }
+        poll();
+      };
+      el.appendChild(b);
+    }
+    return el;
+  }));
+
+  s.vms.forEach(vm => { if (vm.phase === "ready") busy.delete(vm.vmid); });
+  show(s.error || "");
+}
+
+function show(msg) { document.getElementById("err").textContent = msg; }
+
+let manualShed = false, lastImpact = null, confirming = false;
+
+const shedBtn = document.getElementById("shedBtn");
+const shedCancel = document.getElementById("shedCancel");
+const shedWarn = document.getElementById("shedWarn");
+
+// Spells out what holding p1 off does right now. Stopping guests and powering the host down
+// is not something to do on a stray click, and "are you sure?" without numbers is useless.
+function impactText(i) {
+  if (!i) return "This will power p1 off.";
+  if (i.gamingActive) {
+    return `A desktop VM is running, so p1 will stay on — but ${i.migrate} guest(s) will be ` +
+           `migrated away and ${i.stop} stopped. p1 powers off once the VM does.`;
+  }
+  return `This migrates ${i.migrate} guest(s) off p1, stops ${i.stop}, and powers it off. ` +
+         `Migrated guests do not come back automatically.`;
+}
+
+function paintShedButton() {
+  confirming = false;
+  shedBtn.textContent = manualShed ? "Resume solar control" : "Hold p1 off";
+  shedBtn.className = "secondary";
+  shedCancel.hidden = true;
+  shedWarn.hidden = true;
+}
+
+async function setShed(on) {
+  try {
+    await api("/api/admin/shed", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ shed: on }),
+    });
+  } catch (err) { show(err.message); }
+  paintShedButton();
+  poll();
+}
+
+shedBtn.onclick = () => {
+  // Resuming solar control is harmless, so it goes straight through. Shedding asks first.
+  if (manualShed) { setShed(false); return; }
+  if (!confirming) {
+    confirming = true;
+    shedBtn.textContent = "Yes, hold p1 off";
+    shedBtn.className = "danger";
+    shedCancel.hidden = false;
+    shedWarn.textContent = impactText(lastImpact);
+    shedWarn.hidden = false;
+    return;
+  }
+  setShed(true);
+};
+
+shedCancel.onclick = paintShedButton;
+
+async function poll() {
+  try { render(await api("/api/status")); }
+  catch (e) { show(e.message); }
+}
+
+poll();
+setInterval(poll, 2000);
+</script>
+</body>
+</html>

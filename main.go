@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -19,11 +20,14 @@ import (
 	"github.com/JHOFER-Cloud/energy-watchdog/internal/metrics"
 	"github.com/JHOFER-Cloud/energy-watchdog/internal/prom"
 	"github.com/JHOFER-Cloud/energy-watchdog/internal/proxmox"
+	"github.com/JHOFER-Cloud/energy-watchdog/internal/selfservice"
 	"github.com/JHOFER-Cloud/energy-watchdog/internal/state"
 )
 
 func main() {
 	configPath := flag.String("config", "config.yaml", "path to the config file")
+	devUser := flag.String("dev-user", "", "LOCAL DEV ONLY: skip SSO and treat every self-service request as this user")
+	devGroups := flag.String("dev-groups", "", "LOCAL DEV ONLY: comma-separated groups for -dev-user")
 	flag.Parse()
 
 	log := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
@@ -61,10 +65,11 @@ func main() {
 
 	m := metrics.New(cfg.DryRun != config.DryRunFull)
 	m.SetThresholds(cfg.Prometheus.HeadroomWatts, cfg.Prometheus.ShedBelowWatts, cfg.Prometheus.MinBatteryPercent)
+	px := proxmox.New(cfg.Proxmox.Endpoint, cfg.Proxmox.TokenID, cfg.Proxmox.TokenSecret, tlsConf)
 	ctrl := controller.New(
 		cfg,
 		prom.New(cfg.Prometheus.URL),
-		proxmox.New(cfg.Proxmox.Endpoint, cfg.Proxmox.TokenID, cfg.Proxmox.TokenSecret, tlsConf),
+		px,
 		ams,
 		store,
 		m,
@@ -75,6 +80,16 @@ func main() {
 	defer stop()
 
 	go serveMetrics(ctx, cfg.MetricsAddr, m, log)
+	if cfg.SelfService.Enabled() {
+		var srv *selfservice.Server
+		if *devUser != "" {
+			srv = selfservice.NewDev(cfg, px, store, ctrl, log, *devUser, splitGroups(*devGroups))
+		} else {
+			srv = selfservice.New(ctx, cfg, px, store, ctrl, log)
+		}
+		go serveHTTP(ctx, cfg.SelfService.Addr, srv.Handler(), "self-service", log)
+		log.Info("self-service UI enabled", "addr", cfg.SelfService.Addr, "vms", len(cfg.SelfService.VMs))
+	}
 
 	log.Info("energy-watchdog started", "interval", cfg.Interval.Duration, "node", cfg.Proxmox.Node, "dryRun", cfg.DryRun.String())
 	ctrl.Run(ctx)
@@ -90,11 +105,22 @@ func newStore(cfg *config.Config, log *slog.Logger) (state.Store, error) {
 	return state.NewFileStore(cfg.State.FilePath), nil
 }
 
+func splitGroups(s string) []string {
+	if s == "" {
+		return nil
+	}
+	return strings.Split(s, ",")
+}
+
 func serveMetrics(ctx context.Context, addr string, m *metrics.Metrics, log *slog.Logger) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/metrics", m.Handler())
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("ok")) })
-	srv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+	serveHTTP(ctx, addr, mux, "metrics", log)
+}
+
+func serveHTTP(ctx context.Context, addr string, h http.Handler, name string, log *slog.Logger) {
+	srv := &http.Server{Addr: addr, Handler: h, ReadHeaderTimeout: 5 * time.Second}
 	go func() {
 		<-ctx.Done()
 		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -102,6 +128,6 @@ func serveMetrics(ctx context.Context, addr string, m *metrics.Metrics, log *slo
 		_ = srv.Shutdown(shutCtx)
 	}()
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		log.Error("metrics server", "err", err)
+		log.Error(name+" server", "err", err)
 	}
 }

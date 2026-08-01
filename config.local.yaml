@@ -1,0 +1,53 @@
+# Local development config: points at cmd/fakecluster instead of real hardware, so the whole
+# binary (reconcile loop, UI, API) runs on a laptop. See the README's local development section.
+interval: 5s
+dryRun: false
+metricsAddr: ":9333"
+gamingGrace: 2m
+
+prometheus:
+  url: http://127.0.0.1:8006
+  window: 1m
+  headroomWatts: 1000
+  shedBelowWatts: 0
+  minBatteryPercent: 20
+  powerScale: 1 # the fake serves watts already
+  productionMetric: fake_production_w
+  consumptionMetric: fake_consumption_w
+  batteryMetric: fake_charge_level_percent
+
+proxmox:
+  endpoint: http://127.0.0.1:8006
+  tokenID: "dev@pve!local"
+  tokenSecret: "not-a-real-secret"
+  node: pve-1
+  targetNodes: [pve-2, pve-3]
+  manageReplication: false
+  freshBootWindow: 5m
+
+guests:
+  migrate: ["100-199"]
+  stop: ["300-399"]
+  gamingGuard: ["600-699"]
+
+alertmanager:
+  urls: []
+  silences: []
+
+state:
+  filePath: /tmp/energy-watchdog-dev-state.json
+
+selfService:
+  addr: ":8080"
+  # Unused with -dev-user, but config validation still requires them.
+  issuerURL: https://auth.example.invalid/application/o/energy-watchdog/
+  clientID: dev
+  adminGroups: [jhc-admins]
+  vms:
+    - vmid: 601
+      name: josef-desktop
+      groups: [deskvm-josef]
+      streamHost: p1.host.hla1.jhofer.lan
+    - vmid: 602
+      name: guest-desktop
+      groups: [deskvm-guests]
