@@ -3,6 +3,7 @@ package config
 
 import (
 	"fmt"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -70,6 +71,10 @@ type SelfServiceVM struct {
 	// StreamHost is the host the UI hands to Moonlight once the VM is up. Optional.
 	StreamHost string `yaml:"streamHost"`
 }
+
+// minSessionKeyLen is the shortest session key worth signing with; anything shorter is a
+// placeholder someone forgot to replace.
+const minSessionKeyLen = 16
 
 // Enabled reports whether the self-service UI should be served.
 func (s SelfService) Enabled() bool { return s.Addr != "" }
@@ -385,6 +390,23 @@ func (c *Config) validate() error {
 			return fmt.Errorf("selfService.sessionKey is required (or set SELFSERVICE_SESSION_KEY)")
 		case c.SelfService.ExternalURL == "":
 			return fmt.Errorf("selfService.externalURL is required: the OIDC redirect URI is built from it")
+		case len(c.SelfService.SessionKey) < minSessionKeyLen:
+			return fmt.Errorf("selfService.sessionKey must be at least %d characters: it signs the session cookie", minSessionKeyLen)
+		case c.SelfService.SessionTTL.Duration <= 0:
+			return fmt.Errorf("selfService.sessionTTL must be positive, got %v", c.SelfService.SessionTTL.Duration)
+		}
+		// Catch a malformed externalURL at startup rather than as a confusing redirect_uri
+		// mismatch from authentik on someone's first login.
+		u, err := url.Parse(c.SelfService.ExternalURL)
+		switch {
+		case err != nil:
+			return fmt.Errorf("selfService.externalURL is not a URL: %w", err)
+		case u.Scheme != "http" && u.Scheme != "https":
+			return fmt.Errorf("selfService.externalURL needs an http:// or https:// scheme, got %q", c.SelfService.ExternalURL)
+		case u.Host == "":
+			return fmt.Errorf("selfService.externalURL has no host: %q", c.SelfService.ExternalURL)
+		case u.RawQuery != "" || u.Fragment != "":
+			return fmt.Errorf("selfService.externalURL must be a bare origin, not %q", c.SelfService.ExternalURL)
 		}
 		// A self-service VM outside gamingGuard would be started and then powered off under
 		// it, since nothing would hold p1 up for it.

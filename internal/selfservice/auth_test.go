@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/coreos/go-oidc/v3/oidc"
 	"golang.org/x/oauth2"
 )
 
@@ -94,9 +95,10 @@ func TestExpiredSessionIsRejected(t *testing.T) {
 // a stale tab. Either way it must not produce a session.
 func TestCallbackRejectsStateMismatch(t *testing.T) {
 	a := testAuth()
-	// Non-nil oauth config makes ready() true, so we reach the state check rather than
-	// stopping at the 503. The exchange is never attempted, so a bare config is enough.
+	// ready() needs both halves. Neither is actually used: the state check rejects first, so
+	// a bare config and a verifier over a nil key set are enough to get past readiness.
 	a.oauth = &oauth2.Config{}
+	a.verifier = oidc.NewVerifier("https://auth.example", nil, &oidc.Config{ClientID: "x"})
 
 	flow, err := a.encode(flowData{State: "expected", Verifier: "v", Expires: time.Now().Add(time.Minute).Unix()})
 	if err != nil {
@@ -131,6 +133,54 @@ func TestSafeReturn(t *testing.T) {
 	} {
 		if got := safeReturn(in); got != want {
 			t.Errorf("safeReturn(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// A half-initialised authenticator must report not-ready rather than being used: completeLogin
+// dereferences the verifier, so "ready" with a nil verifier would panic on a real login.
+func TestReadyNeedsBothHalves(t *testing.T) {
+	a := testAuth()
+	if a.Ready() {
+		t.Error("zero authenticator reported ready")
+	}
+	a.oauth = &oauth2.Config{}
+	if a.Ready() {
+		t.Error("ready with a nil verifier")
+	}
+	a.verifier = oidc.NewVerifier("https://auth.example", nil, &oidc.Config{ClientID: "x"})
+	if !a.Ready() {
+		t.Error("not ready with both halves set")
+	}
+}
+
+// returnTo comes from the query string, so it is normalised before being signed into the
+// flow cookie - not just at redirect time.
+func TestStartLoginNormalisesReturn(t *testing.T) {
+	a := testAuth()
+	a.oauth = &oauth2.Config{ClientID: "x", Endpoint: oauth2.Endpoint{AuthURL: "https://auth.example/authorize"}}
+	a.verifier = oidc.NewVerifier("https://auth.example", nil, &oidc.Config{ClientID: "x"})
+
+	for _, in := range []string{"https://evil.example", "//evil.example", strings.Repeat("/a", maxReturn)} {
+		w := httptest.NewRecorder()
+		a.startLogin(w, httptest.NewRequest(http.MethodGet, "/auth/login", nil), in)
+
+		var flow flowData
+		var found bool
+		for _, c := range w.Result().Cookies() {
+			if c.Name != flowCookie {
+				continue
+			}
+			found = true
+			if err := a.decode(c.Value, &flow); err != nil {
+				t.Fatalf("flow cookie for %q: %v", in, err)
+			}
+		}
+		if !found {
+			t.Fatalf("no flow cookie set for %q", in)
+		}
+		if flow.Return != "/" {
+			t.Errorf("returnTo %q stored as %q, want /", in, flow.Return)
 		}
 	}
 }

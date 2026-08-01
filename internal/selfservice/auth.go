@@ -96,10 +96,12 @@ func backoff(attempt int) time.Duration {
 	return min(time.Duration(1<<min(attempt, 6))*time.Second, time.Minute)
 }
 
+// ready requires both halves: completeLogin dereferences the verifier, so treating a
+// half-initialised authenticator as usable would panic rather than return a clean 503.
 func (a *oidcAuth) ready() (*oauth2.Config, *oidc.IDTokenVerifier, bool) {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
-	return a.oauth, a.verifier, a.oauth != nil
+	return a.oauth, a.verifier, a.oauth != nil && a.verifier != nil
 }
 
 // Ready reports whether OIDC discovery has completed.
@@ -204,8 +206,11 @@ func (a *oidcAuth) startLogin(w http.ResponseWriter, r *http.Request, returnTo s
 		return
 	}
 	verifier := oauth2.GenerateVerifier()
+	// Normalise here, not just at redirect time: returnTo comes from the query string, and an
+	// oversized one would be signed into the cookie and push the response headers past what
+	// browsers accept, breaking the login outright.
 	flow, err := a.encode(flowData{
-		State: state, Verifier: verifier, Return: returnTo,
+		State: state, Verifier: verifier, Return: safeReturn(returnTo),
 		Expires: time.Now().Add(flowTTL).Unix(),
 	})
 	if err != nil {
@@ -297,10 +302,14 @@ func (a *oidcAuth) logout(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/", http.StatusFound)
 }
 
+// maxReturn caps the post-login path. Anything longer is someone playing with the query
+// string rather than a real page in this UI.
+const maxReturn = 512
+
 // safeReturn keeps the post-login redirect on this site: an attacker-supplied absolute URL
 // would turn the login into an open redirect.
 func safeReturn(p string) string {
-	if p == "" || !strings.HasPrefix(p, "/") || strings.HasPrefix(p, "//") {
+	if p == "" || len(p) > maxReturn || !strings.HasPrefix(p, "/") || strings.HasPrefix(p, "//") {
 		return "/"
 	}
 	return p

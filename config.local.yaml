@@ -43,7 +43,9 @@ selfService:
   issuerURL: https://auth.example.invalid/application/o/energy-watchdog/
   clientID: dev
   clientSecret: dev
-  sessionKey: dev-only-not-a-secret
+  # Local only, and unused with -dev-user (SSO is bypassed). Long enough to pass
+  # validation and obviously not a real secret, so it can never be mistaken for one.
+  sessionKey: local-development-only-do-not-use-anywhere-else
   externalURL: http://localhost:8080
   adminGroups: [jhc-admins]
   vms:
