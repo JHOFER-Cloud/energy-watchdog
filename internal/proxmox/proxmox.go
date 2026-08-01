@@ -261,6 +261,20 @@ func pveBool(v any) bool {
 	return false
 }
 
+// WakeOnLAN asks the cluster to send node a magic packet. The sending node is one that's
+// already on node's segment, so the packet is a local broadcast and needs no ARP entry for
+// the powered-off NIC. The MAC comes from node's `wakeonlan` property (pvenode config set).
+func (c *Client) WakeOnLAN(ctx context.Context, node string) (mac string, err error) {
+	data, err := c.do(ctx, http.MethodPost, fmt.Sprintf("/nodes/%s/wakeonlan", node), url.Values{})
+	if err != nil {
+		return "", err
+	}
+	if err := json.Unmarshal(data, &mac); err != nil {
+		return "", fmt.Errorf("decode wakeonlan mac: %w", err)
+	}
+	return mac, nil
+}
+
 // ShutdownNode powers off a whole node.
 func (c *Client) ShutdownNode(ctx context.Context, node string) error {
 	v := url.Values{}

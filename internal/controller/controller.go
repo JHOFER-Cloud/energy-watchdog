@@ -17,7 +17,6 @@ import (
 	"github.com/JHOFER-Cloud/energy-watchdog/internal/prom"
 	"github.com/JHOFER-Cloud/energy-watchdog/internal/proxmox"
 	"github.com/JHOFER-Cloud/energy-watchdog/internal/state"
-	"github.com/JHOFER-Cloud/energy-watchdog/internal/wol"
 )
 
 // Controller wires the clients and persisted state together.
@@ -84,17 +83,19 @@ func (c *Controller) reconcile(ctx context.Context) {
 		"mode", snap.Mode, "next", plan.NextMode,
 		"surplus", snap.Surplus, "surplusRaw", snap.SurplusRaw, "soc", snap.SoC,
 		"nodeUp", snap.NodeUp, "gaming", gaming, "reason", plan.Reason)
-	sample := metrics.Sample{
+	// Publish the observation now, the outcome once apply resolves: apply can run for
+	// minutes, and reporting its mode and success up front hid every failing apply.
+	c.metrics.Update(metrics.Sample{
 		Surplus: snap.Surplus, SurplusRaw: snap.SurplusRaw, SoC: snap.SoC,
-		NodeUp: snap.NodeUp, Gaming: gaming, Mode: string(plan.NextMode), Tick: now.Unix(), OK: true,
-	}
-	c.metrics.Update(sample)
+		NodeUp: snap.NodeUp, Gaming: gaming, Tick: now.Unix(),
+	})
 
 	if err := c.apply(ctx, plan, snap); err != nil {
 		c.log.Error("apply failed", "err", err)
-		sample.Mode, sample.OK = string(snap.Mode), false
-		c.metrics.Update(sample)
+		c.metrics.SetOutcome(string(snap.Mode), false) // plan didn't land; mode is unchanged
+		return
 	}
+	c.metrics.SetOutcome(string(plan.NextMode), true)
 }
 
 // apply carries out the plan at the configured dry-run level. The physical Proxmox/WoL
@@ -318,10 +319,11 @@ func (c *Controller) startAll(ctx context.Context, guests []state.GuestRef) erro
 }
 
 func (c *Controller) wake(ctx context.Context) error {
-	c.log.Info("sending Wake-on-LAN", "mac", c.cfg.Proxmox.MAC, "node", c.cfg.Proxmox.Node)
-	if err := wol.Send(c.cfg.Proxmox.MAC, c.cfg.Proxmox.WoLBroadcastAddr); err != nil {
+	mac, err := c.px.WakeOnLAN(ctx, c.cfg.Proxmox.Node)
+	if err != nil {
 		return err
 	}
+	c.log.Info("sent Wake-on-LAN", "mac", mac, "node", c.cfg.Proxmox.Node)
 	wctx, cancel := context.WithTimeout(ctx, c.cfg.Proxmox.WakeTimeout.Duration)
 	defer cancel()
 	return c.px.WaitNodeUp(wctx, c.cfg.Proxmox.Node)

@@ -18,12 +18,7 @@ spec:
         app: energy-watchdog
     spec:
       serviceAccountName: energy-watchdog
-      # hostNetwork so the WoL magic packet reaches p1's broadcast domain.
-      # ClusterFirstWithHostNet keeps cluster DNS working (Prometheus, Alertmanager,
-      # kubernetes.default) while on the host network.
-      hostNetwork: true
-      dnsPolicy: ClusterFirstWithHostNet
-      # Pin to an always-on node that shares p1's broadcast domain (a control-plane Pi).
+      # Pin to an always-on node, never one hosted on p1 - that's the node we power off.
       nodeSelector:
         kubernetes.io/hostname: TODO-always-on-node
       tolerations:

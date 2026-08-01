@@ -127,8 +127,11 @@ calls.
 
 - `p1`, `p2`, `p3` need to be one Proxmox cluster with storage the migrate guests can
   move across.
-- Wake-on-LAN on for `p1`'s NIC, and the watchdog running with `hostNetwork` on an
-  always-on node on the same segment so the magic packet lands.
+- Wake-on-LAN enabled on `p1`'s NIC in BIOS, and the MAC registered on the node itself
+  (`pvenode config set -wakeonlan <mac>`). The watchdog doesn't send the magic packet: it
+  calls `POST /nodes/p1/wakeonlan`, so another cluster node broadcasts it on p1's own
+  segment. That means the watchdog needs no `hostNetwork` and no particular subnet — but
+  it must still run on an always-on node that isn't hosted on `p1`.
 - Disable both Proxmox HA and autostart (`onboot=0`) on the `stop` guests. The
   watchdog owns their lifecycle, so nothing else should bring them back. Otherwise, if
   you power `p1` on at night yourself, autostart (or HA) would boot the very VMs the
@@ -152,8 +155,8 @@ dashboard for them is
 ## Deploying
 
 There's a Flux deployment example under [`examples/flux`](./examples/flux), with the
-namespace, RBAC, config, token Secret shape, and a hostNetwork Deployment. It's a
-starting point to adapt, not a drop-in.
+namespace, RBAC, config, token Secret shape, and the Deployment. It's a starting point to
+adapt, not a drop-in.
 
 ## Dev
 
