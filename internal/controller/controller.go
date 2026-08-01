@@ -242,6 +242,15 @@ func (c *Controller) logPlan(p Plan) {
 func (c *Controller) execute(ctx context.Context, p Plan, snap Snapshot) error {
 	st := state.State{Mode: snap.Mode, Stopped: snap.StoppedSet, GraceSince: p.GraceSince}
 
+	// Silence before anything is moved or stopped. Migrating and stopping the guests is
+	// itself what sets their alerts off, and migrateTimeout+stopTimeout make that window tens
+	// of minutes long - silencing after it means every one of them has already fired. The
+	// silence has to cover the whole shed, not just the power-off at the end of it.
+	if p.Silence {
+		if err := c.reconcileSilences(ctx, true); err != nil {
+			return err
+		}
+	}
 	if len(p.Migrate) > 0 {
 		if err := c.migrateAll(ctx, p.Migrate); err != nil {
 			return err
@@ -252,11 +261,6 @@ func (c *Controller) execute(ctx context.Context, p Plan, snap Snapshot) error {
 		st.Stopped = stopped
 		if err != nil {
 			_ = c.store.Save(ctx, st) // persist whatever we managed to stop
-			return err
-		}
-	}
-	if p.Silence {
-		if err := c.reconcileSilences(ctx, true); err != nil {
 			return err
 		}
 	}

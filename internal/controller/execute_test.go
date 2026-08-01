@@ -100,9 +100,10 @@ func TestExecuteShedCycle(t *testing.T) {
 		t.Fatalf("execute: %v", err)
 	}
 
-	// Order: migrate before stop before silence, then replication is disabled before the
+	// Order: silence first, because migrating and stopping the guests is what makes their
+	// alerts fire and that runs for tens of minutes. Then replication is disabled before the
 	// poweroff so no run can land inside the shutdown window (JHC-538).
-	want := []string{"migrate-101", "stop-301", "silence", "repl-disable-104-0", "poweroff"}
+	want := []string{"silence", "migrate-101", "stop-301", "repl-disable-104-0", "poweroff"}
 	if len(calls) != len(want) {
 		t.Fatalf("calls = %v, want %v", calls, want)
 	}
