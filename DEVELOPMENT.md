@@ -74,8 +74,12 @@ migrate can run 15 minutes, and a state save landing at the end of it must not w
 set while it was in flight. `TestConfigMapStoreKeysAreIndependent` pins this down.
 
 The loop never writes intent. Wake requests therefore aren't cleared when satisfied — they
-age out after `state.WakeRequestTTL` (10m). By then either the VM is up, and the *gaming
-guard* is what holds p1, or it failed and retrying is the user's call.
+age out after `gamingGrace`. By then either the VM is up, and the *gaming guard* is what
+holds p1, or it failed and retrying is the user's call.
+
+The TTL is `gamingGrace` rather than a constant of its own on purpose: a request holds p1 up
+for exactly as long as a gaming session gets to produce a running VM, so tuning one can't
+open a window where a request outlives the grace that honours it.
 
 ### Manual shed
 

@@ -1,8 +1,12 @@
 package controller
 
 import (
+	"io"
+	"log/slog"
 	"testing"
 	"time"
+
+	"github.com/JHOFER-Cloud/energy-watchdog/internal/config"
 
 	"github.com/JHOFER-Cloud/energy-watchdog/internal/proxmox"
 	"github.com/JHOFER-Cloud/energy-watchdog/internal/state"
@@ -202,5 +206,25 @@ func TestDecideWakeRequest(t *testing.T) {
 				t.Errorf("graceSince = %d, want %d (%s)", p.GraceSince, tt.wantGrace, p.Reason)
 			}
 		})
+	}
+}
+
+// intent.json is a documented break-glass path, so a hand-written one must not be able to
+// make the loop start the same VM twice, or start something the gaming guard won't hold p1 for.
+func TestRequestedVMIDsSanitisesIntent(t *testing.T) {
+	cfg := testCfg(t)
+	cfg.GamingGrace = config.Duration{Duration: 10 * time.Minute}
+	c := &Controller{cfg: cfg, log: slog.New(slog.NewTextHandler(io.Discard, nil))}
+
+	stale := testNow.Add(-11 * time.Minute).Unix()
+	got := c.requestedVMIDs(state.Intent{Wake: []state.WakeRequest{
+		{VMID: 601, RequestedAt: testNow.Unix()},
+		{VMID: 601, RequestedAt: testNow.Unix()}, // duplicate entry
+		{VMID: 101, RequestedAt: testNow.Unix()}, // outside gamingGuard
+		{VMID: 602, RequestedAt: stale},          // aged out
+	}}, testNow)
+
+	if !equal(got, []int{601}) {
+		t.Errorf("requestedVMIDs = %v, want [601]", got)
 	}
 }

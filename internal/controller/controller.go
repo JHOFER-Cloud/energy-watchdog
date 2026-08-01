@@ -207,11 +207,18 @@ func (c *Controller) observe(ctx context.Context, now time.Time) (Snapshot, bool
 // node VM, and stops a request keeping p1 up for a guest the guard would never hold it for.
 func (c *Controller) requestedVMIDs(intent state.Intent, now time.Time) []int {
 	var out []int
+	seen := map[int]bool{}
 	for _, w := range intent.LiveWake(now, c.cfg.GamingGrace.Duration) {
 		if !c.cfg.Guests.GamingGuard.Contains(w.VMID) {
 			c.log.Warn("ignoring wake request outside the gaming-guard range", "vmid", w.VMID, "user", w.User)
 			continue
 		}
+		// The API replaces a VM's request rather than appending, but intent.json is meant to be
+		// hand-editable, and a repeated entry there would otherwise mean starting it twice.
+		if seen[w.VMID] {
+			continue
+		}
+		seen[w.VMID] = true
 		out = append(out, w.VMID)
 	}
 	return out

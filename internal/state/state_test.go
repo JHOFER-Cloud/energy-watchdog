@@ -196,7 +196,7 @@ func TestConfigMapStoreCreatesOnMissing(t *testing.T) {
 	}
 }
 
-func TestWakeRequestTTL(t *testing.T) {
+func TestWakeRequestExpiry(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
 	const ttl = 10 * time.Minute // gamingGrace
 	fresh := WakeRequest{VMID: 601, RequestedAt: now.Unix()}

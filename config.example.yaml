@@ -126,5 +126,6 @@ selfService:
     - vmid: 601
       name: josef-desktop
       groups: [deskvm-josef]
-      # Optional: handed to Moonlight via a moonlight:// link once the VM is up.
+      # Optional: shown with a copy button once the VM is up, to paste into Moonlight.
+      # Not a deep link - Moonlight has no URL scheme to launch it with. host:port is fine.
       streamHost: p1.host.hla1.jhofer.lan
