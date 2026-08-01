@@ -134,12 +134,6 @@ type Proxmox struct {
 
 	// Node is the managed host that gets powered down ("p1").
 	Node string `yaml:"node"`
-	// MAC is the NIC of Node, used to wake it via Wake-on-LAN.
-	MAC string `yaml:"mac"`
-	// WoLBroadcastAddr is where the magic packet is sent. Defaults to
-	// "255.255.255.255:9"; a subnet-directed address ("10.1.1.255:9") is often more
-	// reliable from a hostNetwork pod with several interfaces.
-	WoLBroadcastAddr string `yaml:"wolBroadcastAddr"`
 	// TargetNodes are the destinations the migrate guests are spread across. Unrelated to a
 	// replication job's own "target" field, which is matched against Node, not this list.
 	TargetNodes []string `yaml:"targetNodes"`
@@ -264,9 +258,6 @@ func (c *Config) defaults() {
 	if c.Proxmox.FreshBootWindow.Duration == 0 {
 		c.Proxmox.FreshBootWindow = Duration{5 * time.Minute}
 	}
-	if c.Proxmox.WoLBroadcastAddr == "" {
-		c.Proxmox.WoLBroadcastAddr = "255.255.255.255:9"
-	}
 	if c.State.ConfigMapName == "" {
 		c.State.ConfigMapName = "energy-watchdog-state"
 	}
@@ -287,8 +278,6 @@ func (c *Config) validate() error {
 		return fmt.Errorf("proxmox.endpoint is required")
 	case c.Proxmox.Node == "":
 		return fmt.Errorf("proxmox.node is required")
-	case c.Proxmox.MAC == "":
-		return fmt.Errorf("proxmox.mac is required (needed for Wake-on-LAN)")
 	case len(c.Proxmox.TargetNodes) == 0:
 		return fmt.Errorf("proxmox.targetNodes must list at least one migration destination")
 	case c.Proxmox.TokenID == "" || c.Proxmox.TokenSecret == "":

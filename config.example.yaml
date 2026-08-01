@@ -52,11 +52,9 @@ proxmox:
   # 1Password secret) in-cluster; only set them here for local runs.
   # tokenID: "energy-watchdog@pve!watchdog"
   # tokenSecret: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+  # Waking is done by the cluster (POST /nodes/<node>/wakeonlan), so the MAC lives on the
+  # node itself: pvenode config set -wakeonlan <mac>. Nothing to configure here.
   node: pve-1
-  mac: "TODO:AA:BB:CC:DD:EE:FF" # p1's NIC MAC, for Wake-on-LAN
-  # Where the magic packet goes. A subnet-directed address is often more reliable from
-  # a hostNetwork pod than the all-ones broadcast. Defaults to 255.255.255.255:9.
-  wolBroadcastAddr: "10.1.1.255:9"
   targetNodes: [pve-2, pve-3] # migration destinations, used round-robin
   # Disable the replication jobs that replicate *into* `node` while it is powered down, and
   # re-enable them when it is back, so pve-2/pve-3 stop retrying (and mailing about) runs to a

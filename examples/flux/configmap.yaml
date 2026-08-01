@@ -26,8 +26,6 @@ data:
       caCertPath: /etc/ssl/certs/jhc-ca.crt
       insecureSkipVerify: false
       node: pve-1
-      mac: "TODO:AA:BB:CC:DD:EE:FF"
-      wolBroadcastAddr: "10.1.1.255:9"
       targetNodes: [pve-2, pve-3]
       # Disable replication jobs targeting pve-1 while it's off. Needs VM.Replicate on the
       # replicated guests; set false if the token doesn't have it. Defaults to true.

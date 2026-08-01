@@ -40,25 +40,32 @@ func (m *Metrics) SetThresholds(headroom, shedBelow, minBattery float64) {
 	m.cfgSet = true
 }
 
-// Sample is one reconcile result to publish.
+// Sample is what one reconcile observed, and when. Mode and success aren't known until
+// apply has run - see SetOutcome.
 type Sample struct {
 	Surplus    float64
 	SurplusRaw float64
 	SoC        float64
 	NodeUp     bool
 	Gaming     bool
-	Mode       string
 	Tick       int64
-	OK         bool
 }
 
-// Update records the latest reconcile result.
+// Update records the observation from the latest reconcile.
 func (m *Metrics) Update(s Sample) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.surplus, m.surplusRaw, m.soc = s.Surplus, s.SurplusRaw, s.SoC
 	m.nodeUp, m.gaming = s.NodeUp, s.Gaming
-	m.mode, m.lastTick, m.lastOK = s.Mode, s.Tick, s.OK
+	m.lastTick = s.Tick
+}
+
+// SetOutcome records the mode in force after apply and whether apply succeeded. Separate
+// from Update because apply can run for minutes, and the gauges must not wait on it.
+func (m *Metrics) SetOutcome(mode string, ok bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.mode, m.lastOK = mode, ok
 }
 
 // MarkStale records that a reconcile tick failed, without overwriting the last good

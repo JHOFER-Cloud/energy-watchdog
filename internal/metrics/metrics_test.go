@@ -10,8 +10,9 @@ func TestHandler(t *testing.T) {
 	m := New(true)
 	m.Update(Sample{
 		Surplus: 1800, SurplusRaw: 2400, SoC: 73.5,
-		NodeUp: false, Gaming: true, Mode: "shed", Tick: 1700000000, OK: true,
+		NodeUp: false, Gaming: true, Tick: 1700000000,
 	})
+	m.SetOutcome("shed", true)
 
 	rr := httptest.NewRecorder()
 	m.Handler()(rr, httptest.NewRequest("GET", "/metrics", nil))
@@ -38,7 +39,8 @@ func TestHandler(t *testing.T) {
 // (and tick) move, so a transient observe error doesn't flap surplus/mode on the dashboard.
 func TestMarkStaleKeepsLastGood(t *testing.T) {
 	m := New(false)
-	m.Update(Sample{Surplus: 1800, SoC: 73.5, NodeUp: true, Mode: "running", Tick: 1700000000, OK: true})
+	m.Update(Sample{Surplus: 1800, SoC: 73.5, NodeUp: true, Tick: 1700000000})
+	m.SetOutcome("running", true)
 	m.MarkStale(1700000060)
 
 	rr := httptest.NewRecorder()
