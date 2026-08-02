@@ -29,17 +29,18 @@ type guest struct {
 }
 
 type cluster struct {
-	mu       sync.Mutex
-	node     string
-	up       bool
-	bootAt   time.Time
-	guests   map[int]*guest
-	surplus  float64
-	soc      float64
-	tasks    map[string]time.Time // upid -> when it completes
-	taskSeq  int
-	shutdown time.Time // pending power-off, zero if none
-	wakeAt   time.Time // pending wake-on-lan, zero if none
+	mu        sync.Mutex
+	node      string
+	up        bool
+	bootAt    time.Time
+	guests    map[int]*guest
+	surplus   float64
+	soc       float64
+	tasks     map[string]time.Time // upid -> when it completes
+	taskSeq   int
+	taskDelay time.Duration // how long a bulk task takes to report done
+	shutdown  time.Time     // pending power-off, zero if none
+	wakeAt    time.Time     // pending wake-on-lan, zero if none
 }
 
 func main() {
@@ -47,10 +48,11 @@ func main() {
 	node := flag.String("node", "pve-1", "managed node name")
 	surplus := flag.Float64("surplus", -300, "solar surplus in watts (negative = deficit)")
 	up := flag.Bool("up", true, "start with the node powered on")
+	taskDelay := flag.Duration("task-delay", 0, "how long bulk migrate/stop tasks take; real ones run for minutes")
 	flag.Parse()
 
 	c := &cluster{
-		node: *node, up: *up, surplus: *surplus, soc: 80,
+		node: *node, up: *up, surplus: *surplus, soc: 80, taskDelay: *taskDelay,
 		guests: map[int]*guest{},
 		tasks:  map[string]time.Time{},
 	}
@@ -283,19 +285,27 @@ func (c *cluster) bulkAction(w http.ResponseWriter, r *http.Request, action stri
 			log.Printf("guest %d (%s) migrated to %s", vmid, g.Name, r.Form.Get("target"))
 		}
 	}
-	c.ok(w, c.newTask())
+	c.ok(w, c.newTaskAfter(c.taskDelay))
 }
 
-func (c *cluster) newTask() string {
+func (c *cluster) newTask() string { return c.newTaskAfter(0) }
+
+// newTaskAfter registers a task that reports done only once d has passed.
+func (c *cluster) newTaskAfter(d time.Duration) string {
 	c.taskSeq++
 	upid := fmt.Sprintf("UPID:%s:fake:%d", c.node, c.taskSeq)
-	c.tasks[upid] = time.Now() // completes immediately
+	c.tasks[upid] = time.Now().Add(d)
 	return upid
 }
 
 func (c *cluster) taskStatus(w http.ResponseWriter, upid string) {
-	if _, ok := c.tasks[upid]; !ok {
+	done, ok := c.tasks[upid]
+	if !ok {
 		http.Error(w, "no such task", http.StatusNotFound)
+		return
+	}
+	if time.Now().Before(done) {
+		c.ok(w, map[string]any{"status": "running"})
 		return
 	}
 	c.ok(w, map[string]any{"status": "stopped", "exitstatus": "OK"})

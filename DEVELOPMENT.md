@@ -28,7 +28,8 @@ curl localhost:8006/fake/state              # node/guest/surplus as the fake see
 
 The fake takes `bootDelay` (6s) to complete a power-off or a wake, so the UI's
 "Waking the server…" and "Server was shutting down…" states are actually on screen long
-enough to look at. Guest start/stop is instant.
+enough to look at. Guest start/stop is instant; pass `-task-delay=40s` to make bulk migrate and
+stop tasks slow, which is what puts the UI into its mid-shed states.
 
 Preloaded guests: `101`/`102` (migrate class), `301`/`302` (stop class), `601`/`602` (gaming
 guard / desktop VMs). Two in each class so a shed exercises the round-robin across

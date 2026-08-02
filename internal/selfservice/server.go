@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/JHOFER-Cloud/energy-watchdog/internal/config"
+	"github.com/JHOFER-Cloud/energy-watchdog/internal/controller"
 	"github.com/JHOFER-Cloud/energy-watchdog/internal/proxmox"
 	"github.com/JHOFER-Cloud/energy-watchdog/internal/state"
 )
@@ -34,8 +35,11 @@ type Store interface {
 	SaveIntent(ctx context.Context, i state.Intent) error
 }
 
-// Nudger asks the reconcile loop to run now.
-type Nudger interface{ Nudge() }
+// Nudger asks the reconcile loop to run now, and reports what it is currently doing.
+type Nudger interface {
+	Nudge()
+	Activity() string
+}
 
 // Server serves the UI and its API.
 type Server struct {
@@ -214,6 +218,7 @@ type statusResponse struct {
 	User       string      `json:"user"`
 	Admin      bool        `json:"admin"`
 	NodeUp     bool        `json:"nodeUp"`
+	Activity   string      `json:"activity,omitempty"`
 	ManualShed bool        `json:"manualShed"`
 	VMs        []vmStatus  `json:"vms"`
 	Impact     *shedImpact `json:"impact,omitempty"`
@@ -268,6 +273,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		User:       id.User,
 		Admin:      s.cfg.SelfService.IsAdmin(id.Groups),
 		NodeUp:     v.nodeUp,
+		Activity:   s.nudge.Activity(),
 		ManualShed: intent.Shed,
 	}
 	if v.err != nil {
@@ -280,7 +286,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		st := vmStatus{VMID: vm.VMID, Name: vm.Name, StreamHost: vm.StreamHost}
 		st.Running = v.running[vm.VMID]
 		st.Requested = requested[vm.VMID]
-		st.Phase = phase(v, st.Running, st.Requested)
+		st.Phase = phase(v, resp.Activity, st.Running, st.Requested)
 		if other, blocked := s.gpuBlocker(vm.VMID, v.running, requested); blocked && !st.Running {
 			st.BlockedBy = s.cfg.SelfService.NameOf(other)
 		}
@@ -289,15 +295,16 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
-// phase is the copy the UI shows. "waking" covers the case the user actually notices: they
-// asked for a VM while p1 was on its way down, so the request is live but the host is gone
-// until the shutdown finishes and the loop wakes it again.
-func phase(v clusterView, running, requested bool) string {
+// phase is the copy the UI shows. "shedding" is a request made while the shed is still running:
+// Proxmox reports the node online throughout, so only the loop's activity gives it away.
+func phase(v clusterView, activity string, running, requested bool) string {
 	switch {
 	case running:
 		return "ready"
 	case requested && !v.nodeUp:
 		return "waking"
+	case requested && activity == controller.ActivityShedding:
+		return "shedding"
 	case requested:
 		return "starting"
 	default:

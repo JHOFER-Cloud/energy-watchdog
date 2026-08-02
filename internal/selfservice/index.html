@@ -32,17 +32,44 @@
   }
   .banner.on { display: block; }
   .banner b { color: var(--warn); }
+  /* Fixed rows, never a wrap decision: a button relabelling itself ("Copy host" -> "Copied")
+     must not be able to reflow the card. */
   .vm {
-    display: flex; align-items: center; gap: 1rem .75rem; flex-wrap: wrap; padding: 1rem;
-    background: var(--card); border: 1px solid var(--line); border-radius: .6rem; margin-bottom: .75rem;
+    display: grid; gap: .7rem; padding: 1rem 1.1rem;
+    background: var(--card); border: 1px solid var(--line); border-radius: .7rem;
+    margin-bottom: .75rem; position: relative; overflow: hidden;
   }
-  .vm .info { flex: 1 1 12rem; min-width: 0; }
+  /* Status stripe down the left edge, so state reads before you get to the words. */
+  .vm::before {
+    content: ""; position: absolute; inset: 0 auto 0 0; width: 3px; background: var(--line);
+  }
+  .vm[data-phase="ready"]::before { background: var(--ok); }
+  .vm[data-phase="waking"]::before, .vm[data-phase="starting"]::before,
+  .vm[data-phase="shedding"]::before {
+    background: var(--warn); animation: pulse 1.4s ease-in-out infinite;
+  }
+  .vm .head { display: flex; align-items: baseline; gap: .55rem; }
   .vm .name { font-weight: 600; overflow-wrap: anywhere; }
-  .vm .state { color: var(--muted); font-size: .85rem; display: flex; align-items: center; gap: .4rem; }
+  .vm .phase {
+    margin-left: auto; color: var(--muted); font-size: .85rem; text-align: right;
+    max-width: 26rem; /* the shed copy is a sentence; wrap it rather than crushing the name */
+  }
+  .vm[data-phase="shedding"] .phase, .vm[data-phase="waking"] .phase { color: var(--warn); }
+  .vm[data-phase="ready"] .phase { color: var(--ok); }
   .dot { width: .5rem; height: .5rem; border-radius: 50%; background: var(--muted); flex: none; }
   .dot.ready { background: var(--ok); }
   .dot.busy { background: var(--warn); animation: pulse 1.4s ease-in-out infinite; }
   @keyframes pulse { 0%,100% { opacity: 1 } 50% { opacity: .3 } }
+  /* The stream host reads as something to copy, not as body text. */
+  .hostrow { display: flex; align-items: center; gap: .5rem; }
+  .hostrow .host {
+    flex: 1; min-width: 0; overflow-wrap: anywhere; padding: .35rem .55rem; border-radius: .35rem;
+    background: color-mix(in srgb, var(--fg) 6%, transparent);
+  }
+  /* Actions get their own row: safe on the left, the two that cut power pushed right. */
+  .bar { display: flex; gap: .4rem; flex-wrap: wrap; padding-top: .15rem; }
+  .bar .right { display: flex; gap: .4rem; margin-left: auto; }
+  .note { color: var(--warn); font-size: .85rem; overflow-wrap: anywhere; }
   button {
     font: inherit; font-weight: 550; padding: .5rem 1rem; border-radius: .45rem;
     border: 1px solid transparent; background: var(--accent); color: #fff; cursor: pointer;
@@ -60,16 +87,17 @@
   button.danger { background: #b3261e; color: #fff; border-color: transparent; }
   /* Resting state for the two that cut power: clearly destructive, but not yet armed. */
   button.destructive { background: transparent; border-color: #b3261e; color: #d3564d; }
-  .actions { display: flex; gap: .4rem; flex-wrap: wrap; justify-content: flex-end; margin-left: auto; }
-  .blocked { color: var(--warn); font-size: .85rem; overflow-wrap: anywhere; }
-  /* One line per VM stops working once five buttons are on it; stack instead of overflowing. */
-  @media (max-width: 34rem) {
-    .actions { margin-left: 0; width: 100%; justify-content: flex-start; }
-    button { flex: 1 1 auto; }
+  /* Sized for their armed label ("Reset?"), so arming can't resize them. */
+  button.destructive, button.danger { min-width: 5.5rem; }
+  button.copy { min-width: 6.5rem; }
+  @media (max-width: 30rem) {
+    .bar { display: grid; grid-template-columns: 1fr 1fr; }
+    .bar .right { display: contents; }
+    button { min-width: 0; }
   }
   .host {
     font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .85rem;
-    color: var(--muted); overflow-wrap: anywhere;
+    color: var(--muted);
   }
   button.linkish {
     background: none; border: none; color: var(--muted); font-size: .85rem;
@@ -113,10 +141,11 @@
 
 <script>
 const PHASES = {
-  off:      { text: "Off",                                          dot: "" },
+  off:      { text: "Off",                                     dot: "" },
+  shedding: { text: "p1 is shutting down — your VM starts once it's back. Grab a coffee, this takes a few minutes.", dot: "busy" },
   waking:   { text: "Waking the server…",                      dot: "busy" },
   starting: { text: "Server up, starting the VM…",             dot: "busy" },
-  ready:    { text: "Running",                                      dot: "ready" },
+  ready:    { text: "Running",                                 dot: "ready" },
 };
 // Shown instead of "waking" when the host is on its way down: the request stays live and the
 // watchdog wakes it again once the shutdown finishes, so this resolves on its own.
@@ -153,48 +182,52 @@ function render(s) {
 
     const el = document.createElement("div");
     el.className = "vm";
+    el.dataset.phase = vm.phase;
     el.innerHTML = `
-      <div class="info">
-        <div class="name"></div>
-        <div class="state"><span class="dot ${p.dot}"></span><span class="phase"></span></div>
+      <div class="head">
+        <span class="dot ${p.dot}"></span><span class="name"></span><span class="phase"></span>
       </div>`;
     el.querySelector(".name").textContent = vm.name || ("VM " + vm.vmid);
     el.querySelector(".phase").textContent = text;
 
-    // Moonlight has no URL scheme to hand off to (moonlight-stream/moonlight-qt#1874 is
-    // still open), so the useful thing is the host itself, ready to paste into the client.
-    const actions = document.createElement("div");
-    actions.className = "actions";
+    const bar = document.createElement("div");
+    bar.className = "bar";
 
     if (vm.phase === "ready") {
+      // Moonlight has no URL scheme to hand off to (moonlight-stream/moonlight-qt#1874 is
+      // still open), so the useful thing is the host itself, ready to paste into the client.
       if (vm.streamHost) {
-        const b = document.createElement("button");
-        b.className = "secondary";
-        b.textContent = "Copy host";
-        b.onclick = async () => {
+        const row = document.createElement("div");
+        row.className = "hostrow";
+        const code = document.createElement("code");
+        code.className = "host";
+        code.textContent = vm.streamHost;
+        const copy = document.createElement("button");
+        copy.className = "secondary copy";
+        copy.textContent = "Copy host";
+        copy.onclick = async () => {
           try {
             await navigator.clipboard.writeText(vm.streamHost);
-            b.textContent = "Copied";
-            setTimeout(() => { b.textContent = "Copy host"; }, 1500);
+            copy.textContent = "Copied";
+            setTimeout(() => { copy.textContent = "Copy host"; }, 1500);
           } catch { show("Clipboard blocked — the host is " + vm.streamHost); }
         };
-        const host = document.createElement("div");
-        host.className = "host";
-        host.textContent = vm.streamHost;
-        el.querySelector(".info").appendChild(host);
-        actions.appendChild(b);
+        row.append(code, copy);
+        el.appendChild(row);
       }
-      // Reset and Stop cut power without the guest agreeing, so they ask first.
-      actions.appendChild(powerButton(vm, "shutdown", "Shut down", false));
-      actions.appendChild(powerButton(vm, "reboot", "Reboot", false));
-      actions.appendChild(powerButton(vm, "reset", "Reset", true));
-      actions.appendChild(powerButton(vm, "stop", "Stop", true));
+      bar.appendChild(powerButton(vm, "shutdown", "Shut down", false));
+      bar.appendChild(powerButton(vm, "reboot", "Reboot", false));
+      // Reset and Stop cut power without the guest agreeing, so they sit apart and ask first.
+      const right = document.createElement("div");
+      right.className = "right";
+      right.append(powerButton(vm, "reset", "Reset", true), powerButton(vm, "stop", "Stop", true));
+      bar.appendChild(right);
     } else if (vm.blockedBy) {
       // Proxmox maps a GPU into one guest at a time, so this start would just fail.
-      const why = document.createElement("span");
-      why.className = "blocked";
-      why.textContent = `${vm.blockedBy} is using this GPU`;
-      actions.appendChild(why);
+      const note = document.createElement("div");
+      note.className = "note";
+      note.textContent = `${vm.blockedBy} is using this GPU — shut it down first`;
+      el.appendChild(note);
     } else {
       const b = document.createElement("button");
       const working = vm.requested || busy.has(vm.vmid);
@@ -206,12 +239,11 @@ function render(s) {
         catch (e) { show(e.message); busy.delete(vm.vmid); }
         poll();
       };
-      actions.appendChild(b);
+      bar.appendChild(b);
     }
-    el.appendChild(actions);
+    if (bar.childElementCount) el.appendChild(bar);
     return el;
   }));
-
   s.vms.forEach(vm => { if (vm.phase === "ready") busy.delete(vm.vmid); });
   show(s.error || "");
 }

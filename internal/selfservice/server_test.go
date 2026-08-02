@@ -59,9 +59,14 @@ func (f *fakeStore) SaveIntent(_ context.Context, i state.Intent) error {
 	return nil
 }
 
-type fakeNudge struct{ n int }
+type fakeNudge struct {
+	n        int
+	activity string
+}
 
 func (f *fakeNudge) Nudge() { f.n++ }
+
+func (f *fakeNudge) Activity() string { return f.activity }
 
 // denyAuth stands in for a caller with no valid session.
 type denyAuth struct{}
@@ -252,7 +257,7 @@ func TestPhaseCopy(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := phase(clusterView{nodeUp: tt.nodeUp}, tt.running, tt.requested)
+			got := phase(clusterView{nodeUp: tt.nodeUp}, "", tt.running, tt.requested)
 			if got != tt.want {
 				t.Errorf("phase = %q, want %q", got, tt.want)
 			}
@@ -461,5 +466,31 @@ func TestSpentRequestReleasesTheGPU(t *testing.T) {
 	s := bothVMs(t, cluster, store)
 	if rec := do(t, s, "POST", "/api/vms/602/start", ""); rec.Code != http.StatusAccepted {
 		t.Errorf("start = %d, want 202: 601's request is spent and its VM is down", rec.Code)
+	}
+}
+
+// Proxmox reports the node online for the whole shed, so without the loop's own activity the
+// UI claims the VM is starting at a host on its way down.
+func TestRequestDuringAShedSaysSo(t *testing.T) {
+	cluster := &fakeCluster{up: true, guests: []proxmox.Guest{{VMID: 601, Type: proxmox.TypeQEMU}}}
+	store := &fakeStore{intent: state.Intent{
+		Shed: true,
+		Wake: []state.WakeRequest{{VMID: 601, User: "josef", RequestedAt: time.Now().Unix()}},
+	}}
+	s, nudge := testServer(t, staticAuth{User: "josef", Groups: []string{"deskvm-josef"}}, cluster, store)
+	s.cfg.GamingGrace = config.Duration{Duration: 10 * time.Minute}
+
+	nudge.activity = "shedding"
+	var resp statusResponse
+	decode(t, do(t, s, "GET", "/api/status", ""), &resp)
+	if resp.VMs[0].Phase != "shedding" {
+		t.Errorf("phase = %q, want shedding: p1 reports online but is mid-shutdown", resp.VMs[0].Phase)
+	}
+
+	// Idle loop, same node state: this really is a VM starting on a host that is staying up.
+	nudge.activity = ""
+	decode(t, do(t, s, "GET", "/api/status", ""), &resp)
+	if resp.VMs[0].Phase != "starting" {
+		t.Errorf("phase = %q, want starting when no shed is running", resp.VMs[0].Phase)
 	}
 }

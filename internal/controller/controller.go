@@ -12,6 +12,7 @@ import (
 	"maps"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/JHOFER-Cloud/energy-watchdog/internal/alertmgr"
@@ -36,7 +37,24 @@ type Controller struct {
 	warnedNoUptime  bool // the missing-uptime warning is logged once, not every tick
 
 	nudge chan struct{} // out-of-band reconcile requests from the self-service API
+
+	// activity is what an in-flight apply is doing. Proxmox reports the node online for the
+	// whole shed, so the UI can't tell "starting your VM" from "host on its way down" without it.
+	activity atomic.Value
 }
+
+// Activity is what the loop is doing now, "" when idle.
+func (c *Controller) Activity() string {
+	s, _ := c.activity.Load().(string)
+	return s
+}
+
+const (
+	ActivityShedding = "shedding"
+	ActivityWaking   = "waking"
+)
+
+func (c *Controller) setActivity(a string) { c.activity.Store(a) }
 
 // Nudge asks for a reconcile now instead of at the next tick, coalescing with any request
 // already pending. The API calls it after writing intent so a button press feels immediate
@@ -250,6 +268,15 @@ func (c *Controller) logPlan(p Plan) {
 // execute applies the plan in a fixed, safe order and persists the resulting state.
 func (c *Controller) execute(ctx context.Context, p Plan, snap Snapshot) error {
 	st := state.State{Mode: snap.Mode, Stopped: snap.StoppedSet, GraceSince: p.GraceSince, WakeDone: p.WakeDone}
+
+	// Set before the first step, not per step: it has to cover the whole shed.
+	switch {
+	case p.Poweroff || len(p.Migrate) > 0 || len(p.Stop) > 0:
+		c.setActivity(ActivityShedding)
+	case p.Wake:
+		c.setActivity(ActivityWaking)
+	}
+	defer c.setActivity("")
 
 	// Silence before anything is moved or stopped. Migrating and stopping the guests is
 	// itself what sets their alerts off, and migrateTimeout+stopTimeout make that window tens
