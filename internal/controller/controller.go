@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"strings"
 	"sync"
 	"time"
@@ -154,6 +155,7 @@ func (c *Controller) persist(ctx context.Context, p Plan, snap Snapshot) error {
 		Mode:       p.NextMode,
 		Stopped:    snap.StoppedSet,
 		GraceSince: p.GraceSince,
+		WakeDone:   p.WakeDone,
 	})
 }
 
@@ -199,16 +201,17 @@ func (c *Controller) observe(ctx context.Context, now time.Time) (Snapshot, bool
 		StoppedSet: st.Stopped,
 		GraceSince: st.GraceSince,
 		ManualShed: intent.Shed,
-		WakeVMIDs:  c.requestedVMIDs(intent, now),
+		Wake:       c.requestedWake(intent, now),
+		WakeDone:   st.WakeDone,
 	}
 	return snap, nodeUp && gamingActive(guests, c.cfg.Guests.GamingGuard), nil
 }
 
-// requestedVMIDs is the live wake requests, restricted to the gaming-guard block. The API
+// requestedWake is the live wake requests, restricted to the gaming-guard block. The API
 // authorises callers already; this makes a hand-edited intent unable to start, say, a Talos
 // node VM, and stops a request keeping p1 up for a guest the guard would never hold it for.
-func (c *Controller) requestedVMIDs(intent state.Intent, now time.Time) []int {
-	var out []int
+func (c *Controller) requestedWake(intent state.Intent, now time.Time) []state.WakeRequest {
+	var out []state.WakeRequest
 	seen := map[int]bool{}
 	for _, w := range intent.LiveWake(now, c.cfg.GamingGrace.Duration) {
 		if !c.cfg.Guests.GamingGuard.Contains(w.VMID) {
@@ -221,13 +224,17 @@ func (c *Controller) requestedVMIDs(intent state.Intent, now time.Time) []int {
 			continue
 		}
 		seen[w.VMID] = true
-		out = append(out, w.VMID)
+		out = append(out, w)
 	}
 	return out
 }
 
+// isNoop reports that the plan changes nothing worth a write. WakeDone counts: the tick that
+// marks a request satisfied is otherwise a noop, and dropping that write would let the VM be
+// started again the moment the user shuts it down.
 func isNoop(p Plan, snap Snapshot) bool {
 	return p.NextMode == snap.Mode && p.GraceSince == snap.GraceSince &&
+		maps.Equal(p.WakeDone, snap.WakeDone) &&
 		!p.Poweroff && !p.Wake && !p.Silence && !p.Unsilence &&
 		len(p.Migrate) == 0 && len(p.Stop) == 0 && len(p.Start) == 0 && len(p.StartRequested) == 0
 }
@@ -242,7 +249,7 @@ func (c *Controller) logPlan(p Plan) {
 
 // execute applies the plan in a fixed, safe order and persists the resulting state.
 func (c *Controller) execute(ctx context.Context, p Plan, snap Snapshot) error {
-	st := state.State{Mode: snap.Mode, Stopped: snap.StoppedSet, GraceSince: p.GraceSince}
+	st := state.State{Mode: snap.Mode, Stopped: snap.StoppedSet, GraceSince: p.GraceSince, WakeDone: p.WakeDone}
 
 	// Silence before anything is moved or stopped. Migrating and stopping the guests is
 	// itself what sets their alerts off, and migrateTimeout+stopTimeout make that window tens
