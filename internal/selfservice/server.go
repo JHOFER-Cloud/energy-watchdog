@@ -67,6 +67,7 @@ func NewDev(cfg *config.Config, cluster Cluster, store Store, nudge Nudger, log 
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /{$}", s.handlePage)
+	mux.HandleFunc("GET /favicon.svg", s.handleFavicon)
 	mux.HandleFunc("GET /auth/login", func(w http.ResponseWriter, r *http.Request) {
 		s.auth.startLogin(w, r, r.URL.Query().Get("return"))
 	})
