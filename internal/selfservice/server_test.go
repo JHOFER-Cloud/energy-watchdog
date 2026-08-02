@@ -22,6 +22,8 @@ type fakeCluster struct {
 	up     bool
 	guests []proxmox.Guest
 	err    error
+	gpu    map[int]string // vmid -> passthrough GPU key
+	power  []string       // "<vmid>:<action>", in call order
 }
 
 func (f *fakeCluster) NodeState(context.Context, string) (bool, time.Duration, error) {
@@ -32,10 +34,22 @@ func (f *fakeCluster) Guests(context.Context, string) ([]proxmox.Guest, error) {
 	return f.guests, f.err
 }
 
+func (f *fakeCluster) GPUKey(_ context.Context, _ string, g proxmox.Guest) (string, error) {
+	return f.gpu[g.VMID], nil
+}
+
+func (f *fakeCluster) Power(_ context.Context, _ string, g proxmox.Guest, a proxmox.GuestPower) (string, error) {
+	f.power = append(f.power, fmt.Sprintf("%d:%s", g.VMID, a))
+	return "UPID:power", f.err
+}
+
 type fakeStore struct {
 	intent state.Intent
+	st     state.State
 	saves  int
 }
+
+func (f *fakeStore) Load(context.Context) (state.State, error) { return f.st, nil }
 
 func (f *fakeStore) LoadIntent(context.Context) (state.Intent, error) { return f.intent, nil }
 
@@ -262,5 +276,190 @@ func TestStatusSurvivesProxmoxOutage(t *testing.T) {
 	}
 	if got.Error == "" {
 		t.Error("outage not reported to the UI")
+	}
+}
+
+func decode(t *testing.T, w *httptest.ResponseRecorder, into any) {
+	t.Helper()
+	if err := json.Unmarshal(w.Body.Bytes(), into); err != nil {
+		t.Fatalf("decode %s: %v", w.Body.String(), err)
+	}
+}
+
+// bothVMs is a caller allowed both desktop VMs, which is what makes a GPU conflict reachable.
+func bothVMs(t *testing.T, cluster *fakeCluster, store *fakeStore) *Server {
+	t.Helper()
+	s, _ := testServer(t, staticAuth{User: "josef", Groups: []string{"deskvm-josef", "deskvm-other"}}, cluster, store)
+	s.cfg.SelfService.VMs[1].Groups = []string{"deskvm-other", "deskvm-josef"}
+	s.cfg.GamingGrace = config.Duration{Duration: 10 * time.Minute}
+	return s
+}
+
+// Proxmox maps a GPU into one guest at a time, so starting the second is a guaranteed failure.
+// It has to be refused up front, not left to fail somewhere in the reconcile loop.
+func TestStartBlockedByGPUInUse(t *testing.T) {
+	cluster := &fakeCluster{up: true, gpu: map[int]string{601: "gpu0", 602: "gpu0"}, guests: []proxmox.Guest{
+		{VMID: 601, Type: proxmox.TypeQEMU, Running: true},
+		{VMID: 602, Type: proxmox.TypeQEMU},
+	}}
+	store := &fakeStore{}
+	s := bothVMs(t, cluster, store)
+
+	if rec := do(t, s, "POST", "/api/vms/602/start", ""); rec.Code != http.StatusConflict {
+		t.Errorf("start = %d, want 409 while 601 holds the GPU", rec.Code)
+	}
+	if store.saves != 0 {
+		t.Error("a blocked start must not record a wake request")
+	}
+
+	// The status feed has to say so too, or the button is enabled and the click just 409s.
+	var resp statusResponse
+	decode(t, do(t, s, "GET", "/api/status", ""), &resp)
+	for _, vm := range resp.VMs {
+		want := ""
+		if vm.VMID == 602 {
+			want = "josef-desktop"
+		}
+		if vm.BlockedBy != want {
+			t.Errorf("vm %d blockedBy = %q, want %q", vm.VMID, vm.BlockedBy, want)
+		}
+	}
+}
+
+// While p1 is off both VMs look equally stopped, so a request has to count as holding the GPU
+// too - otherwise two clicks in a row both get through and the second VM fails to boot.
+func TestStartBlockedByGPURequestedWhileNodeDown(t *testing.T) {
+	cluster := &fakeCluster{up: true, gpu: map[int]string{601: "gpu0", 602: "gpu0"}, guests: []proxmox.Guest{
+		{VMID: 601, Type: proxmox.TypeQEMU},
+		{VMID: 602, Type: proxmox.TypeQEMU},
+	}}
+	store := &fakeStore{}
+	s := bothVMs(t, cluster, store)
+
+	if rec := do(t, s, "POST", "/api/vms/601/start", ""); rec.Code != http.StatusAccepted {
+		t.Fatalf("first start = %d, want 202", rec.Code)
+	}
+	cluster.up = false // p1 goes down to be woken; 601's request is still outstanding
+	s.expireView()
+	if rec := do(t, s, "POST", "/api/vms/602/start", ""); rec.Code != http.StatusConflict {
+		t.Errorf("second start = %d, want 409: 601 already claimed the GPU", rec.Code)
+	}
+}
+
+// Different GPUs are not a conflict; the guard must not block the unrelated VM.
+func TestStartNotBlockedByADifferentGPU(t *testing.T) {
+	cluster := &fakeCluster{up: true, gpu: map[int]string{601: "gpu0", 602: "gpu1"}, guests: []proxmox.Guest{
+		{VMID: 601, Type: proxmox.TypeQEMU, Running: true},
+		{VMID: 602, Type: proxmox.TypeQEMU},
+	}}
+	s := bothVMs(t, cluster, &fakeStore{})
+	if rec := do(t, s, "POST", "/api/vms/602/start", ""); rec.Code != http.StatusAccepted {
+		t.Errorf("start = %d, want 202: the VMs are on different GPUs", rec.Code)
+	}
+}
+
+func TestPowerActions(t *testing.T) {
+	for _, action := range []string{"shutdown", "reboot", "reset", "stop"} {
+		t.Run(action, func(t *testing.T) {
+			cluster := &fakeCluster{up: true, guests: []proxmox.Guest{{VMID: 601, Type: proxmox.TypeQEMU, Running: true}}}
+			s := bothVMs(t, cluster, &fakeStore{})
+			if rec := do(t, s, "POST", "/api/vms/601/power/"+action, ""); rec.Code != http.StatusAccepted {
+				t.Fatalf("%s = %d, want 202", action, rec.Code)
+			}
+			if len(cluster.power) != 1 || cluster.power[0] != "601:"+action {
+				t.Errorf("proxmox calls = %v, want [601:%s]", cluster.power, action)
+			}
+		})
+	}
+}
+
+// The flaw in reverse: shutting a VM down has to retire its wake request, or the loop sees a
+// live request against a stopped VM and starts it straight back up.
+func TestShutdownRetiresTheWakeRequest(t *testing.T) {
+	cluster := &fakeCluster{up: true, guests: []proxmox.Guest{
+		{VMID: 601, Type: proxmox.TypeQEMU, Running: true},
+		{VMID: 602, Type: proxmox.TypeQEMU, Running: true},
+	}}
+	store := &fakeStore{intent: state.Intent{Wake: []state.WakeRequest{
+		{VMID: 601, User: "josef", RequestedAt: time.Now().Unix()},
+		{VMID: 602, User: "josef", RequestedAt: time.Now().Unix()},
+	}}}
+	s := bothVMs(t, cluster, store)
+
+	if rec := do(t, s, "POST", "/api/vms/601/power/shutdown", ""); rec.Code != http.StatusAccepted {
+		t.Fatalf("shutdown = %d, want 202", rec.Code)
+	}
+	if len(store.intent.Wake) != 1 || store.intent.Wake[0].VMID != 602 {
+		t.Errorf("wake = %+v, want only 602's request left", store.intent.Wake)
+	}
+}
+
+// Reboot keeps the VM up, so its request must survive - dropping it would end the session.
+func TestRebootKeepsTheWakeRequest(t *testing.T) {
+	cluster := &fakeCluster{up: true, guests: []proxmox.Guest{{VMID: 601, Type: proxmox.TypeQEMU, Running: true}}}
+	store := &fakeStore{intent: state.Intent{Wake: []state.WakeRequest{
+		{VMID: 601, User: "josef", RequestedAt: time.Now().Unix()},
+	}}}
+	s := bothVMs(t, cluster, store)
+
+	if rec := do(t, s, "POST", "/api/vms/601/power/reboot", ""); rec.Code != http.StatusAccepted {
+		t.Fatalf("reboot = %d, want 202", rec.Code)
+	}
+	if len(store.intent.Wake) != 1 {
+		t.Errorf("wake = %+v, want 601's request kept across a reboot", store.intent.Wake)
+	}
+}
+
+// A caller may only act on VMs their own groups allow, for power actions as much as for start.
+func TestPowerRequiresAuthorisation(t *testing.T) {
+	cluster := &fakeCluster{up: true, guests: []proxmox.Guest{{VMID: 602, Type: proxmox.TypeQEMU, Running: true}}}
+	s, _ := testServer(t, staticAuth{User: "josef", Groups: []string{"deskvm-josef"}}, cluster, &fakeStore{})
+	if rec := do(t, s, "POST", "/api/vms/602/power/stop", ""); rec.Code != http.StatusForbidden {
+		t.Errorf("stop on someone else's VM = %d, want 403", rec.Code)
+	}
+	if len(cluster.power) != 0 {
+		t.Errorf("proxmox was called anyway: %v", cluster.power)
+	}
+}
+
+// A request the loop has already seen through to a running VM is spent: nothing will start the
+// VM again, so the UI must show it as off rather than sitting on "starting" until the TTL runs
+// out. This is what the user sees after shutting the VM down from inside the guest.
+func TestSpentRequestStopsShowingAsStarting(t *testing.T) {
+	clicked := time.Now().Unix()
+	cluster := &fakeCluster{up: true, guests: []proxmox.Guest{{VMID: 601, Type: proxmox.TypeQEMU}}}
+	store := &fakeStore{
+		intent: state.Intent{Wake: []state.WakeRequest{{VMID: 601, User: "josef", RequestedAt: clicked}}},
+		st:     state.State{WakeDone: map[int]int64{601: clicked}},
+	}
+	s := bothVMs(t, cluster, store)
+
+	var resp statusResponse
+	decode(t, do(t, s, "GET", "/api/status", ""), &resp)
+	for _, vm := range resp.VMs {
+		if vm.VMID != 601 {
+			continue
+		}
+		if vm.Requested || vm.Phase != "off" {
+			t.Errorf("601 = requested %v phase %q, want false/off: the request is spent",
+				vm.Requested, vm.Phase)
+		}
+	}
+}
+
+// A spent request must not keep holding the GPU either, or the other VM stays blocked forever.
+func TestSpentRequestReleasesTheGPU(t *testing.T) {
+	clicked := time.Now().Unix()
+	cluster := &fakeCluster{up: true, gpu: map[int]string{601: "gpu0", 602: "gpu0"}, guests: []proxmox.Guest{
+		{VMID: 601, Type: proxmox.TypeQEMU},
+		{VMID: 602, Type: proxmox.TypeQEMU},
+	}}
+	store := &fakeStore{
+		intent: state.Intent{Wake: []state.WakeRequest{{VMID: 601, User: "josef", RequestedAt: clicked}}},
+		st:     state.State{WakeDone: map[int]int64{601: clicked}},
+	}
+	s := bothVMs(t, cluster, store)
+	if rec := do(t, s, "POST", "/api/vms/602/start", ""); rec.Code != http.StatusAccepted {
+		t.Errorf("start = %d, want 202: 601's request is spent and its VM is down", rec.Code)
 	}
 }

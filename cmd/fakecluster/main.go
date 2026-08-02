@@ -25,6 +25,7 @@ type guest struct {
 	Name    string
 	Type    string // qemu | lxc
 	Running bool
+	GPU     string // hostpci0 passthrough key, empty for guests with no GPU
 }
 
 type cluster struct {
@@ -61,8 +62,9 @@ func main() {
 		{VMID: 102, Name: "talos-cp-2", Type: "qemu", Running: true},
 		{VMID: 301, Name: "media", Type: "qemu", Running: true},
 		{VMID: 302, Name: "paperless", Type: "lxc", Running: true},
-		{VMID: 601, Name: "josef-desktop", Type: "qemu"},
-		{VMID: 602, Name: "guest-desktop", Type: "qemu"},
+		// Both desktop VMs share one GPU, as the real ones do: that is the conflict the UI blocks.
+		{VMID: 601, Name: "josef-desktop", Type: "qemu", GPU: "gpu0"},
+		{VMID: 602, Name: "guest-desktop", Type: "qemu", GPU: "gpu0"},
 	} {
 		c.guests[g.VMID] = g
 	}
@@ -171,7 +173,11 @@ func (c *cluster) handleNodePaths(w http.ResponseWriter, r *http.Request) {
 
 	switch {
 	case parts[1] == "qemu" || parts[1] == "lxc":
-		c.listGuests(w, parts[1])
+		if len(parts) == 2 {
+			c.listGuests(w, parts[1])
+			return
+		}
+		c.guestPath(w, parts)
 	case parts[1] == "startall" || parts[1] == "stopall" || parts[1] == "migrateall":
 		c.bulkAction(w, r, parts[1])
 	case parts[1] == "wakeonlan":
@@ -206,6 +212,40 @@ func (c *cluster) listGuests(w http.ResponseWriter, typ string) {
 		out = append(out, map[string]any{"vmid": g.VMID, "name": g.Name, "status": status})
 	}
 	c.ok(w, out)
+}
+
+// guestPath handles /nodes/<node>/<type>/<vmid>/{config,status/<action>}.
+func (c *cluster) guestPath(w http.ResponseWriter, parts []string) {
+	vmid, err := strconv.Atoi(parts[2])
+	if err != nil {
+		http.NotFound(w, nil)
+		return
+	}
+	g, ok := c.guests[vmid]
+	if !ok {
+		http.Error(w, "no such guest", http.StatusNotFound)
+		return
+	}
+	if parts[len(parts)-1] == "config" {
+		cfg := map[string]any{"name": g.Name, "cores": 8, "memory": 16384}
+		if g.GPU != "" {
+			cfg["hostpci0"] = "mapping=" + g.GPU + ",pcie=1,x-vga=1"
+		}
+		c.ok(w, cfg)
+		return
+	}
+	switch parts[len(parts)-1] {
+	case "shutdown", "stop":
+		g.Running = false
+		log.Printf("guest %d (%s) %s", vmid, g.Name, parts[len(parts)-1])
+	case "reboot", "reset":
+		g.Running = true
+		log.Printf("guest %d (%s) %s", vmid, g.Name, parts[len(parts)-1])
+	default:
+		http.NotFound(w, nil)
+		return
+	}
+	c.ok(w, c.newTask())
 }
 
 // bulkAction handles /nodes/<node>/{startall,stopall,migrateall}. The real thing paces guests

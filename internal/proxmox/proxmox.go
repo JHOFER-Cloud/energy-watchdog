@@ -220,6 +220,66 @@ func vmidList(vmids []int) (string, error) {
 	return strings.Join(out, ","), nil
 }
 
+// GuestPower is a per-guest power action, matching the API path segment.
+type GuestPower string
+
+const (
+	PowerShutdown GuestPower = "shutdown" // graceful ACPI shutdown
+	PowerReboot   GuestPower = "reboot"   // graceful shutdown and start again
+	PowerReset    GuestPower = "reset"    // like the reset button; QEMU only
+	PowerStop     GuestPower = "stop"     // pulls the plug
+)
+
+// Power runs a power action on a single guest and returns the task UPID. LXC has no reset, so
+// it is rejected here rather than becoming a 501 from Proxmox mid-click.
+func (c *Client) Power(ctx context.Context, node string, g Guest, action GuestPower) (string, error) {
+	if action == PowerReset && g.Type != TypeQEMU {
+		return "", fmt.Errorf("reset is QEMU-only, guest %d is %s", g.VMID, g.Type)
+	}
+	return c.task(ctx, http.MethodPost, fmt.Sprintf("/nodes/%s/%s/%d/status/%s", node, g.Type, g.VMID, action), url.Values{})
+}
+
+// GPUKey identifies the physical GPU passed through to a guest, or "" if it has none. It is
+// the resource-mapping name where one is used (hostpci0: mapping=gpu0,...) and the raw PCI
+// address otherwise, so two guests sharing a GPU always land on the same key.
+func (c *Client) GPUKey(ctx context.Context, node string, g Guest) (string, error) {
+	data, err := c.do(ctx, http.MethodGet, fmt.Sprintf("/nodes/%s/%s/%d/config", node, g.Type, g.VMID), nil)
+	if err != nil {
+		return "", err
+	}
+	// The config mixes strings and numbers (cores, memory), so decode lazily and only read the
+	// hostpci fields. Lowest-numbered one wins: a guest with several passthrough devices still
+	// gets one stable key, and the GPU is conventionally hostpci0.
+	var cfg map[string]json.RawMessage
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return "", err
+	}
+	field := ""
+	for k := range cfg {
+		if strings.HasPrefix(k, "hostpci") && (field == "" || k < field) {
+			field = k
+		}
+	}
+	if field == "" {
+		return "", nil
+	}
+	var v string
+	if err := json.Unmarshal(cfg[field], &v); err != nil {
+		return "", fmt.Errorf("decode %s of guest %d: %w", field, g.VMID, err)
+	}
+	return hostPCIKey(v), nil
+}
+
+// hostPCIKey reduces a hostpciN value to its device identity, dropping the pcie=/x-vga= flags.
+func hostPCIKey(v string) string {
+	for _, part := range strings.Split(v, ",") {
+		if name, ok := strings.CutPrefix(part, "mapping="); ok {
+			return name
+		}
+	}
+	return strings.Split(v, ",")[0]
+}
+
 // ReplicationJob is one entry of the cluster's replication config.
 type ReplicationJob struct {
 	ID       string // "<guest>-<jobnum>", e.g. "104-0"

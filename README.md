@@ -69,10 +69,20 @@ There's no one-click hand-off to Moonlight, because no such thing exists: Moonli
 URL scheme to launch it with ([moonlight-qt#1874](https://github.com/moonlight-stream/moonlight-qt/issues/1874)
 is still open). The UI shows the stream host with a copy button instead.
 
-The UI never touches `p1` itself. It records intent and the reconcile loop acts on it, so
-there's still exactly one owner of the host's power state — a click while a shed is halfway
-through migrating guests can't fight it. A request that lands during a shutdown simply stays
-outstanding until the shutdown finishes, and the loop then wakes the host.
+Once a VM is up you also get Shut down, Reboot, Reset and Stop; the two that cut power without
+the guest agreeing ask for a second click first. A VM whose GPU is already mapped into another
+guest can't be started — Proxmox allows one guest per GPU at a time — so the UI names the VM
+holding it instead of offering a button that would only fail. Which VMs share a GPU is read
+from their `hostpci` passthrough config while `p1` is up, so remapping a device takes effect on
+the next poll rather than needing a config change here.
+
+Starting the host is the one thing the UI doesn't do itself: it records intent and the
+reconcile loop acts on it, so there's still exactly one owner of the host's power state — a
+click while a shed is halfway through migrating guests can't fight it. A request that lands
+during a shutdown simply stays outstanding until the shutdown finishes, and the loop then wakes
+the host. Guest power actions go straight to Proxmox, which can't turn `p1` on or off and so
+can't break that. A request stops acting the moment its VM has been up, so shutting the VM down
+again — from the UI or from inside the guest — leaves it down instead of being started back up.
 
 Off unless `selfService.addr` is set. See [DEVELOPMENT.md](./DEVELOPMENT.md) for how it fits
 together and how to run the whole thing locally.

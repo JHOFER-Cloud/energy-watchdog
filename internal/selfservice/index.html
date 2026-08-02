@@ -33,11 +33,11 @@
   .banner.on { display: block; }
   .banner b { color: var(--warn); }
   .vm {
-    display: flex; align-items: center; gap: 1rem; padding: 1rem;
+    display: flex; align-items: center; gap: 1rem .75rem; flex-wrap: wrap; padding: 1rem;
     background: var(--card); border: 1px solid var(--line); border-radius: .6rem; margin-bottom: .75rem;
   }
-  .vm .info { flex: 1; min-width: 0; }
-  .vm .name { font-weight: 600; }
+  .vm .info { flex: 1 1 12rem; min-width: 0; }
+  .vm .name { font-weight: 600; overflow-wrap: anywhere; }
   .vm .state { color: var(--muted); font-size: .85rem; display: flex; align-items: center; gap: .4rem; }
   .dot { width: .5rem; height: .5rem; border-radius: 50%; background: var(--muted); flex: none; }
   .dot.ready { background: var(--ok); }
@@ -58,7 +58,19 @@
   .err { color: var(--warn); font-size: .85rem; min-height: 1.2em; margin-top: 1rem; }
   .warn { color: var(--warn); font-size: .85rem; margin: .8rem 0 0; }
   button.danger { background: #b3261e; color: #fff; border-color: transparent; }
-  .host { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .85rem; }
+  /* Resting state for the two that cut power: clearly destructive, but not yet armed. */
+  button.destructive { background: transparent; border-color: #b3261e; color: #d3564d; }
+  .actions { display: flex; gap: .4rem; flex-wrap: wrap; justify-content: flex-end; margin-left: auto; }
+  .blocked { color: var(--warn); font-size: .85rem; overflow-wrap: anywhere; }
+  /* One line per VM stops working once five buttons are on it; stack instead of overflowing. */
+  @media (max-width: 34rem) {
+    .actions { margin-left: 0; width: 100%; justify-content: flex-start; }
+    button { flex: 1 1 auto; }
+  }
+  .host {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .85rem;
+    color: var(--muted); overflow-wrap: anywhere;
+  }
   button.linkish {
     background: none; border: none; color: var(--muted); font-size: .85rem;
     padding: 0 0 0 .6rem; cursor: pointer; text-decoration: underline;
@@ -151,34 +163,52 @@ function render(s) {
 
     // Moonlight has no URL scheme to hand off to (moonlight-stream/moonlight-qt#1874 is
     // still open), so the useful thing is the host itself, ready to paste into the client.
-    if (vm.phase === "ready" && vm.streamHost) {
-      const b = document.createElement("button");
-      b.className = "secondary";
-      b.textContent = "Copy host";
-      b.onclick = async () => {
-        try {
-          await navigator.clipboard.writeText(vm.streamHost);
-          b.textContent = "Copied";
-          setTimeout(() => { b.textContent = "Copy host"; }, 1500);
-        } catch { show("Clipboard blocked — the host is " + vm.streamHost); }
-      };
-      el.querySelector(".state").insertAdjacentHTML("beforeend",
-        `<span class="host"></span>`);
-      el.querySelector(".host").textContent = "· " + vm.streamHost;
-      el.appendChild(b);
+    const actions = document.createElement("div");
+    actions.className = "actions";
+
+    if (vm.phase === "ready") {
+      if (vm.streamHost) {
+        const b = document.createElement("button");
+        b.className = "secondary";
+        b.textContent = "Copy host";
+        b.onclick = async () => {
+          try {
+            await navigator.clipboard.writeText(vm.streamHost);
+            b.textContent = "Copied";
+            setTimeout(() => { b.textContent = "Copy host"; }, 1500);
+          } catch { show("Clipboard blocked — the host is " + vm.streamHost); }
+        };
+        const host = document.createElement("div");
+        host.className = "host";
+        host.textContent = vm.streamHost;
+        el.querySelector(".info").appendChild(host);
+        actions.appendChild(b);
+      }
+      // Reset and Stop cut power without the guest agreeing, so they ask first.
+      actions.appendChild(powerButton(vm, "shutdown", "Shut down", false));
+      actions.appendChild(powerButton(vm, "reboot", "Reboot", false));
+      actions.appendChild(powerButton(vm, "reset", "Reset", true));
+      actions.appendChild(powerButton(vm, "stop", "Stop", true));
+    } else if (vm.blockedBy) {
+      // Proxmox maps a GPU into one guest at a time, so this start would just fail.
+      const why = document.createElement("span");
+      why.className = "blocked";
+      why.textContent = `${vm.blockedBy} is using this GPU`;
+      actions.appendChild(why);
     } else {
       const b = document.createElement("button");
       const working = vm.requested || busy.has(vm.vmid);
       b.textContent = working ? "Starting…" : "Start";
-      b.disabled = working || vm.phase === "ready";
+      b.disabled = working;
       b.onclick = async () => {
         busy.add(vm.vmid); b.disabled = true; b.textContent = "Starting…";
         try { await api(`/api/vms/${vm.vmid}/start`, { method: "POST" }); }
         catch (e) { show(e.message); busy.delete(vm.vmid); }
         poll();
       };
-      el.appendChild(b);
+      actions.appendChild(b);
     }
+    el.appendChild(actions);
     return el;
   }));
 
@@ -187,6 +217,30 @@ function render(s) {
 }
 
 function show(msg) { document.getElementById("err").textContent = msg; }
+
+// powerButton builds one guest power action. The destructive ones arm on the first click and
+// fire on the second, the same pattern the admin shed button uses.
+function powerButton(vm, action, label, confirm) {
+  const b = document.createElement("button");
+  const resting = confirm ? "destructive" : "secondary";
+  b.className = resting;
+  b.textContent = label;
+  let armed = false;
+  b.onclick = async () => {
+    if (confirm && !armed) {
+      armed = true;
+      b.textContent = `${label}?`;
+      b.className = "danger";
+      setTimeout(() => { if (armed) { armed = false; b.textContent = label; b.className = resting; } }, 4000);
+      return;
+    }
+    b.disabled = true;
+    try { await api(`/api/vms/${vm.vmid}/power/${action}`, { method: "POST" }); }
+    catch (e) { show(e.message); }
+    poll();
+  };
+  return b;
+}
 
 let manualShed = false, lastImpact = null, confirming = false;
 

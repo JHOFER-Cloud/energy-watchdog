@@ -32,7 +32,8 @@ enough to look at. Guest start/stop is instant.
 
 Preloaded guests: `101`/`102` (migrate class), `301`/`302` (stop class), `601`/`602` (gaming
 guard / desktop VMs). Two in each class so a shed exercises the round-robin across
-`targetNodes` and a mixed qemu/lxc bulk stop.
+`targetNodes` and a mixed qemu/lxc bulk stop. Both desktop VMs report the same `hostpci0`
+passthrough device, so the UI's one-guest-per-GPU block is reachable locally.
 
 ### -dev-user
 

@@ -278,3 +278,56 @@ func TestErrorStatus(t *testing.T) {
 		t.Fatal("expected error on 403, got nil")
 	}
 }
+
+func TestGPUKey(t *testing.T) {
+	tests := []struct {
+		name, config, want string
+	}{
+		{"mapped device", `{"hostpci0":"mapping=gpu0,pcie=1,x-vga=1","cores":8}`, "gpu0"},
+		{"raw pci address", `{"hostpci0":"0000:01:00,pcie=1","memory":16384}`, "0000:01:00"},
+		// hostpci0 is the GPU by convention; a second device must not change the key.
+		{"lowest hostpci wins", `{"hostpci1":"mapping=nic","hostpci0":"mapping=gpu0"}`, "gpu0"},
+		{"no passthrough", `{"cores":4,"memory":8192}`, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := newTestServer(t, func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = w.Write([]byte(`{"data":` + tt.config + `}`))
+			})
+			got, err := c.GPUKey(context.Background(), "pve-1", Guest{VMID: 601, Type: TypeQEMU})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != tt.want {
+				t.Errorf("GPUKey = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// Proxmox has no reset for containers, so it must be refused before it becomes a mid-click 501.
+func TestPowerRejectsResetOnLXC(t *testing.T) {
+	c := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("reset on an LXC reached the server: %s", r.URL.Path)
+		_, _ = w.Write([]byte(`{"data":"UPID:x"}`))
+	})
+	if _, err := c.Power(context.Background(), "pve-1", Guest{VMID: 301, Type: TypeLXC}, PowerReset); err == nil {
+		t.Error("Power(reset, lxc) = nil error, want a refusal")
+	}
+}
+
+func TestPowerPathPerAction(t *testing.T) {
+	for _, action := range []GuestPower{PowerShutdown, PowerReboot, PowerReset, PowerStop} {
+		t.Run(string(action), func(t *testing.T) {
+			c := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+				if want := "/api2/json/nodes/pve-1/qemu/601/status/" + string(action); r.URL.Path != want {
+					t.Errorf("path = %q, want %q", r.URL.Path, want)
+				}
+				_, _ = w.Write([]byte(`{"data":"UPID:` + string(action) + `"}`))
+			})
+			if _, err := c.Power(context.Background(), "pve-1", Guest{VMID: 601, Type: TypeQEMU}, action); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}

@@ -102,6 +102,17 @@ func (s SelfService) Allowed(groups []string) []SelfServiceVM {
 	return out
 }
 
+// NameOf is a VM's configured name, falling back to its id so a message never reads "VM  is
+// using this GPU" for something the config forgot to name.
+func (s SelfService) NameOf(vmid int) string {
+	for _, vm := range s.VMs {
+		if vm.VMID == vmid && vm.Name != "" {
+			return vm.Name
+		}
+	}
+	return "VM " + strconv.Itoa(vmid)
+}
+
 // IsAdmin reports whether any of these groups may toggle the manual shed.
 func (s SelfService) IsAdmin(groups []string) bool {
 	for _, g := range groups {
