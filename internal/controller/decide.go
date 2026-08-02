@@ -30,8 +30,10 @@ type Snapshot struct {
 	GraceSince int64 // unix time the gaming grace clock started; 0 when not running
 	// ManualShed holds the node shed regardless of surplus (state.Intent.Shed).
 	ManualShed bool
-	// WakeVMIDs are desktop VMs with a live self-service request behind them.
-	WakeVMIDs []int
+	// Wake are the live self-service requests, already filtered to the gaming guard and deduped.
+	Wake []state.WakeRequest
+	// WakeDone is the persisted spent-request marker; see state.State.WakeDone.
+	WakeDone map[int]int64
 }
 
 // Plan is the set of actions a single reconcile wants to take. Disjoint per mode:
@@ -48,7 +50,8 @@ type Plan struct {
 	Silence        bool
 	Unsilence      bool
 	NextMode       state.Mode
-	GraceSince     int64 // the grace clock to persist; carried forward unless a transition changes it
+	GraceSince     int64         // the grace clock to persist; carried forward unless a transition changes it
+	WakeDone       map[int]int64 // the spent-request markers to persist; see state.State.WakeDone
 	Reason         string
 }
 
@@ -82,22 +85,33 @@ func matchRunning(guests []proxmox.Guest, set config.IDSet) []proxmox.Guest {
 	return out
 }
 
-// pendingStarts is the requested ids that aren't already running. With the node down we know
-// of no running guest, so everything asked for is still pending.
-func pendingStarts(want []int, guests []proxmox.Guest) []int {
+// resolveWake splits the live requests into the ones still to act on and the spent-request
+// markers to persist. A request is spent once its VM has been seen running: without that, the
+// user shutting the VM down inside the request's TTL would just start it again next tick. Only
+// VMIDs with a live request are carried, so the markers age out with the requests themselves.
+func resolveWake(want []state.WakeRequest, guests []proxmox.Guest, done map[int]int64) ([]int, map[int]int64) {
 	running := make(map[int]bool, len(guests))
 	for _, g := range guests {
 		if g.Running {
 			running[g.VMID] = true
 		}
 	}
-	var out []int
-	for _, id := range want {
-		if !running[id] {
-			out = append(out, id)
+	var pending []int
+	next := map[int]int64{}
+	for _, w := range want {
+		switch {
+		case w.RequestedAt <= done[w.VMID]:
+			next[w.VMID] = done[w.VMID] // spent on an earlier tick; a newer request re-arms it
+		case running[w.VMID]:
+			next[w.VMID] = w.RequestedAt // the VM is up: this request is satisfied
+		default:
+			pending = append(pending, w.VMID)
 		}
 	}
-	return out
+	if len(next) == 0 {
+		return pending, nil
+	}
+	return pending, next
 }
 
 func refs(guests []proxmox.Guest) []state.GuestRef {
@@ -120,7 +134,7 @@ func Decide(s Snapshot, cfg *config.Config, now time.Time) Plan {
 		sig = sigDeficit
 	}
 	gaming := s.NodeUp && gamingActive(s.Guests, cfg.Guests.GamingGuard)
-	pending := pendingStarts(s.WakeVMIDs, s.Guests)
+	pending, wakeDone := resolveWake(s.Wake, s.Guests, s.WakeDone)
 	requested := len(pending) > 0
 	// graceStart is the clock to record when we enter a gaming session: stopped (0) if a
 	// gaming guest is already running, else start counting from now.
@@ -130,7 +144,7 @@ func Decide(s Snapshot, cfg *config.Config, now time.Time) Plan {
 		}
 		return now.Unix()
 	}
-	p := Plan{NextMode: s.Mode, GraceSince: s.GraceSince}
+	p := Plan{NextMode: s.Mode, GraceSince: s.GraceSince, WakeDone: wakeDone}
 
 	switch s.Mode {
 	case state.ModeRunning:

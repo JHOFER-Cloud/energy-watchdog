@@ -3,6 +3,7 @@ package controller
 import (
 	"io"
 	"log/slog"
+	"maps"
 	"testing"
 	"time"
 
@@ -129,7 +130,7 @@ func TestDecideWakeRequest(t *testing.T) {
 	}{
 		{
 			name:       "shed, request -> wake p1 and start the VM",
-			snap:       Snapshot{Surplus: -300, SoC: 80, NodeUp: false, Mode: state.ModeShed, WakeVMIDs: []int{601}},
+			snap:       Snapshot{Surplus: -300, SoC: 80, NodeUp: false, Mode: state.ModeShed, Wake: wants(601)},
 			wantMode:   state.ModeGaming,
 			wantWake:   true,
 			wantStartR: []int{601},
@@ -138,7 +139,7 @@ func TestDecideWakeRequest(t *testing.T) {
 		{
 			// A manual shed must not block someone gaming, same as the guard doesn't.
 			name:       "shed, manual shed, request -> still wakes",
-			snap:       Snapshot{Surplus: 4000, SoC: 90, NodeUp: false, Mode: state.ModeShed, ManualShed: true, WakeVMIDs: []int{601}},
+			snap:       Snapshot{Surplus: 4000, SoC: 90, NodeUp: false, Mode: state.ModeShed, ManualShed: true, Wake: wants(601)},
 			wantMode:   state.ModeGaming,
 			wantWake:   true,
 			wantStartR: []int{601},
@@ -148,7 +149,7 @@ func TestDecideWakeRequest(t *testing.T) {
 			// This is the shutting-down race: the loop already powered p1 off, and the request
 			// is still live, so the next tick simply wakes it again. Nothing hangs.
 			name:       "gaming, p1 went down, request live -> shed, then wake next tick",
-			snap:       Snapshot{Surplus: -300, SoC: 80, NodeUp: false, Mode: state.ModeGaming, WakeVMIDs: []int{601}, GraceSince: testNow.Add(-time.Minute).Unix()},
+			snap:       Snapshot{Surplus: -300, SoC: 80, NodeUp: false, Mode: state.ModeGaming, Wake: wants(601), GraceSince: testNow.Add(-time.Minute).Unix()},
 			wantMode:   state.ModeShed,
 			wantWake:   false,
 			wantStartR: nil,
@@ -156,14 +157,14 @@ func TestDecideWakeRequest(t *testing.T) {
 		{
 			// Already running: nothing to start, and the guard holds p1 from here on.
 			name:       "gaming, requested VM already running -> no start",
-			snap:       Snapshot{Surplus: -300, SoC: 80, NodeUp: true, Guests: []proxmox.Guest{qemu(601, true)}, Mode: state.ModeGaming, WakeVMIDs: []int{601}},
+			snap:       Snapshot{Surplus: -300, SoC: 80, NodeUp: true, Guests: []proxmox.Guest{qemu(601, true)}, Mode: state.ModeGaming, Wake: wants(601)},
 			wantMode:   state.ModeGaming,
 			wantStartR: nil,
 		},
 		{
 			// A request arriving late in an already-running grace window must not be cut off.
 			name:       "gaming, request late in grace window -> hold, restart clock",
-			snap:       Snapshot{Surplus: -300, SoC: 80, NodeUp: true, Guests: []proxmox.Guest{qemu(601, false)}, Mode: state.ModeGaming, WakeVMIDs: []int{601}, GraceSince: testNow.Add(-9 * time.Minute).Unix()},
+			snap:       Snapshot{Surplus: -300, SoC: 80, NodeUp: true, Guests: []proxmox.Guest{qemu(601, false)}, Mode: state.ModeGaming, Wake: wants(601), GraceSince: testNow.Add(-9 * time.Minute).Unix()},
 			wantMode:   state.ModeGaming,
 			wantPower:  false,
 			wantStartR: []int{601},
@@ -172,14 +173,14 @@ func TestDecideWakeRequest(t *testing.T) {
 		{
 			// p1 is up and serving: just start the VM, no mode change.
 			name:       "running, request -> start the VM, stay running",
-			snap:       Snapshot{Surplus: 4000, SoC: 90, NodeUp: true, Guests: []proxmox.Guest{qemu(601, false)}, Mode: state.ModeRunning, WakeVMIDs: []int{601}},
+			snap:       Snapshot{Surplus: 4000, SoC: 90, NodeUp: true, Guests: []proxmox.Guest{qemu(601, false)}, Mode: state.ModeRunning, Wake: wants(601)},
 			wantMode:   state.ModeRunning,
 			wantStartR: []int{601},
 		},
 		{
 			// Deficit with a request but no VM up yet: hold the host for the session.
 			name:       "running, deficit, request -> gaming, keep host up",
-			snap:       Snapshot{Surplus: -300, SoC: 80, NodeUp: true, Guests: []proxmox.Guest{qemu(601, false)}, Mode: state.ModeRunning, WakeVMIDs: []int{601}},
+			snap:       Snapshot{Surplus: -300, SoC: 80, NodeUp: true, Guests: []proxmox.Guest{qemu(601, false)}, Mode: state.ModeRunning, Wake: wants(601)},
 			wantMode:   state.ModeGaming,
 			wantPower:  false,
 			wantStartR: []int{601},
@@ -211,20 +212,99 @@ func TestDecideWakeRequest(t *testing.T) {
 
 // intent.json is a documented break-glass path, so a hand-written one must not be able to
 // make the loop start the same VM twice, or start something the gaming guard won't hold p1 for.
-func TestRequestedVMIDsSanitisesIntent(t *testing.T) {
+func TestRequestedWakeSanitisesIntent(t *testing.T) {
 	cfg := testCfg(t)
 	cfg.GamingGrace = config.Duration{Duration: 10 * time.Minute}
 	c := &Controller{cfg: cfg, log: slog.New(slog.NewTextHandler(io.Discard, nil))}
 
 	stale := testNow.Add(-11 * time.Minute).Unix()
-	got := c.requestedVMIDs(state.Intent{Wake: []state.WakeRequest{
+	got := c.requestedWake(state.Intent{Wake: []state.WakeRequest{
 		{VMID: 601, RequestedAt: testNow.Unix()},
 		{VMID: 601, RequestedAt: testNow.Unix()}, // duplicate entry
 		{VMID: 101, RequestedAt: testNow.Unix()}, // outside gamingGuard
 		{VMID: 602, RequestedAt: stale},          // aged out
 	}}, testNow)
 
-	if !equal(got, []int{601}) {
-		t.Errorf("requestedVMIDs = %v, want [601]", got)
+	if len(got) != 1 || got[0].VMID != 601 {
+		t.Errorf("requestedWake = %+v, want just 601", got)
+	}
+}
+
+// wants builds live wake requests for the decision tests, dated at testNow.
+func wants(vmids ...int) []state.WakeRequest {
+	out := make([]state.WakeRequest, len(vmids))
+	for i, id := range vmids {
+		out[i] = state.WakeRequest{VMID: id, RequestedAt: testNow.Unix()}
+	}
+	return out
+}
+
+// TestWakeRequestIsSpentOnceTheVMIsUp walks the lifecycle of one Start click. The request must
+// stop acting the moment the VM has been up, or shutting the VM down inside its TTL - the
+// request lives for gamingGrace - just starts it again on the next tick.
+func TestWakeRequestIsSpentOnceTheVMIsUp(t *testing.T) {
+	cfg := testCfg(t)
+	req := wants(601)
+	clicked := req[0].RequestedAt
+
+	tests := []struct {
+		name     string
+		guests   []proxmox.Guest
+		done     map[int]int64
+		wantStar []int
+		wantDone map[int]int64
+	}{
+		{
+			name:     "clicked, VM not up yet -> start it",
+			guests:   []proxmox.Guest{qemu(601, false)},
+			wantStar: []int{601},
+		},
+		{
+			name:     "VM came up -> nothing to start, request marked spent",
+			guests:   []proxmox.Guest{qemu(601, true)},
+			wantDone: map[int]int64{601: clicked},
+		},
+		{
+			// The flaw: same still-live request, VM now shut down by the user. It must stay down.
+			name:     "user shut the VM down -> left alone",
+			guests:   []proxmox.Guest{qemu(601, false)},
+			done:     map[int]int64{601: clicked},
+			wantDone: map[int]int64{601: clicked},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			snap := Snapshot{
+				Surplus: -300, SoC: 80, NodeUp: true, Mode: state.ModeGaming,
+				Guests: tt.guests, Wake: req, WakeDone: tt.done,
+			}
+			p := Decide(snap, cfg, testNow)
+			if !equal(p.StartRequested, tt.wantStar) {
+				t.Errorf("startRequested = %v, want %v", p.StartRequested, tt.wantStar)
+			}
+			if !maps.Equal(p.WakeDone, tt.wantDone) {
+				t.Errorf("wakeDone = %v, want %v", p.WakeDone, tt.wantDone)
+			}
+		})
+	}
+
+	// Clicking Start again re-arms it: the new request is newer than the spent marker.
+	again := []state.WakeRequest{{VMID: 601, RequestedAt: clicked + 1}}
+	p := Decide(Snapshot{
+		Surplus: -300, SoC: 80, NodeUp: true, Mode: state.ModeGaming,
+		Guests: []proxmox.Guest{qemu(601, false)}, Wake: again, WakeDone: map[int]int64{601: clicked},
+	}, cfg, testNow)
+	if !equal(p.StartRequested, []int{601}) {
+		t.Errorf("a fresh click must re-arm: startRequested = %v, want [601]", p.StartRequested)
+	}
+}
+
+// The tick that marks a request spent changes nothing else, so it must not be treated as a
+// noop - skipping that write would lose the marker and let the VM be restarted.
+func TestMarkingAWakeSpentIsNotANoop(t *testing.T) {
+	snap := Snapshot{Mode: state.ModeGaming}
+	p := Plan{NextMode: state.ModeGaming, WakeDone: map[int]int64{601: testNow.Unix()}}
+	if isNoop(p, snap) {
+		t.Error("isNoop = true for a new wakeDone marker, so it would never be persisted")
 	}
 }

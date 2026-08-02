@@ -82,6 +82,10 @@ type State struct {
 	// clock exceeds the grace window, so a freshly-woken host with no VM yet, or a
 	// GPU-passthrough/VM reboot mid-session, isn't cut short. 0 when the clock isn't running.
 	GraceSince int64 `json:"graceSince,omitempty"`
+	// WakeDone records, per desktop VM, the RequestedAt of the last wake request seen through
+	// to a running VM. A spent request must not start the VM again, or shutting it down inside
+	// the request's TTL would just bring it back on the next tick.
+	WakeDone map[int]int64 `json:"wakeDone,omitempty"`
 }
 
 // Store loads and saves the watchdog's State and the externally-set Intent. The two are

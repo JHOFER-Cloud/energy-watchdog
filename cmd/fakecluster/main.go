@@ -25,20 +25,22 @@ type guest struct {
 	Name    string
 	Type    string // qemu | lxc
 	Running bool
+	GPU     string // hostpci0 passthrough key, empty for guests with no GPU
 }
 
 type cluster struct {
-	mu       sync.Mutex
-	node     string
-	up       bool
-	bootAt   time.Time
-	guests   map[int]*guest
-	surplus  float64
-	soc      float64
-	tasks    map[string]time.Time // upid -> when it completes
-	taskSeq  int
-	shutdown time.Time // pending power-off, zero if none
-	wakeAt   time.Time // pending wake-on-lan, zero if none
+	mu        sync.Mutex
+	node      string
+	up        bool
+	bootAt    time.Time
+	guests    map[int]*guest
+	surplus   float64
+	soc       float64
+	tasks     map[string]time.Time // upid -> when it completes
+	taskSeq   int
+	taskDelay time.Duration // how long a bulk task takes to report done
+	shutdown  time.Time     // pending power-off, zero if none
+	wakeAt    time.Time     // pending wake-on-lan, zero if none
 }
 
 func main() {
@@ -46,10 +48,11 @@ func main() {
 	node := flag.String("node", "pve-1", "managed node name")
 	surplus := flag.Float64("surplus", -300, "solar surplus in watts (negative = deficit)")
 	up := flag.Bool("up", true, "start with the node powered on")
+	taskDelay := flag.Duration("task-delay", 0, "how long bulk migrate/stop tasks take; real ones run for minutes")
 	flag.Parse()
 
 	c := &cluster{
-		node: *node, up: *up, surplus: *surplus, soc: 80,
+		node: *node, up: *up, surplus: *surplus, soc: 80, taskDelay: *taskDelay,
 		guests: map[int]*guest{},
 		tasks:  map[string]time.Time{},
 	}
@@ -61,8 +64,9 @@ func main() {
 		{VMID: 102, Name: "talos-cp-2", Type: "qemu", Running: true},
 		{VMID: 301, Name: "media", Type: "qemu", Running: true},
 		{VMID: 302, Name: "paperless", Type: "lxc", Running: true},
-		{VMID: 601, Name: "josef-desktop", Type: "qemu"},
-		{VMID: 602, Name: "guest-desktop", Type: "qemu"},
+		// Both desktop VMs share one GPU, as the real ones do: that is the conflict the UI blocks.
+		{VMID: 601, Name: "josef-desktop", Type: "qemu", GPU: "gpu0"},
+		{VMID: 602, Name: "guest-desktop", Type: "qemu", GPU: "gpu0"},
 	} {
 		c.guests[g.VMID] = g
 	}
@@ -171,7 +175,11 @@ func (c *cluster) handleNodePaths(w http.ResponseWriter, r *http.Request) {
 
 	switch {
 	case parts[1] == "qemu" || parts[1] == "lxc":
-		c.listGuests(w, parts[1])
+		if len(parts) == 2 {
+			c.listGuests(w, parts[1])
+			return
+		}
+		c.guestPath(w, parts)
 	case parts[1] == "startall" || parts[1] == "stopall" || parts[1] == "migrateall":
 		c.bulkAction(w, r, parts[1])
 	case parts[1] == "wakeonlan":
@@ -206,6 +214,40 @@ func (c *cluster) listGuests(w http.ResponseWriter, typ string) {
 		out = append(out, map[string]any{"vmid": g.VMID, "name": g.Name, "status": status})
 	}
 	c.ok(w, out)
+}
+
+// guestPath handles /nodes/<node>/<type>/<vmid>/{config,status/<action>}.
+func (c *cluster) guestPath(w http.ResponseWriter, parts []string) {
+	vmid, err := strconv.Atoi(parts[2])
+	if err != nil {
+		http.NotFound(w, nil)
+		return
+	}
+	g, ok := c.guests[vmid]
+	if !ok {
+		http.Error(w, "no such guest", http.StatusNotFound)
+		return
+	}
+	if parts[len(parts)-1] == "config" {
+		cfg := map[string]any{"name": g.Name, "cores": 8, "memory": 16384}
+		if g.GPU != "" {
+			cfg["hostpci0"] = "mapping=" + g.GPU + ",pcie=1,x-vga=1"
+		}
+		c.ok(w, cfg)
+		return
+	}
+	switch parts[len(parts)-1] {
+	case "shutdown", "stop":
+		g.Running = false
+		log.Printf("guest %d (%s) %s", vmid, g.Name, parts[len(parts)-1])
+	case "reboot", "reset":
+		g.Running = true
+		log.Printf("guest %d (%s) %s", vmid, g.Name, parts[len(parts)-1])
+	default:
+		http.NotFound(w, nil)
+		return
+	}
+	c.ok(w, c.newTask())
 }
 
 // bulkAction handles /nodes/<node>/{startall,stopall,migrateall}. The real thing paces guests
@@ -243,19 +285,27 @@ func (c *cluster) bulkAction(w http.ResponseWriter, r *http.Request, action stri
 			log.Printf("guest %d (%s) migrated to %s", vmid, g.Name, r.Form.Get("target"))
 		}
 	}
-	c.ok(w, c.newTask())
+	c.ok(w, c.newTaskAfter(c.taskDelay))
 }
 
-func (c *cluster) newTask() string {
+func (c *cluster) newTask() string { return c.newTaskAfter(0) }
+
+// newTaskAfter registers a task that reports done only once d has passed.
+func (c *cluster) newTaskAfter(d time.Duration) string {
 	c.taskSeq++
 	upid := fmt.Sprintf("UPID:%s:fake:%d", c.node, c.taskSeq)
-	c.tasks[upid] = time.Now() // completes immediately
+	c.tasks[upid] = time.Now().Add(d)
 	return upid
 }
 
 func (c *cluster) taskStatus(w http.ResponseWriter, upid string) {
-	if _, ok := c.tasks[upid]; !ok {
+	done, ok := c.tasks[upid]
+	if !ok {
 		http.Error(w, "no such task", http.StatusNotFound)
+		return
+	}
+	if time.Now().Before(done) {
+		c.ok(w, map[string]any{"status": "running"})
 		return
 	}
 	c.ok(w, map[string]any{"status": "stopped", "exitstatus": "OK"})
