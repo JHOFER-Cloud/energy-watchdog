@@ -8,6 +8,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -163,27 +164,60 @@ func (c *Client) Guests(ctx context.Context, node string) ([]Guest, error) {
 	return out, nil
 }
 
-// Migrate moves a guest to target. QEMU goes online (live); LXC uses restart-migration.
-// It returns the task UPID to wait on.
-func (c *Client) Migrate(ctx context.Context, node string, g Guest, target string) (string, error) {
+// The bulk endpoints below are Proxmox's own mass actions: they group guests by `startup`
+// order and run each group max_workers wide. max-workers is never sent, so datacenter.cfg wins.
+
+// MigrateAll moves guests to target. Running QEMU guests go online (live), running LXC ones
+// restart-migrate - the same split the per-guest endpoint needs.
+func (c *Client) MigrateAll(ctx context.Context, node, target string, vmids []int) (string, error) {
+	list, err := vmidList(vmids)
+	if err != nil {
+		return "", err
+	}
 	v := url.Values{}
 	v.Set("target", target)
-	if g.Type == TypeQEMU {
-		v.Set("online", "1")
-	} else {
-		v.Set("restart", "1")
+	v.Set("vms", list)
+	return c.task(ctx, http.MethodPost, fmt.Sprintf("/nodes/%s/migrateall", node), v)
+}
+
+// StopAll gracefully shuts guests down, in reverse startup order. force-stop=0 leaves a guest
+// that won't shut down within timeout an error rather than hard-killing it.
+func (c *Client) StopAll(ctx context.Context, node string, vmids []int, timeout time.Duration) (string, error) {
+	list, err := vmidList(vmids)
+	if err != nil {
+		return "", err
 	}
-	return c.task(ctx, http.MethodPost, fmt.Sprintf("/nodes/%s/%s/%d/migrate", node, g.Type, g.VMID), v)
+	v := url.Values{}
+	v.Set("vms", list)
+	v.Set("force-stop", "0")
+	v.Set("timeout", strconv.Itoa(int(timeout.Seconds())))
+	return c.task(ctx, http.MethodPost, fmt.Sprintf("/nodes/%s/stopall", node), v)
 }
 
-// Stop gracefully shuts a guest down. Returns the task UPID.
-func (c *Client) Stop(ctx context.Context, node string, g Guest) (string, error) {
-	return c.task(ctx, http.MethodPost, fmt.Sprintf("/nodes/%s/%s/%d/status/shutdown", node, g.Type, g.VMID), nil)
+// StartAll boots guests in startup order, waiting out each group's up= delay. force=1 because
+// a guest we stopped is ours to start again whether or not it has onboot set.
+func (c *Client) StartAll(ctx context.Context, node string, vmids []int) (string, error) {
+	list, err := vmidList(vmids)
+	if err != nil {
+		return "", err
+	}
+	v := url.Values{}
+	v.Set("vms", list)
+	v.Set("force", "1")
+	return c.task(ctx, http.MethodPost, fmt.Sprintf("/nodes/%s/startall", node), v)
 }
 
-// Start boots a guest. Returns the task UPID.
-func (c *Client) Start(ctx context.Context, node string, g Guest) (string, error) {
-	return c.task(ctx, http.MethodPost, fmt.Sprintf("/nodes/%s/%s/%d/status/start", node, g.Type, g.VMID), nil)
+// vmidList formats the `vms` filter. Absent, it means *every* guest on the node, so an empty
+// list is refused rather than sent - that would sweep up the gaming VMs a shed must leave up.
+func vmidList(vmids []int) (string, error) {
+	if len(vmids) == 0 {
+		return "", errors.New("refusing a bulk action with no vmids: it would act on every guest on the node")
+	}
+	out := make([]string, len(vmids))
+	for i, id := range vmids {
+		out[i] = strconv.Itoa(id)
+	}
+	return strings.Join(out, ","), nil
 }
 
 // ReplicationJob is one entry of the cluster's replication config.

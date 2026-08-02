@@ -6,9 +6,11 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/JHOFER-Cloud/energy-watchdog/internal/alertmgr"
@@ -307,69 +309,130 @@ func (c *Controller) execute(ctx context.Context, p Plan, snap Snapshot) error {
 	return c.store.Save(ctx, st)
 }
 
-// migrateAll spreads the guests across target nodes round-robin, falling back to the
-// next target on failure (e.g. insufficient resources).
+// migrateAll runs one bulk migration per target node, concurrently. Guests still on the node
+// after a round are retried against the next target: the old per-guest fallback for a full one.
 func (c *Controller) migrateAll(ctx context.Context, guests []proxmox.Guest) error {
 	targets := c.cfg.Proxmox.TargetNodes
-	for i, g := range guests {
-		ordered := rotate(targets, i) // equal split: guest i prefers target i%len
-		if err := c.migrateOne(ctx, g, ordered); err != nil {
+	remaining := guestIDs(guests)
+	var lastErr error
+	for round := range targets {
+		byTarget := map[string][]int{}
+		for i, vmid := range remaining {
+			t := targets[(i+round)%len(targets)] // equal split, shifted each round
+			byTarget[t] = append(byTarget[t], vmid)
+		}
+		var wg sync.WaitGroup
+		var mu sync.Mutex
+		for target, vmids := range byTarget {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				if err := c.migrateBatch(ctx, target, vmids); err != nil {
+					c.log.Warn("bulk migration failed", "target", target, "vmids", vmids, "err", err)
+					mu.Lock()
+					lastErr = err
+					mu.Unlock()
+				}
+			}()
+		}
+		wg.Wait()
+
+		left, err := c.stillOnNode(ctx, remaining)
+		if err != nil {
 			return err
 		}
-	}
-	return nil
-}
-
-func (c *Controller) migrateOne(ctx context.Context, g proxmox.Guest, targets []string) error {
-	var lastErr error
-	for _, target := range targets {
-		mctx, cancel := context.WithTimeout(ctx, c.cfg.Proxmox.MigrateTimeout.Duration)
-		upid, err := c.px.Migrate(mctx, c.cfg.Proxmox.Node, g, target)
-		if err == nil {
-			err = c.px.WaitTask(mctx, c.cfg.Proxmox.Node, upid)
-		}
-		cancel()
-		if err == nil {
-			c.log.Info("migrated guest", "vmid", g.VMID, "type", g.Type, "target", target)
+		if len(left) == 0 {
 			return nil
 		}
-		c.log.Warn("migration failed, trying next target", "vmid", g.VMID, "target", target, "err", err)
-		lastErr = err
+		remaining = left
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("guests %v are still on %s after migrating", remaining, c.cfg.Proxmox.Node)
 	}
 	return lastErr
 }
 
-func (c *Controller) stopAll(ctx context.Context, guests []proxmox.Guest) ([]state.GuestRef, error) {
-	var stopped []proxmox.Guest
-	for _, g := range guests {
-		sctx, cancel := context.WithTimeout(ctx, c.cfg.Proxmox.StopTimeout.Duration)
-		upid, err := c.px.Stop(sctx, c.cfg.Proxmox.Node, g)
-		if err == nil {
-			err = c.px.WaitTask(sctx, c.cfg.Proxmox.Node, upid)
-		}
-		cancel()
-		if err != nil {
-			return refs(stopped), err
-		}
-		c.log.Info("stopped guest", "vmid", g.VMID, "type", g.Type)
-		stopped = append(stopped, g)
+func (c *Controller) migrateBatch(ctx context.Context, target string, vmids []int) error {
+	// migrateall has no per-guest timeout, so migrateTimeout bounds the whole batch. Running in
+	// parallel, the batch is about as long as its slowest guest, which is what it bounded before.
+	mctx, cancel := context.WithTimeout(ctx, c.cfg.Proxmox.MigrateTimeout.Duration)
+	defer cancel()
+	upid, err := c.px.MigrateAll(mctx, c.cfg.Proxmox.Node, target, vmids)
+	if err != nil {
+		return err
 	}
-	return refs(stopped), nil
+	c.log.Info("migrating guests", "vmids", vmids, "target", target)
+	return c.px.WaitTask(mctx, c.cfg.Proxmox.Node, upid)
 }
 
-func (c *Controller) startAll(ctx context.Context, guests []state.GuestRef) error {
-	for _, ref := range guests {
-		g := proxmox.Guest{VMID: ref.VMID, Type: proxmox.GuestType(ref.Type)}
-		upid, err := c.px.Start(ctx, c.cfg.Proxmox.Node, g)
-		if err == nil {
-			err = c.px.WaitTask(ctx, c.cfg.Proxmox.Node, upid)
-		}
-		if err != nil {
-			c.log.Warn("failed to start guest", "vmid", ref.VMID, "err", err)
-			continue // best-effort; one stuck guest shouldn't block the others
-		}
-		c.log.Info("started guest", "vmid", ref.VMID, "type", ref.Type)
+// stillOnNode is the subset of vmids the node still hosts.
+func (c *Controller) stillOnNode(ctx context.Context, vmids []int) ([]int, error) {
+	guests, err := c.px.Guests(ctx, c.cfg.Proxmox.Node)
+	if err != nil {
+		return nil, err
 	}
+	here := make(map[int]bool, len(guests))
+	for _, g := range guests {
+		here[g.VMID] = true
+	}
+	var out []int
+	for _, id := range vmids {
+		if here[id] {
+			out = append(out, id)
+		}
+	}
+	return out, nil
+}
+
+// stopAll shuts the guests down in one bulk task: reverse startup order, max_workers at a
+// time, each guest given stopTimeout to go down cleanly before the task reports it failed.
+func (c *Controller) stopAll(ctx context.Context, guests []proxmox.Guest) ([]state.GuestRef, error) {
+	upid, err := c.px.StopAll(ctx, c.cfg.Proxmox.Node, guestIDs(guests), c.cfg.Proxmox.StopTimeout.Duration)
+	if err == nil {
+		err = c.px.WaitTask(ctx, c.cfg.Proxmox.Node, upid)
+	}
+	// The task reports one aggregate result, so read back what stopped. If that fails too,
+	// record everything: an unrecorded guest stays off for good, an over-recorded one is a no-op.
+	stopped, listErr := c.stoppedOf(ctx, guests)
+	if listErr != nil {
+		return refs(guests), errors.Join(err, listErr)
+	}
+	c.log.Info("stopped guests", "vmids", refIDs(stopped))
+	return stopped, err
+}
+
+// stoppedOf is the subset of want the node no longer reports as running.
+func (c *Controller) stoppedOf(ctx context.Context, want []proxmox.Guest) ([]state.GuestRef, error) {
+	guests, err := c.px.Guests(ctx, c.cfg.Proxmox.Node)
+	if err != nil {
+		return nil, err
+	}
+	running := make(map[int]bool, len(guests))
+	for _, g := range guests {
+		running[g.VMID] = g.Running
+	}
+	var out []proxmox.Guest
+	for _, g := range want {
+		if !running[g.VMID] {
+			out = append(out, g)
+		}
+	}
+	return refs(out), nil
+}
+
+// startAll boots the guests we stopped, in startup order with each group's up= delay honoured.
+// Best-effort: one guest that won't boot must not fail the reconcile and roll the mode back.
+func (c *Controller) startAll(ctx context.Context, guests []state.GuestRef) error {
+	ids := refIDs(guests)
+	upid, err := c.px.StartAll(ctx, c.cfg.Proxmox.Node, ids)
+	if err == nil {
+		err = c.px.WaitTask(ctx, c.cfg.Proxmox.Node, upid)
+	}
+	if err != nil {
+		c.log.Warn("failed to start guests", "vmids", ids, "err", err)
+		return nil
+	}
+	c.log.Info("started guests", "vmids", ids)
 	return nil
 }
 
@@ -385,25 +448,28 @@ func (c *Controller) startRequested(ctx context.Context, ids []int) error {
 	for _, g := range guests {
 		byID[g.VMID] = g
 	}
+	var want []int
 	for _, id := range ids {
 		g, ok := byID[id]
 		if !ok {
 			c.log.Warn("requested guest is not on the node", "vmid", id, "node", c.cfg.Proxmox.Node)
 			continue
 		}
-		if g.Running {
-			continue
+		if !g.Running {
+			want = append(want, id)
 		}
-		upid, err := c.px.Start(ctx, c.cfg.Proxmox.Node, g)
-		if err == nil {
-			err = c.px.WaitTask(ctx, c.cfg.Proxmox.Node, upid)
-		}
-		if err != nil {
-			c.log.Warn("failed to start requested guest", "vmid", id, "err", err)
-			continue
-		}
-		c.log.Info("started requested guest", "vmid", id, "type", g.Type)
 	}
+	if len(want) == 0 {
+		return nil
+	}
+	upid, err := c.px.StartAll(ctx, c.cfg.Proxmox.Node, want)
+	if err == nil {
+		err = c.px.WaitTask(ctx, c.cfg.Proxmox.Node, upid)
+	}
+	if err != nil {
+		return err
+	}
+	c.log.Info("started requested guests", "vmids", want)
 	return nil
 }
 
@@ -629,17 +695,6 @@ func (c *Controller) reconcileSilencesAt(ctx context.Context, url string, desire
 		c.log.Info("removed alertmanager silence", "url", url, "id", s.ID)
 	}
 	return nil
-}
-
-func rotate[T any](s []T, n int) []T {
-	if len(s) == 0 {
-		return s
-	}
-	n %= len(s)
-	out := make([]T, 0, len(s))
-	out = append(out, s[n:]...)
-	out = append(out, s[:n]...)
-	return out
 }
 
 func guestIDs(gs []proxmox.Guest) []int {

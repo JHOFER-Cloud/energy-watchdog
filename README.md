@@ -131,6 +131,12 @@ Three lists. Each entry is a single id (`601`) or a range (`"600-699"`):
 
 The lists can't overlap, which is checked at startup.
 
+Guests are migrated, stopped and started through Proxmox's own bulk actions, so each guest's
+`startup` order and the datacenter's `max_workers` decide the sequencing and how many run at
+once — same as the GUI's Bulk Shutdown. Guests in one order group go together; give a group a
+different `order` to keep it sequenced. Only the listed guests are ever touched: nothing else
+on `p1` is started or stopped.
+
 ## Config
 
 It all lives in [`config.example.yaml`](./config.example.yaml). In production the

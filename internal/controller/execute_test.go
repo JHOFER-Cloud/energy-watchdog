@@ -2,11 +2,14 @@ package controller
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -33,12 +36,19 @@ func TestExecuteShedCycle(t *testing.T) {
 	px := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		p := r.URL.Path
 		switch {
-		case strings.Contains(p, "/qemu/101/migrate"):
-			record("migrate-101")
-			_, _ = w.Write([]byte(`{"data":"UPID:migrate-101"}`))
-		case strings.Contains(p, "/qemu/301/status/shutdown"):
-			record("stop-301")
-			_, _ = w.Write([]byte(`{"data":"UPID:stop-301"}`))
+		case strings.HasSuffix(p, "/migrateall"):
+			_ = r.ParseForm()
+			record("migrate-" + r.Form.Get("vms"))
+			_, _ = w.Write([]byte(`{"data":"UPID:migrateall"}`))
+		case strings.HasSuffix(p, "/stopall"):
+			_ = r.ParseForm()
+			record("stop-" + r.Form.Get("vms"))
+			_, _ = w.Write([]byte(`{"data":"UPID:stopall"}`))
+		// Read back after each bulk task: 101 has left the node, 301 is no longer running.
+		case strings.HasSuffix(p, "/nodes/pve-1/qemu"):
+			_, _ = w.Write([]byte(`{"data":[{"vmid":301,"status":"stopped"}]}`))
+		case strings.HasSuffix(p, "/nodes/pve-1/lxc"):
+			_, _ = w.Write([]byte(`{"data":[]}`))
 		case strings.Contains(p, "/tasks/"):
 			_, _ = w.Write([]byte(`{"data":{"status":"stopped","exitstatus":"OK"}}`))
 		case p == "/api2/json/cluster/replication":
@@ -165,6 +175,131 @@ func TestApplyNoopDoesNotPersist(t *testing.T) {
 	if st.Mode != state.ModeRunning { // default; proves nothing was written
 		t.Errorf("mode = %q, want running (noop must not persist)", st.Mode)
 	}
+}
+
+// TestMigrateAllRetriesOnNextTarget: a target that can't take a guest must not strand it on
+// p1. The bulk call reports one aggregate result, so what's left is read back and retried.
+func TestMigrateAllRetriesOnNextTarget(t *testing.T) {
+	var (
+		mu      sync.Mutex
+		calls   []string
+		onNode  = map[int]bool{101: true, 102: true}
+		badTask = map[string]bool{}
+	)
+	px := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		p := r.URL.Path
+		switch {
+		case strings.HasSuffix(p, "/migrateall"):
+			_ = r.ParseForm()
+			target, vms := r.Form.Get("target"), r.Form.Get("vms")
+			calls = append(calls, target+":"+vms)
+			upid := "UPID:" + target
+			if target == "pve-2" { // pve-2 refuses everything; the guests stay put
+				badTask[upid] = true
+			} else {
+				for _, s := range strings.Split(vms, ",") {
+					id, _ := strconv.Atoi(s)
+					delete(onNode, id)
+				}
+			}
+			_, _ = w.Write([]byte(`{"data":"` + upid + `"}`))
+		case strings.HasSuffix(p, "/nodes/pve-1/qemu"):
+			var items []string
+			for id := range onNode {
+				items = append(items, fmt.Sprintf(`{"vmid":%d,"status":"running"}`, id))
+			}
+			_, _ = w.Write([]byte(`{"data":[` + strings.Join(items, ",") + `]}`))
+		case strings.HasSuffix(p, "/nodes/pve-1/lxc"):
+			_, _ = w.Write([]byte(`{"data":[]}`))
+		case strings.Contains(p, "/tasks/"):
+			status := "OK"
+			for upid := range badTask {
+				if strings.Contains(p, url.PathEscape(upid)) {
+					status = "migration aborted"
+				}
+			}
+			_, _ = w.Write([]byte(`{"data":{"status":"stopped","exitstatus":"` + status + `"}}`))
+		default:
+			t.Errorf("unexpected proxmox path %s", p)
+		}
+	}))
+	defer px.Close()
+
+	c := bulkController(t, px.URL, []string{"pve-2", "pve-3"})
+	guests := []proxmox.Guest{
+		{VMID: 101, Type: proxmox.TypeQEMU, Running: true},
+		{VMID: 102, Type: proxmox.TypeQEMU, Running: true},
+	}
+	if err := c.migrateAll(context.Background(), guests); err != nil {
+		t.Fatalf("migrateAll: %v", err)
+	}
+	if len(onNode) != 0 {
+		t.Errorf("guests %v left on pve-1, want none", onNode)
+	}
+	// Round 0 splits them one each (concurrently, so in either order); 101 comes back from the
+	// refusal and round 1 sends it to the target that works.
+	want := map[string]bool{"pve-2:101": true, "pve-3:102": true, "pve-3:101": true}
+	if len(calls) != len(want) {
+		t.Fatalf("migrateall calls = %v, want %v", calls, want)
+	}
+	for _, c := range calls {
+		if !want[c] {
+			t.Errorf("unexpected migrateall call %q (all: %v)", c, calls)
+		}
+	}
+}
+
+// TestStopAllRecordsOnlyWhatStopped: with force-stop=0 a guest that won't shut down fails the
+// task. The ones that did stop must still be recorded, or good-morning never starts them again.
+func TestStopAllRecordsOnlyWhatStopped(t *testing.T) {
+	px := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		p := r.URL.Path
+		switch {
+		case strings.HasSuffix(p, "/stopall"):
+			_, _ = w.Write([]byte(`{"data":"UPID:stopall"}`))
+		case strings.HasSuffix(p, "/nodes/pve-1/qemu"):
+			_, _ = w.Write([]byte(`{"data":[{"vmid":301,"status":"stopped"},{"vmid":302,"status":"running"}]}`))
+		case strings.HasSuffix(p, "/nodes/pve-1/lxc"):
+			_, _ = w.Write([]byte(`{"data":[]}`))
+		case strings.Contains(p, "/tasks/"):
+			_, _ = w.Write([]byte(`{"data":{"status":"stopped","exitstatus":"shutdown timed out"}}`))
+		default:
+			t.Errorf("unexpected proxmox path %s", p)
+		}
+	}))
+	defer px.Close()
+
+	c := bulkController(t, px.URL, nil)
+	stopped, err := c.stopAll(context.Background(), []proxmox.Guest{
+		{VMID: 301, Type: proxmox.TypeQEMU, Running: true},
+		{VMID: 302, Type: proxmox.TypeQEMU, Running: true},
+	})
+	if err == nil {
+		t.Error("stopAll = nil error, want the failed task surfaced (302 never went down)")
+	}
+	if len(stopped) != 1 || stopped[0].VMID != 301 {
+		t.Errorf("stopped = %+v, want [301] only", stopped)
+	}
+}
+
+func bulkController(t *testing.T, pxURL string, targets []string) *Controller {
+	t.Helper()
+	return New(
+		&config.Config{Proxmox: config.Proxmox{
+			Node:           "pve-1",
+			TargetNodes:    targets,
+			MigrateTimeout: config.Duration{Duration: time.Minute},
+			StopTimeout:    config.Duration{Duration: time.Minute},
+		}},
+		prom.New("http://unused"),
+		proxmox.New(pxURL, "u@pam!t", "s", nil),
+		map[string]*alertmgr.Client{},
+		state.NewFileStore(filepath.Join(t.TempDir(), "state.json")),
+		metrics.New(true),
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+	)
 }
 
 func dryRunController(t *testing.T, dry config.DryRunMode, statePath string) *Controller {

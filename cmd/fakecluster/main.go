@@ -54,9 +54,13 @@ func main() {
 		tasks:  map[string]time.Time{},
 	}
 	c.bootAt = time.Now().Add(-2 * time.Hour) // old enough not to look freshly booted
+	// Two guests in each of the migrate and stop ranges, so a shed actually exercises the
+	// round-robin across target nodes and a mixed qemu/lxc bulk stop.
 	for _, g := range []*guest{
 		{VMID: 101, Name: "talos-cp-1", Type: "qemu", Running: true},
+		{VMID: 102, Name: "talos-cp-2", Type: "qemu", Running: true},
 		{VMID: 301, Name: "media", Type: "qemu", Running: true},
+		{VMID: 302, Name: "paperless", Type: "lxc", Running: true},
 		{VMID: 601, Name: "josef-desktop", Type: "qemu"},
 		{VMID: 602, Name: "guest-desktop", Type: "qemu"},
 	} {
@@ -167,11 +171,9 @@ func (c *cluster) handleNodePaths(w http.ResponseWriter, r *http.Request) {
 
 	switch {
 	case parts[1] == "qemu" || parts[1] == "lxc":
-		if len(parts) == 2 {
-			c.listGuests(w, parts[1])
-			return
-		}
-		c.guestAction(w, parts)
+		c.listGuests(w, parts[1])
+	case parts[1] == "startall" || parts[1] == "stopall" || parts[1] == "migrateall":
+		c.bulkAction(w, r, parts[1])
 	case parts[1] == "wakeonlan":
 		c.wakeAt = time.Now().Add(bootDelay)
 		log.Printf("wake-on-lan: node comes up in %s", bootDelay)
@@ -206,32 +208,40 @@ func (c *cluster) listGuests(w http.ResponseWriter, typ string) {
 	c.ok(w, out)
 }
 
-// guestAction handles /nodes/<node>/<type>/<vmid>/status/{start,shutdown} and /migrate.
-func (c *cluster) guestAction(w http.ResponseWriter, parts []string) {
-	vmid, err := strconv.Atoi(parts[2])
-	if err != nil {
-		http.NotFound(w, nil)
+// bulkAction handles /nodes/<node>/{startall,stopall,migrateall}. The real thing paces guests
+// by startup order and max_workers; here they all take effect at once.
+func (c *cluster) bulkAction(w http.ResponseWriter, r *http.Request, action string) {
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	g, ok := c.guests[vmid]
-	if !ok {
-		http.Error(w, "no such guest", http.StatusNotFound)
+	// An absent vms filter means "every guest on the node" - the mistake the client guards
+	// against, so refuse it here too rather than quietly wiping the fake cluster.
+	list := r.Form.Get("vms")
+	if list == "" {
+		http.Error(w, "refusing a bulk action with no vms filter", http.StatusBadRequest)
 		return
 	}
-	action := parts[len(parts)-1]
-	switch action {
-	case "start":
-		g.Running = true
-		log.Printf("guest %d (%s) started", vmid, g.Name)
-	case "shutdown":
-		g.Running = false
-		log.Printf("guest %d (%s) stopped", vmid, g.Name)
-	case "migrate":
-		delete(c.guests, vmid)
-		log.Printf("guest %d (%s) migrated away", vmid, g.Name)
-	default:
-		http.NotFound(w, nil)
-		return
+	for _, s := range strings.Split(list, ",") {
+		vmid, err := strconv.Atoi(s)
+		if err != nil {
+			continue
+		}
+		g, ok := c.guests[vmid]
+		if !ok {
+			continue
+		}
+		switch action {
+		case "startall":
+			g.Running = true
+			log.Printf("guest %d (%s) started", vmid, g.Name)
+		case "stopall":
+			g.Running = false
+			log.Printf("guest %d (%s) stopped", vmid, g.Name)
+		case "migrateall":
+			delete(c.guests, vmid)
+			log.Printf("guest %d (%s) migrated to %s", vmid, g.Name, r.Form.Get("target"))
+		}
 	}
 	c.ok(w, c.newTask())
 }

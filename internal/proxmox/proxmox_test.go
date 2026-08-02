@@ -77,16 +77,20 @@ func TestGuests(t *testing.T) {
 	}
 }
 
-func TestMigrateAndWaitTask(t *testing.T) {
-	const upid = "UPID:pve-1:00001:migrate"
+func TestMigrateAllAndWaitTask(t *testing.T) {
+	const upid = "UPID:pve-1:00001:migrateall"
 	c := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
 		switch {
-		case strings.HasSuffix(r.URL.Path, "/migrate"):
+		case strings.HasSuffix(r.URL.Path, "/migrateall"):
 			if err := r.ParseForm(); err != nil {
 				t.Fatal(err)
 			}
-			if r.Form.Get("target") != "pve-2" || r.Form.Get("online") != "1" {
-				t.Errorf("migrate form = %v", r.Form)
+			if r.Form.Get("target") != "pve-2" || r.Form.Get("vms") != "101,311" {
+				t.Errorf("migrateall form = %v", r.Form)
+			}
+			// max-workers must stay unset so the datacenter's bulk-action setting applies.
+			if _, ok := r.Form["max-workers"]; ok {
+				t.Errorf("max-workers was sent: %v", r.Form)
 			}
 			_, _ = w.Write([]byte(`{"data":"` + upid + `"}`))
 		case strings.Contains(r.URL.Path, "/tasks/"):
@@ -95,7 +99,7 @@ func TestMigrateAndWaitTask(t *testing.T) {
 			t.Errorf("unexpected path %s", r.URL.Path)
 		}
 	})
-	got, err := c.Migrate(context.Background(), "pve-1", Guest{VMID: 101, Type: TypeQEMU}, "pve-2")
+	got, err := c.MigrateAll(context.Background(), "pve-1", "pve-2", []int{101, 311})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -104,6 +108,59 @@ func TestMigrateAndWaitTask(t *testing.T) {
 	}
 	if err := c.WaitTask(context.Background(), "pve-1", got); err != nil {
 		t.Errorf("WaitTask: %v", err)
+	}
+}
+
+// TestStopAllForm pins the two parameters that decide what a shed does to a guest that won't
+// go down: it gets stopTimeout, and force-stop=0 leaves it an error rather than a hard kill.
+func TestStopAllForm(t *testing.T) {
+	c := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseForm(); err != nil {
+			t.Fatal(err)
+		}
+		if r.Form.Get("vms") != "301" || r.Form.Get("force-stop") != "0" || r.Form.Get("timeout") != "600" {
+			t.Errorf("stopall form = %v", r.Form)
+		}
+		_, _ = w.Write([]byte(`{"data":"UPID:stopall"}`))
+	})
+	if _, err := c.StopAll(context.Background(), "pve-1", []int{301}, 10*time.Minute); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestStartAllForcesOnboot: startall skips guests without onboot=1 unless force is set, and
+// a guest we stopped is ours to start again whether or not it boots on its own.
+func TestStartAllForcesOnboot(t *testing.T) {
+	c := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseForm(); err != nil {
+			t.Fatal(err)
+		}
+		if r.Form.Get("vms") != "301,700" || r.Form.Get("force") != "1" {
+			t.Errorf("startall form = %v", r.Form)
+		}
+		_, _ = w.Write([]byte(`{"data":"UPID:startall"}`))
+	})
+	if _, err := c.StartAll(context.Background(), "pve-1", []int{301, 700}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestBulkRefusesEmptyList: with vms absent the bulk endpoints act on every guest on the node,
+// so an empty list must never reach them - a shed would sweep up the gaming VMs.
+func TestBulkRefusesEmptyList(t *testing.T) {
+	c := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("bulk call reached the server with an empty vmid list: %s", r.URL.Path)
+		_, _ = w.Write([]byte(`{"data":"UPID:x"}`))
+	})
+	ctx := context.Background()
+	if _, err := c.StopAll(ctx, "pve-1", nil, time.Minute); err == nil {
+		t.Error("StopAll(nil) = nil error, want a refusal")
+	}
+	if _, err := c.StartAll(ctx, "pve-1", nil); err == nil {
+		t.Error("StartAll(nil) = nil error, want a refusal")
+	}
+	if _, err := c.MigrateAll(ctx, "pve-1", "pve-2", nil); err == nil {
+		t.Error("MigrateAll(nil) = nil error, want a refusal")
 	}
 }
 
