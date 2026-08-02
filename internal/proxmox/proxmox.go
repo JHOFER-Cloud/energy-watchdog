@@ -254,10 +254,15 @@ func (c *Client) GPUKey(ctx context.Context, node string, g Guest) (string, erro
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		return "", err
 	}
-	field := ""
+	field, lowest := "", -1
 	for k := range cfg {
-		if strings.HasPrefix(k, "hostpci") && (field == "" || k < field) {
-			field = k
+		// Compare the index numerically: "hostpci10" sorts before "hostpci2" as a string.
+		n, err := strconv.Atoi(strings.TrimPrefix(k, "hostpci"))
+		if !strings.HasPrefix(k, "hostpci") || err != nil {
+			continue
+		}
+		if lowest < 0 || n < lowest {
+			field, lowest = k, n
 		}
 	}
 	if field == "" {

@@ -372,7 +372,7 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 }
 
 // powerActions is what the UI may ask for. Start is not here: it goes through intent so the
-// reconcile loop can wake p1 first, while these only ever act on an already-running guest.
+// reconcile loop can wake p1 first, while these go straight to Proxmox.
 var powerActions = map[string]proxmox.GuestPower{
 	"shutdown": proxmox.PowerShutdown,
 	"reboot":   proxmox.PowerReboot,
@@ -382,6 +382,7 @@ var powerActions = map[string]proxmox.GuestPower{
 
 // handlePower runs a power action straight against Proxmox. That doesn't break p1's single
 // owner: the loop owns the *node's* power, and a guest action can't turn p1 on or off.
+// Whether the guest is in a state that accepts the action is Proxmox's call, not ours.
 func (s *Server) handlePower(w http.ResponseWriter, r *http.Request) {
 	action, ok := powerActions[r.PathValue("action")]
 	if !ok {
@@ -398,12 +399,13 @@ func (s *Server) handlePower(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var guest proxmox.Guest
+	var found bool
 	for _, g := range v.guests {
 		if g.VMID == vmid {
-			guest = g
+			guest, found = g, true
 		}
 	}
-	if guest.VMID == 0 {
+	if !found {
 		http.Error(w, "VM is not on this node", http.StatusConflict)
 		return
 	}

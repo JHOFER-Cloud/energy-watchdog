@@ -287,6 +287,8 @@ func TestGPUKey(t *testing.T) {
 		{"raw pci address", `{"hostpci0":"0000:01:00,pcie=1","memory":16384}`, "0000:01:00"},
 		// hostpci0 is the GPU by convention; a second device must not change the key.
 		{"lowest hostpci wins", `{"hostpci1":"mapping=nic","hostpci0":"mapping=gpu0"}`, "gpu0"},
+		// Numeric, not lexicographic: "hostpci10" sorts before "hostpci2" as a string.
+		{"double-digit index", `{"hostpci10":"mapping=nic","hostpci2":"mapping=gpu0"}`, "gpu0"},
 		{"no passthrough", `{"cores":4,"memory":8192}`, ""},
 	}
 	for _, tt := range tests {
