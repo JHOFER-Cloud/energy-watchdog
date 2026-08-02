@@ -387,12 +387,16 @@ func (c *Controller) stillOnNode(ctx context.Context, vmids []int) ([]int, error
 // stopAll shuts the guests down in one bulk task: reverse startup order, max_workers at a
 // time, each guest given stopTimeout to go down cleanly before the task reports it failed.
 func (c *Controller) stopAll(ctx context.Context, guests []proxmox.Guest) ([]state.GuestRef, error) {
-	upid, err := c.px.StopAll(ctx, c.cfg.Proxmox.Node, guestIDs(guests), c.cfg.Proxmox.StopTimeout.Duration)
+	// Proxmox gives each guest stopTimeout; bound the whole task at the worst case of every
+	// guest in its own order group, so a task that never reports done can't wedge the loop.
+	sctx, cancel := context.WithTimeout(ctx, time.Duration(len(guests))*c.cfg.Proxmox.StopTimeout.Duration)
+	defer cancel()
+	upid, err := c.px.StopAll(sctx, c.cfg.Proxmox.Node, guestIDs(guests), c.cfg.Proxmox.StopTimeout.Duration)
 	if err == nil {
-		err = c.px.WaitTask(ctx, c.cfg.Proxmox.Node, upid)
+		err = c.px.WaitTask(sctx, c.cfg.Proxmox.Node, upid)
 	}
-	// The task reports one aggregate result, so read back what stopped. If that fails too,
-	// record everything: an unrecorded guest stays off for good, an over-recorded one is a no-op.
+	// Read back what stopped on the caller's ctx, not sctx: a stop that timed out still has to
+	// record what did go down, or good-morning never starts those guests again.
 	stopped, listErr := c.stoppedOf(ctx, guests)
 	if listErr != nil {
 		return refs(guests), errors.Join(err, listErr)

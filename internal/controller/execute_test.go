@@ -284,6 +284,45 @@ func TestStopAllRecordsOnlyWhatStopped(t *testing.T) {
 	}
 }
 
+// TestStopAllBoundsAWedgedTask: WaitTask polls until its ctx is done, so a task Proxmox never
+// reports as finished would hang the reconcile loop forever without a deadline on the wait.
+func TestStopAllBoundsAWedgedTask(t *testing.T) {
+	px := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch p := r.URL.Path; {
+		case strings.HasSuffix(p, "/stopall"):
+			_, _ = w.Write([]byte(`{"data":"UPID:stopall"}`))
+		case strings.HasSuffix(p, "/nodes/pve-1/qemu"):
+			_, _ = w.Write([]byte(`{"data":[{"vmid":301,"status":"stopped"}]}`))
+		case strings.HasSuffix(p, "/nodes/pve-1/lxc"):
+			_, _ = w.Write([]byte(`{"data":[]}`))
+		case strings.Contains(p, "/tasks/"):
+			_, _ = w.Write([]byte(`{"data":{"status":"running"}}`)) // never finishes
+		}
+	}))
+	defer px.Close()
+
+	c := bulkController(t, px.URL, nil)
+	c.cfg.Proxmox.StopTimeout = config.Duration{Duration: 50 * time.Millisecond}
+
+	done := make(chan []state.GuestRef, 1)
+	go func() {
+		stopped, err := c.stopAll(context.Background(), []proxmox.Guest{{VMID: 301, Type: proxmox.TypeQEMU}})
+		if err == nil {
+			t.Error("stopAll = nil error, want the wait deadline surfaced")
+		}
+		done <- stopped
+	}()
+	select {
+	case stopped := <-done:
+		// The read-back runs on the caller's ctx, so what did go down is still recorded.
+		if len(stopped) != 1 || stopped[0].VMID != 301 {
+			t.Errorf("stopped = %+v, want [301] recorded despite the timeout", stopped)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("stopAll did not return: the bulk wait is unbounded")
+	}
+}
+
 func bulkController(t *testing.T, pxURL string, targets []string) *Controller {
 	t.Helper()
 	return New(
