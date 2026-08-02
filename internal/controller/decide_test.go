@@ -227,4 +227,3 @@ func equal(a, b []int) bool {
 	}
 	return true
 }
-
