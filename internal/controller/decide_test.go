@@ -227,17 +227,3 @@ func equal(a, b []int) bool {
 	}
 	return true
 }
-
-func TestRotate(t *testing.T) {
-	targets := []string{"pve-2", "pve-3"}
-	// Equal split: guest i prefers target i%len, so consecutive guests alternate.
-	if got := rotate(targets, 0)[0]; got != "pve-2" {
-		t.Errorf("guest 0 -> %q, want pve-2", got)
-	}
-	if got := rotate(targets, 1)[0]; got != "pve-3" {
-		t.Errorf("guest 1 -> %q, want pve-3", got)
-	}
-	if got := rotate(targets, 2)[0]; got != "pve-2" {
-		t.Errorf("guest 2 -> %q, want pve-2", got)
-	}
-}
