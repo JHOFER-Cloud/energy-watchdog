@@ -47,8 +47,6 @@ type Plan struct {
 	StartRequested []int
 	Poweroff       bool
 	Wake           bool
-	Silence        bool
-	Unsilence      bool
 	NextMode       state.Mode
 	GraceSince     int64         // the grace clock to persist; carried forward unless a transition changes it
 	WakeDone       map[int]int64 // the spent-request markers to persist; see state.State.WakeDone
@@ -151,10 +149,10 @@ func Decide(s Snapshot, cfg *config.Config, now time.Time) Plan {
 		if sig != sigDeficit {
 			break
 		}
-		// Shed posture: criticals move, the rest stop, silence the resulting alerts.
+		// Shed posture: criticals move, the rest stop. Alertmanager coverage isn't planned
+		// here - it's derived from NextMode every tick, so a long shed keeps being extended.
 		p.Migrate = matchRunning(s.Guests, cfg.Guests.Migrate)
 		p.Stop = matchRunning(s.Guests, cfg.Guests.Stop)
-		p.Silence = true
 		if gaming || requested {
 			// A gaming guest is running, or someone just asked for one: keep the host up and
 			// shed load around it. The grace clock covers the VM that hasn't booted yet.
@@ -174,7 +172,6 @@ func Decide(s Snapshot, cfg *config.Config, now time.Time) Plan {
 		case sig == sigSurplus:
 			p.Wake = true
 			p.Start = s.StoppedSet
-			p.Unsilence = true
 			p.NextMode = state.ModeRunning
 			p.Reason = "surplus returned: wake p1 and restart the guests we stopped"
 		case requested:
@@ -206,7 +203,6 @@ func Decide(s Snapshot, cfg *config.Config, now time.Time) Plan {
 			// Good morning. p1 is already up; restore what we stopped. Criticals stay
 			// where they were migrated. Nothing migrates back automatically.
 			p.Start = s.StoppedSet
-			p.Unsilence = true
 			p.NextMode = state.ModeRunning
 			p.GraceSince = 0
 			p.Reason = "surplus returned while p1 up: restart the guests we stopped"

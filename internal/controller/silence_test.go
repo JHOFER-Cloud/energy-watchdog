@@ -36,7 +36,7 @@ func ctlWithAMs(cfg *config.Config, urls ...string) *Controller {
 
 func alertCfg(am string, silences ...config.Silence) *config.Config {
 	return &config.Config{
-		DryRun: config.DryRunAlert,
+		DryRun: config.DryRunFull,
 		Alertmanager: config.Alertmanager{
 			URLs:           []string{am},
 			Comment:        "p1 down",
@@ -50,10 +50,77 @@ func sil(name, value string) config.Silence {
 	return config.Silence{Matchers: []config.Matcher{{Name: name, Value: value, IsRegex: true}}}
 }
 
-// TestReconcileAlertOnlyLifecycle covers DryRunAlert: a silence set is created when p1 goes
-// down, left untouched while it's healthy (no churn), grown when the config gains a silence,
-// and grace-expired (not dropped outright) when p1 comes back.
-func TestReconcileAlertOnlyLifecycle(t *testing.T) {
+// TestApplySilencesEveryTick is the regression for a shed outliving silenceTTL: a steady
+// shed plans nothing, so driving coverage off the plan alone left it with nothing to renew
+// the silence after 24h. The two dry-run levels disagree on purpose - alert-only takes no
+// Proxmox actions, so its mode is simulated and only p1's real power state means anything.
+func TestApplySilencesEveryTick(t *testing.T) {
+	noRepl := false
+	tests := []struct {
+		name                   string
+		dryRun                 config.DryRunMode
+		plan                   Plan
+		snap                   Snapshot
+		wantCreate, wantUpdate int
+	}{
+		{
+			name:       "full: steady shed extends a silence near expiry",
+			dryRun:     config.DryRunFull,
+			plan:       Plan{NextMode: state.ModeShed},
+			snap:       Snapshot{Mode: state.ModeShed},
+			wantUpdate: 1,
+		},
+		{
+			// Nothing created, and the seeded silence is already inside the 30m grace window, so
+			// it's left to lapse rather than rescheduled every tick.
+			name:   "full: steady running creates nothing",
+			dryRun: config.DryRunFull,
+			plan:   Plan{NextMode: state.ModeRunning},
+			snap:   Snapshot{Mode: state.ModeRunning, NodeUp: true},
+		},
+		{
+			// Mode says running, but p1 is really down: alert-only follows the node.
+			name:       "alert-only: follows the node, not the mode",
+			dryRun:     config.DryRunAlert,
+			plan:       Plan{NextMode: state.ModeRunning},
+			snap:       Snapshot{Mode: state.ModeRunning},
+			wantUpdate: 1,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			am := newFakeAM()
+			defer am.Close()
+			// Seed a silence 30m out, inside the 1h refresh window: it's extended iff coverage
+			// is wanted, so one update proves this tick reconciled at all.
+			am.seed("energy-watchdog", "p1 down",
+				[]fakeMatcher{{Name: "node", Value: ".*-p1", IsRegex: true, IsEqual: true}},
+				time.Now().Add(30*time.Minute))
+
+			cfg := alertCfg(am.URL(), sil("node", ".*-p1"))
+			cfg.DryRun = tt.dryRun
+			cfg.Proxmox.ManageReplication = &noRepl
+			c := ctlWithAMs(cfg, am.URL())
+
+			if !isNoop(tt.plan, tt.snap) {
+				t.Fatalf("plan must be a noop, or this proves nothing about steady ticks")
+			}
+			if err := c.apply(context.Background(), tt.plan, tt.snap); err != nil {
+				t.Fatalf("apply: %v", err)
+			}
+			cr, up, _ := am.counts()
+			if cr != tt.wantCreate || up != tt.wantUpdate {
+				t.Errorf("creates=%d updates=%d, want %d/%d", cr, up, tt.wantCreate, tt.wantUpdate)
+			}
+		})
+	}
+}
+
+// TestReconcileSilenceLifecycle: a silence set is created when p1 sheds, left untouched
+// while it's healthy (no churn), grown when the config gains a silence, and grace-expired
+// (not dropped outright) when p1 comes back.
+func TestReconcileSilenceLifecycle(t *testing.T) {
 	am := newFakeAM()
 	defer am.Close()
 	cfg := alertCfg(am.URL(), sil("node", ".*-p1"), sil("instance", "pve-1(\\..*)?"))
@@ -61,7 +128,7 @@ func TestReconcileAlertOnlyLifecycle(t *testing.T) {
 	ctx := context.Background()
 
 	// p1 down: one silence per configured entry, nothing deleted.
-	c.reconcileAlertOnly(ctx, Snapshot{NodeUp: false})
+	_ = c.reconcileSilences(ctx, true)
 	if cr, up, del := am.counts(); cr != 2 || up != 0 || del != 0 {
 		t.Fatalf("after shutdown: creates=%d updates=%d deletes=%d, want 2/0/0", cr, up, del)
 	}
@@ -70,14 +137,14 @@ func TestReconcileAlertOnlyLifecycle(t *testing.T) {
 	}
 
 	// Still down and healthy: no writes at all (this is the fix for per-tick churn).
-	c.reconcileAlertOnly(ctx, Snapshot{NodeUp: false})
+	_ = c.reconcileSilences(ctx, true)
 	if cr, up, del := am.counts(); cr != 2 || up != 0 || del != 0 {
 		t.Errorf("healthy silences should not churn: creates=%d updates=%d deletes=%d, want 2/0/0", cr, up, del)
 	}
 
 	// Config gains a silence while still down: only the new one is created.
 	cfg.Alertmanager.Silences = append(cfg.Alertmanager.Silences, sil("alertname", "GarageDown"))
-	c.reconcileAlertOnly(ctx, Snapshot{NodeUp: false})
+	_ = c.reconcileSilences(ctx, true)
 	if cr, up, del := am.counts(); cr != 3 || up != 0 || del != 0 {
 		t.Errorf("added silence: creates=%d updates=%d deletes=%d, want 3/0/0", cr, up, del)
 	}
@@ -87,7 +154,7 @@ func TestReconcileAlertOnlyLifecycle(t *testing.T) {
 
 	// p1 back up: coverage isn't dropped outright but each silence is shortened to the grace
 	// window (an in-place update), so it stays active for now and lapses on its own later.
-	c.reconcileAlertOnly(ctx, Snapshot{NodeUp: true})
+	_ = c.reconcileSilences(ctx, false)
 	if cr, up, del := am.counts(); cr != 3 || up != 3 || del != 0 {
 		t.Errorf("after wake: creates=%d updates=%d deletes=%d, want 3/3/0 (grace-expired, not deleted)", cr, up, del)
 	}
@@ -107,13 +174,13 @@ func TestReconcileUnsilenceGrace(t *testing.T) {
 	ctx := context.Background()
 
 	// p1 down: create the silence (ends ~24h out).
-	c.reconcileAlertOnly(ctx, Snapshot{NodeUp: false})
+	_ = c.reconcileSilences(ctx, true)
 	if cr, _, _ := am.counts(); cr != 1 {
 		t.Fatalf("creates=%d, want 1", cr)
 	}
 
 	// p1 back up: shorten to the grace window (an update), don't delete.
-	c.reconcileAlertOnly(ctx, Snapshot{NodeUp: true})
+	_ = c.reconcileSilences(ctx, false)
 	if cr, up, del := am.counts(); cr != 1 || up != 1 || del != 0 {
 		t.Fatalf("first wake: creates=%d updates=%d deletes=%d, want 1/1/0", cr, up, del)
 	}
@@ -123,14 +190,14 @@ func TestReconcileUnsilenceGrace(t *testing.T) {
 
 	// Still up: the silence now ends inside the grace window, so it's left to lapse - no further
 	// write (the bug would re-shorten it every tick and it would never expire).
-	c.reconcileAlertOnly(ctx, Snapshot{NodeUp: true})
+	_ = c.reconcileSilences(ctx, false)
 	if cr, up, del := am.counts(); cr != 1 || up != 1 || del != 0 {
 		t.Errorf("second wake churned the grace window: creates=%d updates=%d deletes=%d, want 1/1/0", cr, up, del)
 	}
 
 	// p1 drops again inside the window: the same silence is extended back out (it ends < the 1h
 	// refresh window), restoring full coverage.
-	c.reconcileAlertOnly(ctx, Snapshot{NodeUp: false})
+	_ = c.reconcileSilences(ctx, true)
 	if cr, up, del := am.counts(); cr != 1 || up != 2 || del != 0 {
 		t.Errorf("re-silence during grace: creates=%d updates=%d deletes=%d, want 1/2/0", cr, up, del)
 	}
@@ -151,7 +218,7 @@ func TestReconcileExtendsNearExpiry(t *testing.T) {
 		[]fakeMatcher{{Name: "node", Value: ".*-p1", IsRegex: true, IsEqual: true}},
 		time.Now().Add(30*time.Minute))
 
-	ctlWithAMs(cfg, am.URL()).reconcileAlertOnly(context.Background(), Snapshot{NodeUp: false})
+	_ = ctlWithAMs(cfg, am.URL()).reconcileSilences(context.Background(), true)
 
 	if cr, up, del := am.counts(); cr != 0 || up != 1 || del != 0 {
 		t.Errorf("near-expiry: creates=%d updates=%d deletes=%d, want 0/1/0", cr, up, del)
@@ -179,7 +246,7 @@ func TestReconcileGCsDuplicatesAndDrift(t *testing.T) {
 		[]fakeMatcher{{Name: "instance", Value: "old", IsRegex: true, IsEqual: true}}, now.Add(24*time.Hour))
 	foreign := am.seed("jhofer", "manual", nodeMatch, now.Add(24*time.Hour))
 
-	ctlWithAMs(cfg, am.URL()).reconcileAlertOnly(context.Background(), Snapshot{NodeUp: false})
+	_ = ctlWithAMs(cfg, am.URL()).reconcileSilences(context.Background(), true)
 
 	if cr, up, del := am.counts(); cr != 0 || up != 0 || del != 2 {
 		t.Errorf("gc: creates=%d updates=%d deletes=%d, want 0/0/2", cr, up, del)
@@ -216,14 +283,14 @@ func TestReconcilePartialFailureNoChurn(t *testing.T) {
 	c := ctlWithAMs(cfg, good.URL(), bad.URL)
 	ctx := context.Background()
 
-	c.reconcileAlertOnly(ctx, Snapshot{NodeUp: false})
+	_ = c.reconcileSilences(ctx, true)
 	if cr, _, _ := good.counts(); cr != 1 {
 		t.Fatalf("healthy AM creates = %d, want 1", cr)
 	}
 
 	// Next tick: the healthy AM already has its silence, so nothing is recreated there even
 	// though the bad AM keeps failing.
-	c.reconcileAlertOnly(ctx, Snapshot{NodeUp: false})
+	_ = c.reconcileSilences(ctx, true)
 	if cr, up, del := good.counts(); cr != 1 || up != 0 || del != 0 {
 		t.Errorf("healthy AM churned because neighbour failed: creates=%d updates=%d deletes=%d, want 1/0/0", cr, up, del)
 	}
