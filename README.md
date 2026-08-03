@@ -167,6 +167,11 @@ stopping the guests is itself what makes their alerts fire, and with `migrateTim
 `stopTimeout` that window runs to tens of minutes, so silencing afterwards would mean every
 one of them had already gone off.
 
+Coverage is derived from the mode on every tick, not planned once at the transition. Each
+silence lasts 24h and is extended when it comes within an hour of lapsing, so a shed of any
+length stays covered — a manual shed can easily run for days — while a watchdog that dies
+leaves nothing behind for longer than one TTL.
+
 When `p1` comes back, its silences aren't dropped the instant the node reports up — the
 guests hosted on it (a Talos cluster) take a while to boot, and dropping coverage that early
 un-suppresses every one of their still-firing alerts at once. Instead each silence is

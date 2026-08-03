@@ -135,14 +135,13 @@ func (c *Controller) reconcile(ctx context.Context) {
 }
 
 // apply carries out the plan at the configured dry-run level. The physical Proxmox/WoL
-// actions run only in full mode; alert additionally reconciles Alertmanager silences from
-// p1's real power state. The state machine is advanced and persisted in *every* mode:
-// skipping the physical actions must not skip the bookkeeping, or the mode never latches and
-// a dry run can't preview what live would decide. Alert's silences track the real node state,
-// independent of the (possibly simulated) mode, so they reconcile every tick.
+// actions run only in full mode; alert additionally reconciles Alertmanager silences. The
+// state machine is advanced and persisted in *every* mode: skipping the physical actions must
+// not skip the bookkeeping, or the mode never latches and a dry run can't preview what live
+// would decide.
 func (c *Controller) apply(ctx context.Context, p Plan, snap Snapshot) error {
 	// Replication into the managed node tracks its real power state in every mode, for the
-	// same reason the alert-only silences do: while p1 is off, p2/p3 must not keep trying to
+	// same reason the silences do: while p1 is off, p2/p3 must not keep trying to
 	// replicate to it and mailing about every failed run (JHC-538). Driving this from the
 	// observed node state rather than from the plan also covers the cases no mode transition
 	// produces - a p1 powered on by hand, or one already off when the watchdog starts. A
@@ -151,14 +150,26 @@ func (c *Controller) apply(ctx context.Context, p Plan, snap Snapshot) error {
 	if err := c.reconcileReplication(ctx, !snap.NodeUp); err != nil {
 		c.log.Error("reconcile replication", "err", err)
 	}
-	if c.cfg.DryRun == config.DryRunAlert {
-		c.reconcileAlertOnly(ctx, snap)
+	// Silences are reconciled every tick, before the noop gate, because a shed can outlast
+	// silenceTTL: driving them off the transition alone let a multi-day manual shed lapse.
+	// This also keeps them ahead of the migrate/stop that make the alerts fire.
+	switch c.cfg.DryRun {
+	case config.DryRunAlert:
+		// Alert-only takes no Proxmox actions, so its mode is simulated and can't drive
+		// coverage; p1's real power state does.
+		if err := c.reconcileSilences(ctx, !snap.NodeUp); err != nil {
+			c.log.Error("alert-only: reconcile silences", "err", err)
+		}
+	case config.DryRunFull:
+		if err := c.reconcileSilences(ctx, p.NextMode != state.ModeRunning); err != nil {
+			return err
+		}
 	}
 	if isNoop(p, snap) {
 		return nil
 	}
 	if c.cfg.DryRun == config.DryRunFull {
-		return c.execute(ctx, p, snap) // physical actions + plan-driven silences + persist
+		return c.execute(ctx, p, snap) // physical actions + persist
 	}
 	// log / alert: advance the state machine, but take no physical action.
 	c.logPlan(p)
@@ -253,7 +264,7 @@ func (c *Controller) requestedWake(intent state.Intent, now time.Time) []state.W
 func isNoop(p Plan, snap Snapshot) bool {
 	return p.NextMode == snap.Mode && p.GraceSince == snap.GraceSince &&
 		maps.Equal(p.WakeDone, snap.WakeDone) &&
-		!p.Poweroff && !p.Wake && !p.Silence && !p.Unsilence &&
+		!p.Poweroff && !p.Wake &&
 		len(p.Migrate) == 0 && len(p.Stop) == 0 && len(p.Start) == 0 && len(p.StartRequested) == 0
 }
 
@@ -261,7 +272,7 @@ func (c *Controller) logPlan(p Plan) {
 	c.log.Info("[dry-run] would act",
 		"migrate", guestIDs(p.Migrate), "stop", guestIDs(p.Stop), "start", refIDs(p.Start),
 		"startRequested", p.StartRequested,
-		"poweroff", p.Poweroff, "wake", p.Wake, "silence", p.Silence, "unsilence", p.Unsilence,
+		"poweroff", p.Poweroff, "wake", p.Wake,
 		"nextMode", p.NextMode)
 }
 
@@ -278,15 +289,6 @@ func (c *Controller) execute(ctx context.Context, p Plan, snap Snapshot) error {
 	}
 	defer c.setActivity("")
 
-	// Silence before anything is moved or stopped. Migrating and stopping the guests is
-	// itself what sets their alerts off, and migrateTimeout+stopTimeout make that window tens
-	// of minutes long - silencing after it means every one of them has already fired. The
-	// silence has to cover the whole shed, not just the power-off at the end of it.
-	if p.Silence {
-		if err := c.reconcileSilences(ctx, true); err != nil {
-			return err
-		}
-	}
 	if len(p.Migrate) > 0 {
 		if err := c.migrateAll(ctx, p.Migrate); err != nil {
 			return err
@@ -332,12 +334,6 @@ func (c *Controller) execute(ctx context.Context, p Plan, snap Snapshot) error {
 			return err
 		}
 	}
-	if p.Unsilence {
-		if err := c.reconcileSilences(ctx, false); err != nil {
-			return err
-		}
-	}
-
 	st.Mode = p.NextMode
 	st.GraceSince = p.GraceSince
 	return c.store.Save(ctx, st)
@@ -610,21 +606,12 @@ const (
 	silenceRefresh = time.Hour
 )
 
-// reconcileAlertOnly drives Alertmanager silences purely from p1's real power state
-// (DryRunAlert mode): silence when the node is down, drop them when it's back. It takes no
-// Proxmox actions, so it's safe to run before Wake-on-LAN is ready.
-func (c *Controller) reconcileAlertOnly(ctx context.Context, snap Snapshot) {
-	if err := c.reconcileSilences(ctx, !snap.NodeUp); err != nil {
-		c.log.Error("alert-only: reconcile silences", "err", err)
-	}
-}
-
 // reconcileSilences makes the energy-watchdog silences in every configured Alertmanager
-// match the desired set: the configured silences when silence is true (p1 down), or none
-// when false (p1 up). It never persists silence ids - it recognises its own silences by
-// createdBy on each Alertmanager - so a lost or stale ConfigMap can't orphan them, and any
-// orphans from an earlier run are cleaned up here. Each Alertmanager is reconciled
-// independently, so one being unreachable doesn't disturb the others.
+// match the desired set: the configured silences when silence is true, or none when false.
+// What that boolean tracks is the caller's business - see apply. It never persists silence
+// ids - it recognises its own silences by createdBy on each Alertmanager - so a lost or stale
+// ConfigMap can't orphan them, and any orphans from an earlier run are cleaned up here. Each
+// Alertmanager is reconciled independently, so one being unreachable doesn't disturb the others.
 func (c *Controller) reconcileSilences(ctx context.Context, silence bool) error {
 	var desired []config.Silence
 	if silence {
@@ -633,7 +620,7 @@ func (c *Controller) reconcileSilences(ctx context.Context, silence bool) error 
 	var firstErr error
 	for _, url := range c.cfg.Alertmanager.URLs {
 		// When silencing, anything of ours that isn't desired is a stale-config orphan and is
-		// removed at once. When unsilencing (p1 back up), drop coverage via the grace window
+		// removed at once. When unsilencing, drop coverage via the grace window
 		// instead, so guests still booting on the node aren't un-suppressed the same tick.
 		if err := c.reconcileSilencesAt(ctx, url, desired, !silence); err != nil {
 			c.log.Error("reconcile silences", "url", url, "err", err)

@@ -78,6 +78,7 @@ func TestExecuteShedCycle(t *testing.T) {
 
 	statePath := filepath.Join(t.TempDir(), "state.json")
 	cfg := &config.Config{
+		DryRun: config.DryRunFull,
 		Proxmox: config.Proxmox{
 			Node:           "pve-1",
 			TargetNodes:    []string{"pve-2"},
@@ -101,13 +102,13 @@ func TestExecuteShedCycle(t *testing.T) {
 	plan := Plan{
 		Migrate:  []proxmox.Guest{{VMID: 101, Type: proxmox.TypeQEMU, Running: true}},
 		Stop:     []proxmox.Guest{{VMID: 301, Type: proxmox.TypeQEMU, Running: true}},
-		Silence:  true,
 		Poweroff: true,
 		NextMode: state.ModeShed,
 	}
-	snap := Snapshot{Mode: state.ModeRunning}
-	if err := c.execute(context.Background(), plan, snap); err != nil {
-		t.Fatalf("execute: %v", err)
+	// Through apply, not execute: silencing now happens there, so only apply can pin the order.
+	snap := Snapshot{Mode: state.ModeRunning, NodeUp: true}
+	if err := c.apply(context.Background(), plan, snap); err != nil {
+		t.Fatalf("apply: %v", err)
 	}
 
 	// Order: silence first, because migrating and stopping the guests is what makes their

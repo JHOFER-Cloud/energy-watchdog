@@ -60,8 +60,6 @@ func TestDecide(t *testing.T) {
 		wantStart   []int
 		wantPower   bool
 		wantWake    bool
-		wantSilence bool
-		wantUnsil   bool
 		wantGrace   int64
 	}{
 		{
@@ -81,7 +79,6 @@ func TestDecide(t *testing.T) {
 			wantMigrate: []int{101},
 			wantStop:    []int{301}, // 302 is not running, so not stopped
 			wantPower:   true,
-			wantSilence: true,
 		},
 		{
 			name:        "running, deficit, gaming up -> shed but keep host",
@@ -90,16 +87,14 @@ func TestDecide(t *testing.T) {
 			wantMigrate: []int{101},
 			wantStop:    []int{301},
 			wantPower:   false,
-			wantSilence: true,
 		},
 		{
 			// A power-off of an already-off node fails, and a failed apply never persists the
 			// mode - so the same impossible plan would be retried every tick.
-			name:        "running, deficit, p1 already down -> shed without poweroff",
-			snap:        Snapshot{Surplus: -300, SoC: 80, NodeUp: false, Mode: state.ModeRunning},
-			wantMode:    state.ModeShed,
-			wantPower:   false,
-			wantSilence: true,
+			name:      "running, deficit, p1 already down -> shed without poweroff",
+			snap:      Snapshot{Surplus: -300, SoC: 80, NodeUp: false, Mode: state.ModeRunning},
+			wantMode:  state.ModeShed,
+			wantPower: false,
 		},
 		{
 			name:      "shed, surplus -> wake + restart stopped",
@@ -107,7 +102,6 @@ func TestDecide(t *testing.T) {
 			wantMode:  state.ModeRunning,
 			wantStart: []int{301},
 			wantWake:  true,
-			wantUnsil: true,
 		},
 		{
 			name:     "shed, low battery blocks wake despite surplus",
@@ -137,7 +131,6 @@ func TestDecide(t *testing.T) {
 			snap:      Snapshot{Surplus: 1500, SoC: 80, NodeUp: true, Guests: []proxmox.Guest{qemu(601, true)}, Mode: state.ModeGaming, StoppedSet: []state.GuestRef{{VMID: 301, Type: "qemu"}}},
 			wantMode:  state.ModeRunning,
 			wantStart: []int{301},
-			wantUnsil: true,
 		},
 		{
 			// The bug fix: a freshly-woken host with no VM yet must NOT be powered off; it
@@ -205,12 +198,6 @@ func TestDecide(t *testing.T) {
 			}
 			if p.Wake != tt.wantWake {
 				t.Errorf("wake = %v, want %v", p.Wake, tt.wantWake)
-			}
-			if p.Silence != tt.wantSilence {
-				t.Errorf("silence = %v, want %v", p.Silence, tt.wantSilence)
-			}
-			if p.Unsilence != tt.wantUnsil {
-				t.Errorf("unsilence = %v, want %v", p.Unsilence, tt.wantUnsil)
 			}
 		})
 	}

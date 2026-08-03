@@ -27,7 +27,6 @@ func TestDecideManualShed(t *testing.T) {
 		wantStop    []int
 		wantPower   bool
 		wantWake    bool
-		wantSilence bool
 		wantGrace   int64
 	}{
 		{
@@ -38,7 +37,6 @@ func TestDecideManualShed(t *testing.T) {
 			wantMigrate: []int{101},
 			wantStop:    []int{301},
 			wantPower:   true,
-			wantSilence: true,
 		},
 		{
 			// Requirement: the gaming guard still vetoes the power-off.
@@ -48,7 +46,6 @@ func TestDecideManualShed(t *testing.T) {
 			wantMigrate: []int{101},
 			wantStop:    []int{301},
 			wantPower:   false,
-			wantSilence: true,
 		},
 		{
 			// Requirement: wake inhibit. Surplus is way past headroom and it still must not wake.
@@ -106,9 +103,6 @@ func TestDecideManualShed(t *testing.T) {
 			}
 			if p.Wake != tt.wantWake {
 				t.Errorf("wake = %v, want %v (%s)", p.Wake, tt.wantWake, p.Reason)
-			}
-			if p.Silence != tt.wantSilence {
-				t.Errorf("silence = %v, want %v", p.Silence, tt.wantSilence)
 			}
 		})
 	}
