@@ -607,11 +607,11 @@ const (
 )
 
 // reconcileSilences makes the energy-watchdog silences in every configured Alertmanager
-// match the desired set: the configured silences when silence is true (p1 shed), or none
-// when false (p1 in service). It never persists silence ids - it recognises its own silences by
-// createdBy on each Alertmanager - so a lost or stale ConfigMap can't orphan them, and any
-// orphans from an earlier run are cleaned up here. Each Alertmanager is reconciled
-// independently, so one being unreachable doesn't disturb the others.
+// match the desired set: the configured silences when silence is true, or none when false.
+// What that boolean tracks is the caller's business - see apply. It never persists silence
+// ids - it recognises its own silences by createdBy on each Alertmanager - so a lost or stale
+// ConfigMap can't orphan them, and any orphans from an earlier run are cleaned up here. Each
+// Alertmanager is reconciled independently, so one being unreachable doesn't disturb the others.
 func (c *Controller) reconcileSilences(ctx context.Context, silence bool) error {
 	var desired []config.Silence
 	if silence {
@@ -620,7 +620,7 @@ func (c *Controller) reconcileSilences(ctx context.Context, silence bool) error 
 	var firstErr error
 	for _, url := range c.cfg.Alertmanager.URLs {
 		// When silencing, anything of ours that isn't desired is a stale-config orphan and is
-		// removed at once. When unsilencing (p1 back up), drop coverage via the grace window
+		// removed at once. When unsilencing, drop coverage via the grace window
 		// instead, so guests still booting on the node aren't un-suppressed the same tick.
 		if err := c.reconcileSilencesAt(ctx, url, desired, !silence); err != nil {
 			c.log.Error("reconcile silences", "url", url, "err", err)
