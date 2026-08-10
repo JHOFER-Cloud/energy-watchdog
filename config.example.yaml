@@ -20,6 +20,15 @@ metricsAddr: ":9333"
 # to launch one, and rides out GPU-passthrough/VM reboots mid-session. Default 10m.
 gamingGrace: 10m
 
+# p1's power belongs to nut-dog: it has to work during an outage, and its shed signal and
+# WoL need neither Proxmox nor a second node to relay the packet. This watchdog only states
+# what it wants, every tick; nut-dog obeys unless a UPS says otherwise. Omit the block to
+# power p1 over Proxmox instead (what local runs against cmd/fakecluster do).
+powerAPI:
+  url: http://nut-dog.energy.svc.cluster.local:9335
+  load: p1 # nut-dog's load name for this node
+  # token: injected via POWER_API_TOKEN
+
 prometheus:
   url: http://kube-prometheus-stack-prometheus.monitoring.svc.cluster.local:9090
   # avg_over_time window. The "base level" that stops a kitchen burst from triggering

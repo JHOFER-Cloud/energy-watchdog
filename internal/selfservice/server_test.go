@@ -194,25 +194,52 @@ func TestRepeatClickExtendsRatherThanPilesUp(t *testing.T) {
 	}
 }
 
-func TestShedToggleIsAdminOnly(t *testing.T) {
+func TestHoldIsAdminOnly(t *testing.T) {
 	store := &fakeStore{}
 	user, _ := testServer(t, staticAuth{User: "josef", Groups: []string{"deskvm-josef"}}, &fakeCluster{up: true}, store)
-	if w := do(t, user, http.MethodPost, "/api/admin/shed", `{"shed":true}`); w.Code != http.StatusForbidden {
-		t.Fatalf("non-admin shed = %d, want 403", w.Code)
+	if w := do(t, user, http.MethodPost, "/api/admin/hold", `{"hold":"shed"}`); w.Code != http.StatusForbidden {
+		t.Fatalf("non-admin hold = %d, want 403", w.Code)
 	}
 	if store.intent.Shed {
-		t.Fatal("non-admin toggled the shed")
+		t.Fatal("non-admin set the hold")
 	}
 
 	admin, nudge := testServer(t, staticAuth{User: "josef", Groups: []string{"jhc-admins"}}, &fakeCluster{up: true}, store)
-	if w := do(t, admin, http.MethodPost, "/api/admin/shed", `{"shed":true}`); w.Code != http.StatusOK {
-		t.Fatalf("admin shed = %d", w.Code)
+	if w := do(t, admin, http.MethodPost, "/api/admin/hold", `{"hold":"shed"}`); w.Code != http.StatusOK {
+		t.Fatalf("admin hold = %d", w.Code)
 	}
 	if !store.intent.Shed {
-		t.Error("admin toggle did not stick")
+		t.Error("admin hold did not stick")
 	}
 	if nudge.n != 1 {
 		t.Errorf("nudges = %d, want 1", nudge.n)
+	}
+}
+
+// The three positions are mutually exclusive by construction: one endpoint writes both flags,
+// so no sequence of clicks can leave p1 held off and on at once.
+func TestHoldPositionsAreExclusive(t *testing.T) {
+	store := &fakeStore{}
+	admin, _ := testServer(t, staticAuth{User: "josef", Groups: []string{"jhc-admins"}}, &fakeCluster{up: true}, store)
+
+	for _, tc := range []struct {
+		hold             string
+		wantShed, wantOn bool
+	}{
+		{"shed", true, false},
+		{"on", false, true},
+		{"solar", false, false},
+	} {
+		if w := do(t, admin, http.MethodPost, "/api/admin/hold", `{"hold":"`+tc.hold+`"}`); w.Code != http.StatusOK {
+			t.Fatalf("hold %s = %d", tc.hold, w.Code)
+		}
+		if store.intent.Shed != tc.wantShed || store.intent.On != tc.wantOn {
+			t.Errorf("hold %s: shed=%v on=%v, want shed=%v on=%v",
+				tc.hold, store.intent.Shed, store.intent.On, tc.wantShed, tc.wantOn)
+		}
+	}
+	if w := do(t, admin, http.MethodPost, "/api/admin/hold", `{"hold":"off"}`); w.Code != http.StatusBadRequest {
+		t.Errorf("unknown hold = %d, want 400", w.Code)
 	}
 }
 
@@ -230,7 +257,7 @@ func TestUnauthenticatedIsRejectedEverywhere(t *testing.T) {
 		{http.MethodGet, "/", "", http.StatusFound},
 		{http.MethodGet, "/api/status", "", http.StatusUnauthorized},
 		{http.MethodPost, "/api/vms/601/start", "", http.StatusUnauthorized},
-		{http.MethodPost, "/api/admin/shed", `{"shed":true}`, http.StatusUnauthorized},
+		{http.MethodPost, "/api/admin/hold", `{"hold":"shed"}`, http.StatusUnauthorized},
 	} {
 		if w := do(t, s, tc.method, tc.path, tc.body); w.Code != tc.want {
 			t.Errorf("%s %s = %d, want %d", tc.method, tc.path, w.Code, tc.want)

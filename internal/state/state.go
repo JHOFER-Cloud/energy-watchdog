@@ -40,10 +40,16 @@ type Intent struct {
 	// Shed holds the node shed regardless of solar surplus (heatwave, maintenance). Gaming
 	// guard, grace window and wake inhibit behave exactly as in a solar-triggered shed.
 	Shed bool `json:"shed,omitempty"`
+	// On holds the node up regardless of surplus. Shed wins if a hand-edited intent sets both.
+	On bool `json:"on,omitempty"`
 	// Wake are outstanding requests to start a desktop VM, waking the node first if it's down.
 	// They age out after gamingGrace rather than being cleared, so the loop never writes to spec.
 	Wake []WakeRequest `json:"wake,omitempty"`
 }
+
+// Holds resolves the two flags to the posture actually in force. Only a hand-edited intent
+// can set both; hold-off wins, so the gauges and the UI never disagree with the loop.
+func (i Intent) Holds() (shed, on bool) { return i.Shed, i.On && !i.Shed }
 
 // WakeRequest is one user asking for their desktop VM to be started.
 type WakeRequest struct {

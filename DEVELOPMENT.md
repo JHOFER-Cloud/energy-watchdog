@@ -70,7 +70,7 @@ The state ConfigMap has two keys, written by different parties:
 | Key | Written by | Contains |
 |---|---|---|
 | `state.json` | the reconcile loop | mode, stopped guests, grace clock (status) |
-| `intent.json` | the API, or you with kubectl | manual shed, wake requests (spec) |
+| `intent.json` | the API, or you with kubectl | manual holds, wake requests (spec) |
 
 They are written by **separate merge patches**, never a whole-object PUT. That matters: a
 migrate can run 15 minutes, and a state save landing at the end of it must not wipe an intent
@@ -84,25 +84,56 @@ The TTL is `gamingGrace` rather than a constant of its own on purpose: a request
 for exactly as long as a gaming session gets to produce a running VM, so tuning one can't
 open a window where a request outlives the grace that honours it.
 
-### Manual shed
+### Manual holds
 
-`Decide` treats it as a permanent deficit:
+`Decide` pins the signal rather than adding a mode:
 
 ```go
-if s.ManualShed {
+switch {
+case s.ManualShed:
     sig = sigDeficit
+case s.ManualOn:
+    sig = sigSurplus
 }
 ```
 
-That one line is the whole feature. Every existing rule then applies unchanged — gaming guard
-still vetoes the power-off, the grace window still runs, powering p1 on by hand is still
-adopted — and `sigSurplus` becomes unreachable, so solar can't wake it.
+That is the whole feature, both directions. Every existing rule then applies unchanged —
+gaming guard still vetoes the power-off, the grace window still runs, powering p1 on by hand
+is still adopted — while the opposite signal becomes unreachable, so solar can neither wake a
+held-off node nor shed a held-on one.
 
-**`energy_watchdog_mode` deliberately keeps reporting `shed`, not `manual`.** nut-dog's wake
-inhibit queries `energy_watchdog_mode{mode="shed"} == 1`
-(`fleet/infra/nut-dog/common/config.yaml`); a new mode value would silently switch that off
-and nut-dog would wake p1 mid-shed. The "why" lives in the separate
-`energy_watchdog_manual_shed` gauge.
+The shed case is deliberately first: the API writes the pair through one endpoint and can't
+set both, but a hand-edited `intent.json` can, and the heatwave outranks the convenience.
+
+**`energy_watchdog_mode` deliberately keeps reporting `shed`, not `manual`.** A fourth mode
+value would break every dashboard and alert that keys off it, and the "why" belongs in the
+separate `energy_watchdog_manual_shed` / `energy_watchdog_manual_on` gauges rather than in
+the mode itself.
+
+### p1's power belongs to nut-dog
+
+This loop decides *whether* p1 should be on; nut-dog does the powering. It has to work when
+the cluster doesn't, and its mechanisms need neither Proxmox nor a second node — where this
+loop's own WoL goes through `POST /nodes/pve-1/wakeonlan`, i.e. it needs another node up to
+relay the packet, which is exactly what a full shed leaves you without.
+
+So `wake` and the power-off become one call each (`powerAPI`), and the wish is **restated
+every tick** rather than sent on transitions: nut-dog keeps requests in memory, and its
+`startupGrace` is sized so a restart is covered by the next tick here.
+
+`powerWish` derives that wish from what the loop actually established — never from the mode
+label. `ModeRunning` with p1 down is a deliberate hold, and `ModeShed` with p1 up is the
+stalemate where a hand-started node is left alone; asserting a wish in either case powers p1
+against the loop's own decision. Both are pinned by `TestRestateNeverOverridesTheLoop`.
+
+There is no gate in the other direction. nut-dog resolves the conflict itself: a critical UPS
+outranks any request, so this side never has to ask permission, and the two can't deadlock.
+Watch `energy_watchdog_power_request_success` — with all of p1's power running through that
+call, a wrong token or load name is otherwise silent.
+
+A hold-on is a latch with no expiry, so alert on
+`min_over_time(energy_watchdog_manual_on[6h]) == 1` — a forgotten one means p1 runs on grid
+power every night.
 
 ### Break-glass
 
@@ -110,10 +141,39 @@ If the UI is down, intent is just a ConfigMap key:
 
 ```sh
 kubectl -n energy patch cm energy-watchdog-state --type merge \
-  -p '{"data":{"intent.json":"{\"shed\":true}"}}'
+  -p '{"data":{"intent.json":"{\"shed\":true}"}}'   # or {"on":true}
 ```
 
-The loop picks it up on the next tick. Set `false` to hand control back to the sun.
+The loop picks it up on the next tick. Write `{}` to hand control back to the sun.
+
+## Regenerating the decision reference
+
+There is a published page listing every decision this loop can reach and every request nut-dog
+can honour or refuse. It is worth keeping, because it is not written by hand: both tables come
+from running the real `Decide` and `DesiredForLoad` over their whole input space, so the page
+cannot claim behaviour the code doesn't have. It has already earned that twice — it is how the
+`running` + p1-down dead end surfaced, and how `hold` turning into `on` inside nut-dog was
+caught.
+
+The generators live as tests that skip unless `OUT` is set, so they cost nothing in a normal
+run but still compile against the real signatures:
+
+```sh
+# every reachable Decide outcome (270 rows)
+OUT=/tmp/decide.json go test ./internal/controller/ -run TestGenerateDecisionTable
+
+# nut-dog's precedence + reconcile tables (40 + 27 rows), from the nut-dog repo
+OUT=/tmp/nutdog.json go test ./internal/control/ -run TestGenerateNutDogTables
+```
+
+Both dump JSON. The page is a self-contained HTML artifact built from those two files: a
+filterable table per dataset, plus two hand-drawn SVGs (the delegation path and the mode state
+machine). Rebuilding it is a matter of re-rendering that JSON — ask Claude to rebuild the
+decision reference from the two dumps, and give it the existing artifact URL so it updates in
+place instead of minting a new one.
+
+When adding a dimension to `Decide` — a new mode, another intent flag — add it to the loop in
+`decisiontable_test.go` too, or the page quietly stops covering it.
 
 ## Authentication
 

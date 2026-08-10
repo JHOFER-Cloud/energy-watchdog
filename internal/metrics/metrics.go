@@ -17,7 +17,11 @@ type Metrics struct {
 	nodeUp     bool
 	gaming     bool
 	manualShed bool
+	manualOn   bool
 	dryRun     bool
+	// powerReqOK is nil until a request has been attempted, so a deployment that
+	// doesn't delegate p1's power exports nothing rather than a misleading 1.
+	powerReqOK *bool
 	mode       string
 	lastTick   int64
 	lastOK     bool
@@ -50,6 +54,7 @@ type Sample struct {
 	NodeUp     bool
 	Gaming     bool
 	ManualShed bool
+	ManualOn   bool
 	Tick       int64
 }
 
@@ -58,8 +63,18 @@ func (m *Metrics) Update(s Sample) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.surplus, m.surplusRaw, m.soc = s.Surplus, s.SurplusRaw, s.SoC
-	m.nodeUp, m.gaming, m.manualShed = s.NodeUp, s.Gaming, s.ManualShed
+	m.nodeUp, m.gaming = s.NodeUp, s.Gaming
+	m.manualShed, m.manualOn = s.ManualShed, s.ManualOn
 	m.lastTick = s.Tick
+}
+
+// SetPowerRequestOK records whether the last power request to nut-dog landed. p1's power
+// runs entirely through that call now, so a rejected token or a wrong load name has to be
+// visible - it fails silently otherwise, with every other gauge still green.
+func (m *Metrics) SetPowerRequestOK(ok bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.powerReqOK = &ok
 }
 
 // SetOutcome records the mode in force after apply and whether apply succeeded. Separate
@@ -112,12 +127,21 @@ func (m *Metrics) Handler() http.HandlerFunc {
 		fmt.Fprintf(w, "# HELP energy_watchdog_manual_shed Whether the node is held shed by hand rather than by the solar signal.\n")
 		fmt.Fprintf(w, "# TYPE energy_watchdog_manual_shed gauge\n")
 		fmt.Fprintf(w, "energy_watchdog_manual_shed %g\n", b2f(m.manualShed))
+		// A hold-on that nobody clears keeps p1 on grid power every night, so this gauge is
+		// meant to be alerted on: min_over_time(energy_watchdog_manual_on[6h]) == 1.
+		fmt.Fprintf(w, "# HELP energy_watchdog_manual_on Whether the node is held on by hand rather than by the solar signal.\n")
+		fmt.Fprintf(w, "# TYPE energy_watchdog_manual_on gauge\n")
+		fmt.Fprintf(w, "energy_watchdog_manual_on %g\n", b2f(m.manualOn))
+		if m.powerReqOK != nil {
+			fmt.Fprintf(w, "# HELP energy_watchdog_power_request_success Whether the last power request to nut-dog succeeded.\n")
+			fmt.Fprintf(w, "# TYPE energy_watchdog_power_request_success gauge\n")
+			fmt.Fprintf(w, "energy_watchdog_power_request_success %g\n", b2f(*m.powerReqOK))
+		}
 		fmt.Fprintf(w, "# HELP energy_watchdog_dry_run Whether the watchdog is in dry-run mode.\n")
 		fmt.Fprintf(w, "# TYPE energy_watchdog_dry_run gauge\n")
 		fmt.Fprintf(w, "energy_watchdog_dry_run %g\n", b2f(m.dryRun))
-		// A manual shed deliberately does NOT get its own mode label: nut-dog inhibits its
-		// wake on energy_watchdog_mode{mode="shed"} == 1, so the real mode has to keep
-		// reporting shed. Dashboards join energy_watchdog_manual_shed for the "why".
+		// A manual shed deliberately does NOT get its own mode label: dashboards and alerts
+		// key off these three values. Join energy_watchdog_manual_shed for the "why".
 		fmt.Fprintf(w, "# HELP energy_watchdog_mode Current mode (1 for the active mode).\n")
 		fmt.Fprintf(w, "# TYPE energy_watchdog_mode gauge\n")
 		for _, mode := range []string{"running", "shed", "gaming"} {

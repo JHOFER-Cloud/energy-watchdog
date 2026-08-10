@@ -4,8 +4,9 @@ Shuts the Proxmox host `p1` down at night when there's no solar surplus, and wak
 back up in the morning once production covers the load again. The always-on stuff
 (network gear, the control-plane Raspberry Pis) keeps running the whole time.
 
-Part of JHC-504. The UPS / power-cut side of things is a separate service (`nut-dog`,
-JHC-501), since the trigger and the mechanism are nothing alike.
+Part of JHC-504. The UPS / power-cut side is a separate service (`nut-dog`, JHC-501), since
+the trigger and the mechanism are nothing alike. `nut-dog` also owns `p1`'s power switch —
+see "Who actually powers p1" below.
 
 ## How it works
 
@@ -41,22 +42,71 @@ Two things stop it thrashing:
 Migrated guests don't come back on their own. They stay where they landed; moving them
 back is a manual call.
 
-### Holding p1 off by hand
+### Overriding the sun by hand
 
-Sometimes there's plenty of sun and you still don't want the machine on — a heatwave, or
-maintenance. Setting the manual shed holds `p1` down regardless of surplus, via the admin
-button in the self-service UI or a ConfigMap key (see below).
+The admin section of the self-service UI is a three-position control (or a ConfigMap key, see
+below):
 
-It isn't a fourth mode. `Decide` treats it as a permanent deficit, so every rule above
-applies unchanged: the gaming guard still keeps the host up, the grace window still runs,
-powering `p1` on by hand is still adopted as a gaming session, and a self-service VM request
-still wakes it. The one thing that changes is that returning surplus can no longer wake it.
+| Position | Effect |
+|----------|--------|
+| **Hold off** | `p1` stays down regardless of surplus — a heatwave, or maintenance |
+| **Follow solar** | the default: the signal decides |
+| **Hold on** | `p1` stays up regardless of surplus, and the guests it stopped come back |
 
-Clearing it hands control straight back to the sun on the next tick.
+Neither hold is a fourth mode. `Decide` pins the signal — a hold-off is a permanent deficit, a
+hold-on a permanent surplus — so every rule above applies unchanged. The gaming guard still
+keeps the host up during a hold-off, the grace window still runs, powering `p1` on by hand is
+still adopted as a gaming session, and a self-service VM request wakes it either way. A
+hold-on additionally ignores `minBatteryPercent`: a deliberate hold outranks the battery.
 
-`energy_watchdog_mode` keeps reporting `shed` while it's on — nut-dog's wake inhibit depends
-on that — and `energy_watchdog_manual_shed` says whether it was solar or a person who
-decided.
+Hold off wins if both flags end up set, which only a hand-edited intent can do. Clearing a
+hold hands control back to the sun on the next tick — from a hold-on during a deficit, that
+means `p1` sheds immediately.
+
+All three positions ask for confirmation, because all three move power and which way depends
+on the surplus at the moment you click: a hold-off cuts it, a hold-on burns it until somebody
+remembers, and `Follow solar` sheds `p1` or wakes it depending on whether the sun is out.
+None of them is a free move.
+
+`energy_watchdog_mode` keeps reporting `shed` during a hold-off, and
+`energy_watchdog_manual_shed` / `energy_watchdog_manual_on` say whether it was solar or a
+person who decided. A hold-on that nobody clears burns grid power every
+night, so alert on it:
+
+```promql
+min_over_time(energy_watchdog_manual_on[6h]) == 1
+```
+
+### Who actually powers p1
+
+This watchdog decides *whether* `p1` should be on. `nut-dog` does the powering, over
+`powerAPI`:
+
+```
+PUT /api/loads/p1/power   {"desired": "on" | "off" | "hold", "reason": "solar"}
+```
+
+It owns the switch because it has to work when the cluster doesn't: its shed signal and WoL
+need neither Proxmox nor a second node to relay a packet — which is what a full shed leaves
+you without. Guest choreography stays here: migrate and stop run first, *then* the power-off
+is requested.
+
+The wish is restated every tick, not just on transitions, so nut-dog can stay stateless.
+It is derived from what the loop established rather than from the mode: when the loop is
+deliberately holding — `running` with `p1` down, or `shed` with `p1` up — nothing is
+asserted, and `p1` is left exactly where it is.
+
+When the watchdog cannot observe — Prometheus gone with the cluster during an outage — it
+sends `hold` rather than falling silent, so `p1` stays where it is until there is a reading to
+decide on. Silence would leave nut-dog acting on the last thing it heard, which after a UPS
+recovery means waking `p1` at whatever hour that lands.
+
+There is no gate in this direction: a critical UPS outranks any request inside nut-dog, so
+neither service has to ask the other's permission and they can't deadlock. Alert on
+`energy_watchdog_power_request_success` — every watt of p1's power now goes through that call.
+
+Unset `powerAPI` and the watchdog powers `p1` itself over Proxmox, which is what local runs
+against `cmd/fakecluster` do.
 
 ### Desktop VMs (self-service)
 
