@@ -26,8 +26,9 @@ func TestFileStoreRoundTrip(t *testing.T) {
 	}
 
 	want := State{
-		Mode:    ModeShed,
-		Stopped: []GuestRef{{VMID: 301, Type: "qemu"}, {VMID: 311, Type: "lxc"}},
+		Mode:       ModeShed,
+		GraceSince: 1234567890,
+		WakeDone:   map[int]int64{601: 42},
 	}
 	if err := s.Save(ctx, want); err != nil {
 		t.Fatal(err)
@@ -36,11 +37,11 @@ func TestFileStoreRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Mode != want.Mode || len(got.Stopped) != 2 {
+	if got.Mode != want.Mode || got.GraceSince != want.GraceSince {
 		t.Errorf("round-trip = %+v, want %+v", got, want)
 	}
-	if got.Stopped[0].VMID != 301 || got.Stopped[1].Type != "lxc" {
-		t.Errorf("stopped = %+v", got.Stopped)
+	if got.WakeDone[601] != 42 {
+		t.Errorf("wakeDone = %+v", got.WakeDone)
 	}
 }
 
@@ -144,7 +145,7 @@ func TestConfigMapStoreKeysAreIndependent(t *testing.T) {
 	if err := store.SaveIntent(ctx, Intent{Shed: true}); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.Save(ctx, State{Mode: ModeShed, Stopped: []GuestRef{{VMID: 301, Type: "qemu"}}}); err != nil {
+	if err := store.Save(ctx, State{Mode: ModeShed, GraceSince: 99}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -159,7 +160,7 @@ func TestConfigMapStoreKeysAreIndependent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if st.Mode != ModeShed || len(st.Stopped) != 1 {
+	if st.Mode != ModeShed || st.GraceSince != 99 {
 		t.Errorf("state = %+v", st)
 	}
 

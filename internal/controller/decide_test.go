@@ -57,7 +57,7 @@ func TestDecide(t *testing.T) {
 		wantMode    state.Mode
 		wantMigrate []int
 		wantStop    []int
-		wantStart   []int
+		wantRestore bool
 		wantPower   bool
 		wantWake    bool
 		wantGrace   int64
@@ -97,11 +97,11 @@ func TestDecide(t *testing.T) {
 			wantPower: false,
 		},
 		{
-			name:      "shed, surplus -> wake + restart stopped",
-			snap:      Snapshot{Surplus: 1500, SoC: 80, NodeUp: false, Mode: state.ModeShed, StoppedSet: []state.GuestRef{{VMID: 301, Type: "qemu"}}},
-			wantMode:  state.ModeRunning,
-			wantStart: []int{301},
-			wantWake:  true,
+			name:        "shed, surplus -> wake + restart stopped",
+			snap:        Snapshot{Surplus: 1500, SoC: 80, NodeUp: false, Mode: state.ModeShed},
+			wantMode:    state.ModeRunning,
+			wantRestore: true,
+			wantWake:    true,
 		},
 		{
 			name:     "shed, low battery blocks wake despite surplus",
@@ -127,10 +127,10 @@ func TestDecide(t *testing.T) {
 			wantMode: state.ModeShed,
 		},
 		{
-			name:      "gaming, surplus -> restart stopped, no wake",
-			snap:      Snapshot{Surplus: 1500, SoC: 80, NodeUp: true, Guests: []proxmox.Guest{qemu(601, true)}, Mode: state.ModeGaming, StoppedSet: []state.GuestRef{{VMID: 301, Type: "qemu"}}},
-			wantMode:  state.ModeRunning,
-			wantStart: []int{301},
+			name:        "gaming, surplus -> restart stopped, no wake",
+			snap:        Snapshot{Surplus: 1500, SoC: 80, NodeUp: true, Guests: []proxmox.Guest{qemu(601, true)}, Mode: state.ModeGaming},
+			wantMode:    state.ModeRunning,
+			wantRestore: true,
 		},
 		{
 			// The bug fix: a freshly-woken host with no VM yet must NOT be powered off; it
@@ -170,7 +170,7 @@ func TestDecide(t *testing.T) {
 			// Surplus with p1 gone must not start guests on a dead node: shed first, and the
 			// next tick wakes it via the ModeShed path.
 			name:     "gaming, p1 gone, surplus -> shed first, no start",
-			snap:     Snapshot{Surplus: 1500, SoC: 80, NodeUp: false, Mode: state.ModeGaming, StoppedSet: []state.GuestRef{{VMID: 301, Type: "qemu"}}},
+			snap:     Snapshot{Surplus: 1500, SoC: 80, NodeUp: false, Mode: state.ModeGaming},
 			wantMode: state.ModeShed,
 		},
 	}
@@ -190,8 +190,8 @@ func TestDecide(t *testing.T) {
 			if !equal(ids(p.Stop), tt.wantStop) {
 				t.Errorf("stop = %v, want %v", ids(p.Stop), tt.wantStop)
 			}
-			if !equal(refIDs(p.Start), tt.wantStart) {
-				t.Errorf("start = %v, want %v", refIDs(p.Start), tt.wantStart)
+			if p.RestoreStopped != tt.wantRestore {
+				t.Errorf("restoreStopped = %v, want %v", p.RestoreStopped, tt.wantRestore)
 			}
 			if p.Poweroff != tt.wantPower {
 				t.Errorf("poweroff = %v, want %v", p.Poweroff, tt.wantPower)

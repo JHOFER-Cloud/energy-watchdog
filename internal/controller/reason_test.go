@@ -29,7 +29,6 @@ func TestPowerActionsAlwaysCarryAReason(t *testing.T) {
 							s := Snapshot{
 								Surplus: surplus[sig], SoC: 90, NodeUp: nodeUp, Mode: mode,
 								NodeUptime: time.Hour,
-								StoppedSet: []state.GuestRef{{VMID: 301, Type: "qemu"}},
 								ManualShed: hold == "hold off",
 								ManualOn:   hold == "hold on",
 							}

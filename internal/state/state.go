@@ -80,8 +80,7 @@ func (i Intent) LiveWake(now time.Time, ttl time.Duration) []WakeRequest {
 // they're reconciled directly against Alertmanager (identified by their createdBy), so a
 // lost or stale ConfigMap can't orphan them.
 type State struct {
-	Mode    Mode       `json:"mode"`
-	Stopped []GuestRef `json:"stopped"`
+	Mode Mode `json:"mode"`
 	// GraceSince is the unix time the gaming-session grace clock started ticking: it is
 	// set when p1 is up in ModeGaming with no gaming guest running, and reset to 0 the
 	// moment a gaming guest is seen (or the session ends). p1 isn't powered off until the

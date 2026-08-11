@@ -26,7 +26,6 @@ type Snapshot struct {
 	NodeUptime time.Duration   // 0 when the node is down, or when the token can't read uptime
 	Guests     []proxmox.Guest // guests currently on the managed node ("" if it's down)
 	Mode       state.Mode
-	StoppedSet []state.GuestRef
 	GraceSince int64 // unix time the gaming grace clock started; 0 when not running
 	// ManualShed holds the node shed regardless of surplus (state.Intent.Shed).
 	ManualShed bool
@@ -41,9 +40,12 @@ type Snapshot struct {
 // Plan is the set of actions a single reconcile wants to take. Disjoint per mode:
 // a shed plan never also wakes, and vice-versa, so execute can apply a fixed order.
 type Plan struct {
-	Migrate []proxmox.Guest  // live-migrate off the node before power-off
-	Stop    []proxmox.Guest  // graceful stop + record
-	Start   []state.GuestRef // start the guests we previously stopped
+	Migrate []proxmox.Guest // live-migrate off the node before power-off
+	Stop    []proxmox.Guest // graceful stop
+	// RestoreStopped brings the stop-class guests back at good-morning. It is a flag, not a
+	// list: p1 is still down when this is planned, so the guests can't be enumerated until
+	// execute has woken it.
+	RestoreStopped bool
 	// StartRequested are desktop VMs to start for a self-service request. Ids only: when the
 	// node is still down we can't know a guest's type yet, so execute resolves it after wake.
 	StartRequested []int
@@ -186,7 +188,7 @@ func Decide(s Snapshot, cfg *config.Config, now time.Time) Plan {
 		switch {
 		case sig == sigSurplus:
 			p.Wake = true
-			p.Start = s.StoppedSet
+			p.RestoreStopped = true
 			p.NextMode = state.ModeRunning
 			p.Reason = "surplus returned: wake p1 and restart the guests we stopped"
 		case requested:
@@ -217,7 +219,7 @@ func Decide(s Snapshot, cfg *config.Config, now time.Time) Plan {
 		case sig == sigSurplus:
 			// Good morning. p1 is already up; restore what we stopped. Criticals stay
 			// where they were migrated. Nothing migrates back automatically.
-			p.Start = s.StoppedSet
+			p.RestoreStopped = true
 			p.NextMode = state.ModeRunning
 			p.GraceSince = 0
 			p.Reason = "surplus returned while p1 up: restart the guests we stopped"
