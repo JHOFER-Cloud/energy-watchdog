@@ -87,7 +87,9 @@ proxmox:
 # The three lists must not overlap.
 guests:
   migrate: ["100-199"] # live-migrate off p1 before power-off; never migrated back
-  stop: ["300-399"] # graceful stop; recorded and restarted at good-morning
+  # Graceful stop; all of these are started again at good-morning. To keep one down,
+  # tag it in Proxmox: qm set <id> --tags en_no-autostart
+  stop: ["300-399"]
   gamingGuard: ["600-699"] # any running -> keep p1 up (no power-off)
 
 alertmanager:

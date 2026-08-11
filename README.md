@@ -33,14 +33,29 @@ Two things stop it thrashing:
 |------|---------|--------------|
 | `running` | deficit, nothing gaming | silence alerts, migrate criticals, stop the rest, power off |
 | `running` | deficit, a gaming VM is up | migrate and stop, but leave the host on |
-| `shed` | surplus is back | Wake-on-LAN, start the guests it stopped, drop the silence |
+| `shed` | surplus is back | Wake-on-LAN, start the stop-class guests, drop the silence |
 | `shed` | host got powered on by hand | treat it as `gaming`, don't fight a manual wake |
-| `gaming` | surplus is back | start the stopped guests (host's already on) |
+| `gaming` | surplus is back | start the stop-class guests (host's already on) |
 | `gaming` | no gaming VM yet, within grace | leave the host on, wait for a VM |
 | `gaming` | no gaming VM once grace elapses, still no surplus | power off |
 
 Migrated guests don't come back on their own. They stay where they landed; moving them
 back is a manual call.
+
+Good-morning starts every `stop`-class guest that isn't already running, derived from config
+and the live guest list rather than from a record of what this loop stopped. That record used
+to exist and was empty in exactly the cases that matter: `p1` can be taken down by a UPS shed,
+a crash, or `pve-guests` during a host shutdown, none of which this loop drives, so the guests
+died unrecorded and never came back.
+
+To keep a guest down across good-morning, say so on the guest:
+
+```sh
+qm set 700 --tags en_no-autostart
+```
+
+It is declared rather than inferred because the two cases are indistinguishable from
+observed state — a guest you stopped by hand looks exactly like one a shutdown killed.
 
 ### Overriding the sun by hand
 
@@ -51,7 +66,7 @@ below):
 |----------|--------|
 | **Hold off** | `p1` stays down regardless of surplus — a heatwave, or maintenance |
 | **Follow solar** | the default: the signal decides |
-| **Hold on** | `p1` stays up regardless of surplus, and the guests it stopped come back |
+| **Hold on** | `p1` stays up regardless of surplus, and the stop-class guests come back |
 
 Neither hold is a fourth mode. `Decide` pins the signal — a hold-off is a permanent deficit, a
 hold-on a permanent surplus — so every rule above applies unchanged. The gaming guard still

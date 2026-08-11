@@ -124,17 +124,14 @@ func TestExecuteShedCycle(t *testing.T) {
 		}
 	}
 
-	// State persisted: shed mode and 301 recorded as stopped. Silences are no longer
-	// tracked in state - they're reconciled against Alertmanager by createdBy.
+	// State persisted: shed mode. The stopped guests are deliberately NOT recorded - the
+	// good-morning restore derives them from config and the live guest list instead.
 	st, err := state.NewFileStore(statePath).Load(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
 	if st.Mode != state.ModeShed {
 		t.Errorf("mode = %q, want shed", st.Mode)
-	}
-	if len(st.Stopped) != 1 || st.Stopped[0].VMID != 301 {
-		t.Errorf("stopped = %+v, want [301]", st.Stopped)
 	}
 }
 

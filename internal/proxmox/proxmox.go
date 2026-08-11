@@ -33,6 +33,26 @@ type Guest struct {
 	Name    string
 	Type    GuestType
 	Running bool
+	Tags    []string // Proxmox guest tags, already split
+}
+
+// HasTag reports whether the guest carries tag (case-insensitive, as Proxmox
+// lowercases tags on write but older ones may not be).
+func (g Guest) HasTag(tag string) bool {
+	for _, t := range g.Tags {
+		if strings.EqualFold(t, tag) {
+			return true
+		}
+	}
+	return false
+}
+
+// splitTags parses Proxmox's tag encoding: semicolon-separated, and empty when unset.
+func splitTags(s string) []string {
+	if s == "" {
+		return nil
+	}
+	return strings.Split(s, ";")
 }
 
 // Client talks to a single Proxmox cluster node's API. That node manages the whole
@@ -149,6 +169,7 @@ func (c *Client) Guests(ctx context.Context, node string) ([]Guest, error) {
 			VMID   json.Number `json:"vmid"`
 			Name   string      `json:"name"`
 			Status string      `json:"status"`
+			Tags   string      `json:"tags"`
 		}
 		if err := json.Unmarshal(data, &items); err != nil {
 			return nil, err
@@ -158,7 +179,7 @@ func (c *Client) Guests(ctx context.Context, node string) ([]Guest, error) {
 			if err != nil {
 				continue
 			}
-			out = append(out, Guest{VMID: id, Name: it.Name, Type: t, Running: it.Status == "running"})
+			out = append(out, Guest{VMID: id, Name: it.Name, Type: t, Running: it.Status == "running", Tags: splitTags(it.Tags)})
 		}
 	}
 	return out, nil

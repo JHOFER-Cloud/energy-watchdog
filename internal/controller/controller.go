@@ -203,7 +203,6 @@ func (c *Controller) apply(ctx context.Context, p Plan, snap Snapshot) error {
 func (c *Controller) persist(ctx context.Context, p Plan, snap Snapshot) error {
 	return c.store.Save(ctx, state.State{
 		Mode:       p.NextMode,
-		Stopped:    snap.StoppedSet,
 		GraceSince: p.GraceSince,
 		WakeDone:   p.WakeDone,
 	})
@@ -249,7 +248,6 @@ func (c *Controller) observe(ctx context.Context, now time.Time) (Snapshot, bool
 		NodeUptime: uptime,
 		Guests:     guests,
 		Mode:       st.Mode,
-		StoppedSet: st.Stopped,
 		GraceSince: st.GraceSince,
 		ManualShed: manualShed,
 		ManualOn:   manualOn,
@@ -288,12 +286,12 @@ func isNoop(p Plan, snap Snapshot) bool {
 	return p.NextMode == snap.Mode && p.GraceSince == snap.GraceSince &&
 		maps.Equal(p.WakeDone, snap.WakeDone) &&
 		!p.Poweroff && !p.Wake &&
-		len(p.Migrate) == 0 && len(p.Stop) == 0 && len(p.Start) == 0 && len(p.StartRequested) == 0
+		len(p.Migrate) == 0 && len(p.Stop) == 0 && !p.RestoreStopped && len(p.StartRequested) == 0
 }
 
 func (c *Controller) logPlan(p Plan) {
 	c.log.Info("[dry-run] would act",
-		"migrate", guestIDs(p.Migrate), "stop", guestIDs(p.Stop), "start", refIDs(p.Start),
+		"migrate", guestIDs(p.Migrate), "stop", guestIDs(p.Stop), "restoreStopped", p.RestoreStopped,
 		"startRequested", p.StartRequested,
 		"poweroff", p.Poweroff, "wake", p.Wake,
 		"nextMode", p.NextMode)
@@ -301,7 +299,7 @@ func (c *Controller) logPlan(p Plan) {
 
 // execute applies the plan in a fixed, safe order and persists the resulting state.
 func (c *Controller) execute(ctx context.Context, p Plan, snap Snapshot) error {
-	st := state.State{Mode: snap.Mode, Stopped: snap.StoppedSet, GraceSince: p.GraceSince, WakeDone: p.WakeDone}
+	st := state.State{Mode: snap.Mode, GraceSince: p.GraceSince, WakeDone: p.WakeDone}
 
 	// Set before the first step, not per step: it has to cover the whole shed.
 	switch {
@@ -318,10 +316,7 @@ func (c *Controller) execute(ctx context.Context, p Plan, snap Snapshot) error {
 		}
 	}
 	if len(p.Stop) > 0 {
-		stopped, err := c.stopAll(ctx, p.Stop)
-		st.Stopped = stopped
-		if err != nil {
-			_ = c.store.Save(ctx, st) // persist whatever we managed to stop
+		if _, err := c.stopAll(ctx, p.Stop); err != nil {
 			return err
 		}
 	}
@@ -330,11 +325,10 @@ func (c *Controller) execute(ctx context.Context, p Plan, snap Snapshot) error {
 			return err
 		}
 	}
-	if len(p.Start) > 0 {
-		if err := c.startAll(ctx, p.Start); err != nil {
+	if p.RestoreStopped {
+		if err := c.restoreStopped(ctx); err != nil {
 			return err
 		}
-		st.Stopped = nil
 	}
 	if len(p.StartRequested) > 0 {
 		// Best-effort: a desktop VM that won't boot is the user's problem, and failing the
@@ -479,6 +473,33 @@ func (c *Controller) stoppedOf(ctx context.Context, want []proxmox.Guest) ([]sta
 
 // startAll boots the guests we stopped, in startup order with each group's up= delay honoured.
 // Best-effort: one guest that won't boot must not fail the reconcile and roll the mode back.
+// restoreStopped brings the stop-class guests back at good-morning. The set is derived from
+// config and the node's live guest list, never from a persisted record: p1 can be taken down
+// by a UPS shed, a crash or pve-guests, none of which this loop drives, and a recorded list is
+// then empty exactly when it is needed. Guests tagged NoAutostartTag stay off - the watchdog
+// cannot tell a hand-stopped guest from one a shutdown killed, so that intent is declared.
+func (c *Controller) restoreStopped(ctx context.Context) error {
+	guests, err := c.px.Guests(ctx, c.cfg.Proxmox.Node)
+	if err != nil {
+		return err
+	}
+	var want []state.GuestRef
+	for _, g := range guests {
+		if g.Running || !c.cfg.Guests.Stop.Contains(g.VMID) {
+			continue
+		}
+		if g.HasTag(config.NoAutostartTag) {
+			c.log.Info("leaving guest stopped", "vmid", g.VMID, "tag", config.NoAutostartTag)
+			continue
+		}
+		want = append(want, state.GuestRef{VMID: g.VMID, Type: string(g.Type)})
+	}
+	if len(want) == 0 {
+		return nil
+	}
+	return c.startAll(ctx, want)
+}
+
 func (c *Controller) startAll(ctx context.Context, guests []state.GuestRef) error {
 	ids := refIDs(guests)
 	upid, err := c.px.StartAll(ctx, c.cfg.Proxmox.Node, ids)

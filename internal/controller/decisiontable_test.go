@@ -14,8 +14,8 @@ import (
 type row struct {
 	Mode, Hold, Signal, Node, Guest, Request, Grace string
 	NextMode, Wish                                  string
-	Migrate, Stop, Start, StartReq                  []int
-	Poweroff, Wake                                  bool
+	Migrate, Stop, StartReq                         []int
+	Poweroff, Wake, RestoreStopped                  bool
 	GraceAction, Reason                             string
 }
 
@@ -47,7 +47,6 @@ func TestGenerateDecisionTable(t *testing.T) {
 								s := Snapshot{
 									Surplus: surplus[sig], SoC: 90, NodeUp: nodeUp, Mode: mode,
 									NodeUptime: time.Hour,
-									StoppedSet: []state.GuestRef{{VMID: 301, Type: "qemu"}},
 									ManualShed: hold == "hold off",
 									ManualOn:   hold == "hold on",
 								}
@@ -80,7 +79,7 @@ func TestGenerateDecisionTable(t *testing.T) {
 									Guest:   map[bool]string{true: "yes", false: "no"}[guest],
 									Request: map[bool]string{true: "yes", false: "no"}[req],
 									Grace:   grace, NextMode: string(p.NextMode), Wish: powerWish(p, s),
-									Migrate: ids(p.Migrate), Stop: ids(p.Stop), Start: refIDs(p.Start),
+									Migrate: ids(p.Migrate), Stop: ids(p.Stop), RestoreStopped: p.RestoreStopped,
 									StartReq: p.StartRequested, Poweroff: p.Poweroff, Wake: p.Wake,
 									GraceAction: ga, Reason: p.Reason,
 								})

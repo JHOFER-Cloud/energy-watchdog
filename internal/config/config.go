@@ -219,6 +219,11 @@ type PowerAPI struct {
 	Token string `yaml:"token"`
 }
 
+// NoAutostartTag is a Proxmox guest tag that exempts a guest from the good-morning restore
+// (`qm set <id> --tags en_no-autostart`). It is declared on the guest rather than inferred,
+// because a guest stopped by hand is indistinguishable from one a shutdown killed.
+const NoAutostartTag = "en_no-autostart"
+
 // Proxmox configures the cluster API client and the host under management.
 type Proxmox struct {
 	// Endpoint must stay reachable while the managed node is off. The proxy fronting

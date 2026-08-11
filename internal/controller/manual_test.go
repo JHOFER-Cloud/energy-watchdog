@@ -49,7 +49,7 @@ func TestDecideManualShed(t *testing.T) {
 		{
 			// Requirement: surplus is way past headroom and it still must not wake.
 			name:     "shed, big surplus, manual shed -> stays shed, no wake",
-			snap:     Snapshot{Surplus: 4000, SoC: 90, NodeUp: false, Mode: state.ModeShed, ManualShed: true, StoppedSet: []state.GuestRef{{VMID: 301, Type: "qemu"}}},
+			snap:     Snapshot{Surplus: 4000, SoC: 90, NodeUp: false, Mode: state.ModeShed, ManualShed: true},
 			wantMode: state.ModeShed,
 			wantWake: false,
 		},
@@ -76,7 +76,7 @@ func TestDecideManualShed(t *testing.T) {
 		{
 			// Clearing the flag hands control straight back to the sun.
 			name:     "shed, surplus, manual shed cleared -> normal wake",
-			snap:     Snapshot{Surplus: 4000, SoC: 90, NodeUp: false, Mode: state.ModeShed, ManualShed: false, StoppedSet: []state.GuestRef{{VMID: 301, Type: "qemu"}}},
+			snap:     Snapshot{Surplus: 4000, SoC: 90, NodeUp: false, Mode: state.ModeShed, ManualShed: false},
 			wantMode: state.ModeRunning,
 			wantWake: true,
 		},
@@ -111,17 +111,16 @@ func TestDecideManualShed(t *testing.T) {
 // permanent surplus. Every case runs at a deficit that would normally shed the node.
 func TestDecideManualOn(t *testing.T) {
 	cfg := testCfg(t)
-	stopped := []state.GuestRef{{VMID: 301, Type: "qemu"}}
 
 	tests := []struct {
-		name      string
-		snap      Snapshot
-		wantMode  state.Mode
-		wantStop  []int
-		wantStart []int
-		wantPower bool
-		wantWake  bool
-		wantGrace int64
+		name        string
+		snap        Snapshot
+		wantMode    state.Mode
+		wantStop    []int
+		wantRestore bool
+		wantPower   bool
+		wantWake    bool
+		wantGrace   int64
 	}{
 		{
 			name:     "running, deficit, manual on -> stays running, sheds nothing",
@@ -130,11 +129,11 @@ func TestDecideManualOn(t *testing.T) {
 		},
 		{
 			// The 1am case: p1 is off, you need the whole cluster, there is no sun.
-			name:      "shed, deficit, manual on -> wake and restart what we stopped",
-			snap:      Snapshot{Surplus: -800, SoC: 20, NodeUp: false, Mode: state.ModeShed, ManualOn: true, StoppedSet: stopped},
-			wantMode:  state.ModeRunning,
-			wantWake:  true,
-			wantStart: []int{301},
+			name:        "shed, deficit, manual on -> wake and restart what we stopped",
+			snap:        Snapshot{Surplus: -800, SoC: 20, NodeUp: false, Mode: state.ModeShed, ManualOn: true},
+			wantMode:    state.ModeRunning,
+			wantWake:    true,
+			wantRestore: true,
 		},
 		{
 			// Hold-on has to survive p1 dying, or it means "never sheds" rather than "stays
@@ -146,17 +145,18 @@ func TestDecideManualOn(t *testing.T) {
 		},
 		{
 			// A flat battery must not veto a deliberate hold, unlike a solar wake.
-			name:     "shed, empty battery, manual on -> still wakes",
-			snap:     Snapshot{Surplus: -800, SoC: 0, NodeUp: false, Mode: state.ModeShed, ManualOn: true},
-			wantMode: state.ModeRunning,
-			wantWake: true,
+			name:        "shed, empty battery, manual on -> still wakes",
+			snap:        Snapshot{Surplus: -800, SoC: 0, NodeUp: false, Mode: state.ModeShed, ManualOn: true},
+			wantMode:    state.ModeRunning,
+			wantWake:    true,
+			wantRestore: true,
 		},
 		{
 			// Holding on mid-session ends the grace clock instead of letting it power p1 off.
-			name:      "gaming, grace elapsed, manual on -> back to running, no poweroff",
-			snap:      Snapshot{Surplus: -800, SoC: 20, NodeUp: true, Guests: []proxmox.Guest{qemu(601, false)}, Mode: state.ModeGaming, ManualOn: true, GraceSince: testNow.Add(-11 * time.Minute).Unix(), StoppedSet: stopped},
-			wantMode:  state.ModeRunning,
-			wantStart: []int{301},
+			name:        "gaming, grace elapsed, manual on -> back to running, no poweroff",
+			snap:        Snapshot{Surplus: -800, SoC: 20, NodeUp: true, Guests: []proxmox.Guest{qemu(601, false)}, Mode: state.ModeGaming, ManualOn: true, GraceSince: testNow.Add(-11 * time.Minute).Unix()},
+			wantMode:    state.ModeRunning,
+			wantRestore: true,
 		},
 		{
 			// Both set by hand in intent.json: the shed wins, because that is the one protecting
@@ -186,8 +186,8 @@ func TestDecideManualOn(t *testing.T) {
 			if !equal(ids(p.Stop), tt.wantStop) {
 				t.Errorf("stop = %v, want %v", ids(p.Stop), tt.wantStop)
 			}
-			if !equal(refIDs(p.Start), tt.wantStart) {
-				t.Errorf("start = %v, want %v", refIDs(p.Start), tt.wantStart)
+			if p.RestoreStopped != tt.wantRestore {
+				t.Errorf("restoreStopped = %v, want %v", p.RestoreStopped, tt.wantRestore)
 			}
 			if p.Poweroff != tt.wantPower {
 				t.Errorf("poweroff = %v, want %v (%s)", p.Poweroff, tt.wantPower, p.Reason)
