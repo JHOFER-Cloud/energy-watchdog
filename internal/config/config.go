@@ -28,6 +28,10 @@ type Config struct {
 	// cut the session short. Default 10m.
 	GamingGrace Duration `yaml:"gamingGrace"`
 
+	// PowerAPI delegates p1's power to nut-dog. Unset means the watchdog powers p1
+	// itself over Proxmox (WoL relay + node shutdown), which is what local runs use.
+	PowerAPI *PowerAPI `yaml:"powerAPI"`
+
 	Prometheus   Prometheus   `yaml:"prometheus"`
 	Proxmox      Proxmox      `yaml:"proxmox"`
 	Guests       Guests       `yaml:"guests"`
@@ -206,6 +210,15 @@ type Prometheus struct {
 	BatteryMetric     string `yaml:"batteryMetric"`
 }
 
+// PowerAPI points at nut-dog's power endpoint. nut-dog owns p1's power because it
+// must work when the cluster doesn't; the watchdog only states what it wants.
+type PowerAPI struct {
+	URL  string `yaml:"url"`  // base URL, e.g. http://nut-dog.energy.svc.cluster.local:9335
+	Load string `yaml:"load"` // nut-dog load name for the managed node
+	// Token authenticates the request. Usually injected via POWER_API_TOKEN.
+	Token string `yaml:"token"`
+}
+
 // Proxmox configures the cluster API client and the host under management.
 type Proxmox struct {
 	// Endpoint must stay reachable while the managed node is off. The proxy fronting
@@ -319,6 +332,9 @@ func Load(path string) (*Config, error) {
 	if secret := os.Getenv("PROXMOX_TOKEN_SECRET"); secret != "" {
 		c.Proxmox.TokenSecret = secret
 	}
+	if t := os.Getenv("POWER_API_TOKEN"); t != "" && c.PowerAPI != nil {
+		c.PowerAPI.Token = t
+	}
 
 	c.defaults()
 	if err := c.validate(); err != nil {
@@ -384,6 +400,10 @@ func (c *Config) validate() error {
 		return fmt.Errorf("proxmox token missing (set proxmox.tokenID/tokenSecret or PROXMOX_TOKEN_ID/PROXMOX_TOKEN_SECRET)")
 	case len(c.Alertmanager.URLs) > 0 && len(c.Alertmanager.Silences) == 0:
 		return fmt.Errorf("alertmanager.silences must be set when alertmanager.urls is configured")
+	case c.PowerAPI != nil && (c.PowerAPI.URL == "" || c.PowerAPI.Load == ""):
+		return fmt.Errorf("powerAPI needs url and load")
+	case c.PowerAPI != nil && c.PowerAPI.Token == "":
+		return fmt.Errorf("powerAPI token missing (set powerAPI.token or POWER_API_TOKEN)")
 	}
 	if c.Prometheus.HeadroomWatts < c.Prometheus.ShedBelowWatts {
 		return fmt.Errorf("prometheus.headroomWatts (%v) must be >= shedBelowWatts (%v) for stable hysteresis",

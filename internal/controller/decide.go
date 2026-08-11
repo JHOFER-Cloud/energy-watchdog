@@ -30,6 +30,8 @@ type Snapshot struct {
 	GraceSince int64 // unix time the gaming grace clock started; 0 when not running
 	// ManualShed holds the node shed regardless of surplus (state.Intent.Shed).
 	ManualShed bool
+	// ManualOn holds the node up regardless of surplus (state.Intent.On).
+	ManualOn bool
 	// Wake are the live self-service requests, already filtered to the gaming guard and deduped.
 	Wake []state.WakeRequest
 	// WakeDone is the persisted spent-request marker; see state.State.WakeDone.
@@ -125,11 +127,14 @@ func refs(guests []proxmox.Guest) []state.GuestRef {
 // (the JHC-504 comment logic) is unit-testable without touching hardware.
 func Decide(s Snapshot, cfg *config.Config, now time.Time) Plan {
 	sig := classify(s.Surplus, s.SoC, cfg.Prometheus)
-	// A manual shed is just a permanent deficit: every existing rule - gaming guard, grace
-	// window, the shed-mode wake inhibit nut-dog reads - then applies unchanged, and surplus
-	// can no longer wake the node.
-	if s.ManualShed {
+	// The manual holds are a pinned signal, not a fourth mode: every existing rule - gaming
+	// guard, grace window, wake requests - then applies unchanged. Shed first, so a
+	// hand-edited intent setting both can't override a heatwave shed.
+	switch {
+	case s.ManualShed:
 		sig = sigDeficit
+	case s.ManualOn:
+		sig = sigSurplus // bypasses minBatteryPercent: a manual hold outranks the battery
 	}
 	gaming := s.NodeUp && gamingActive(s.Guests, cfg.Guests.GamingGuard)
 	pending, wakeDone := resolveWake(s.Wake, s.Guests, s.WakeDone)
@@ -146,6 +151,16 @@ func Decide(s Snapshot, cfg *config.Config, now time.Time) Plan {
 
 	switch s.Mode {
 	case state.ModeRunning:
+		if !s.NodeUp {
+			// Running means p1 is up; something else took it down (nut-dog on a UPS event, a
+			// crash, a human). Correct the mode so ModeShed's rules own the wake - this plans
+			// no power action itself. Without it a hold-on is stranded: it pins the signal to
+			// surplus, which is exactly what closes off the deficit path that rescues the
+			// other cases.
+			p.NextMode = state.ModeShed
+			p.Reason = "p1 went down while running: back to shed"
+			break
+		}
 		if sig != sigDeficit {
 			break
 		}
@@ -231,6 +246,14 @@ func Decide(s Snapshot, cfg *config.Config, now time.Time) Plan {
 			// Still within the grace window: hold p1 up and keep waiting for a VM.
 			p.Reason = "within gaming grace period: holding p1 up"
 		}
+	}
+	// A pinned signal makes the reasons read as if solar decided ("surplus returned" at
+	// midnight); name who actually did.
+	switch {
+	case s.ManualShed && p.Reason != "":
+		p.Reason += " (held off by hand)"
+	case s.ManualOn && p.Reason != "":
+		p.Reason += " (held on by hand)"
 	}
 	// One rule for every mode: start what was asked for wherever the node is up, or about to
 	// be. Never on the way down - a VM started into a power-off would just die with it.

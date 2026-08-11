@@ -14,8 +14,7 @@ import (
 )
 
 // TestDecideManualShed covers the operator-set shed: it must behave exactly like a
-// solar-triggered one, including the gaming guard and the wake inhibit, but never wake on
-// surplus. Every case here runs with a surplus that would normally wake or hold the node.
+// solar-triggered one, including the gaming guard, but never wake on surplus. Every case here runs with a surplus that would normally wake or hold the node.
 func TestDecideManualShed(t *testing.T) {
 	cfg := testCfg(t)
 
@@ -48,7 +47,7 @@ func TestDecideManualShed(t *testing.T) {
 			wantPower:   false,
 		},
 		{
-			// Requirement: wake inhibit. Surplus is way past headroom and it still must not wake.
+			// Requirement: surplus is way past headroom and it still must not wake.
 			name:     "shed, big surplus, manual shed -> stays shed, no wake",
 			snap:     Snapshot{Surplus: 4000, SoC: 90, NodeUp: false, Mode: state.ModeShed, ManualShed: true, StoppedSet: []state.GuestRef{{VMID: 301, Type: "qemu"}}},
 			wantMode: state.ModeShed,
@@ -103,6 +102,101 @@ func TestDecideManualShed(t *testing.T) {
 			}
 			if p.Wake != tt.wantWake {
 				t.Errorf("wake = %v, want %v (%s)", p.Wake, tt.wantWake, p.Reason)
+			}
+		})
+	}
+}
+
+// TestDecideManualOn is the mirror: the operator-set hold-on must behave exactly like a
+// permanent surplus. Every case runs at a deficit that would normally shed the node.
+func TestDecideManualOn(t *testing.T) {
+	cfg := testCfg(t)
+	stopped := []state.GuestRef{{VMID: 301, Type: "qemu"}}
+
+	tests := []struct {
+		name      string
+		snap      Snapshot
+		wantMode  state.Mode
+		wantStop  []int
+		wantStart []int
+		wantPower bool
+		wantWake  bool
+		wantGrace int64
+	}{
+		{
+			name:     "running, deficit, manual on -> stays running, sheds nothing",
+			snap:     Snapshot{Surplus: -800, SoC: 20, NodeUp: true, Guests: []proxmox.Guest{qemu(101, true), qemu(301, true)}, Mode: state.ModeRunning, ManualOn: true},
+			wantMode: state.ModeRunning,
+		},
+		{
+			// The 1am case: p1 is off, you need the whole cluster, there is no sun.
+			name:      "shed, deficit, manual on -> wake and restart what we stopped",
+			snap:      Snapshot{Surplus: -800, SoC: 20, NodeUp: false, Mode: state.ModeShed, ManualOn: true, StoppedSet: stopped},
+			wantMode:  state.ModeRunning,
+			wantWake:  true,
+			wantStart: []int{301},
+		},
+		{
+			// Hold-on has to survive p1 dying, or it means "never sheds" rather than "stays
+			// up". Running plans no wake, so the mode is corrected to shed and the next tick
+			// wakes it - through nut-dog, which refuses if a UPS is critical.
+			name:     "running, p1 gone, manual on -> back to shed so the wake can happen",
+			snap:     Snapshot{Surplus: -800, SoC: 20, NodeUp: false, Mode: state.ModeRunning, ManualOn: true},
+			wantMode: state.ModeShed,
+		},
+		{
+			// A flat battery must not veto a deliberate hold, unlike a solar wake.
+			name:     "shed, empty battery, manual on -> still wakes",
+			snap:     Snapshot{Surplus: -800, SoC: 0, NodeUp: false, Mode: state.ModeShed, ManualOn: true},
+			wantMode: state.ModeRunning,
+			wantWake: true,
+		},
+		{
+			// Holding on mid-session ends the grace clock instead of letting it power p1 off.
+			name:      "gaming, grace elapsed, manual on -> back to running, no poweroff",
+			snap:      Snapshot{Surplus: -800, SoC: 20, NodeUp: true, Guests: []proxmox.Guest{qemu(601, false)}, Mode: state.ModeGaming, ManualOn: true, GraceSince: testNow.Add(-11 * time.Minute).Unix(), StoppedSet: stopped},
+			wantMode:  state.ModeRunning,
+			wantStart: []int{301},
+		},
+		{
+			// Both set by hand in intent.json: the shed wins, because that is the one protecting
+			// hardware from a heatwave.
+			name:      "both holds set -> shed wins",
+			snap:      Snapshot{Surplus: 4000, SoC: 90, NodeUp: true, Guests: []proxmox.Guest{qemu(301, true)}, Mode: state.ModeRunning, ManualShed: true, ManualOn: true},
+			wantMode:  state.ModeShed,
+			wantStop:  []int{301},
+			wantPower: true,
+		},
+		{
+			// Clearing it hands control straight back to the sun, deficit and all.
+			name:      "running, deficit, manual on cleared -> normal shed",
+			snap:      Snapshot{Surplus: -800, SoC: 20, NodeUp: true, Guests: []proxmox.Guest{qemu(301, true)}, Mode: state.ModeRunning, ManualOn: false},
+			wantMode:  state.ModeShed,
+			wantStop:  []int{301},
+			wantPower: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p := Decide(tt.snap, cfg, testNow)
+			if p.NextMode != tt.wantMode {
+				t.Errorf("mode = %q, want %q (%s)", p.NextMode, tt.wantMode, p.Reason)
+			}
+			if !equal(ids(p.Stop), tt.wantStop) {
+				t.Errorf("stop = %v, want %v", ids(p.Stop), tt.wantStop)
+			}
+			if !equal(refIDs(p.Start), tt.wantStart) {
+				t.Errorf("start = %v, want %v", refIDs(p.Start), tt.wantStart)
+			}
+			if p.Poweroff != tt.wantPower {
+				t.Errorf("poweroff = %v, want %v (%s)", p.Poweroff, tt.wantPower, p.Reason)
+			}
+			if p.Wake != tt.wantWake {
+				t.Errorf("wake = %v, want %v (%s)", p.Wake, tt.wantWake, p.Reason)
+			}
+			if p.GraceSince != tt.wantGrace {
+				t.Errorf("graceSince = %d, want %d (%s)", p.GraceSince, tt.wantGrace, p.Reason)
 			}
 		})
 	}

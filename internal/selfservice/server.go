@@ -89,7 +89,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/status", s.handleStatus)
 	mux.HandleFunc("POST /api/vms/{vmid}/start", s.handleStart)
 	mux.HandleFunc("POST /api/vms/{vmid}/power/{action}", s.handlePower)
-	mux.HandleFunc("POST /api/admin/shed", s.handleShed)
+	mux.HandleFunc("POST /api/admin/hold", s.handleHold)
 	return mux
 }
 
@@ -220,6 +220,7 @@ type statusResponse struct {
 	NodeUp     bool        `json:"nodeUp"`
 	Activity   string      `json:"activity,omitempty"`
 	ManualShed bool        `json:"manualShed"`
+	ManualOn   bool        `json:"manualOn"`
 	VMs        []vmStatus  `json:"vms"`
 	Impact     *shedImpact `json:"impact,omitempty"`
 	Error      string      `json:"error,omitempty"`
@@ -268,13 +269,15 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	v := s.view(r.Context())
 	requested := s.liveRequests(r.Context(), intent)
+	manualShed, manualOn := intent.Holds()
 
 	resp := statusResponse{
 		User:       id.User,
 		Admin:      s.cfg.SelfService.IsAdmin(id.Groups),
 		NodeUp:     v.nodeUp,
 		Activity:   s.nudge.Activity(),
-		ManualShed: intent.Shed,
+		ManualShed: manualShed,
+		ManualOn:   manualOn,
 	}
 	if v.err != nil {
 		resp.Error = "cannot reach Proxmox right now"
@@ -451,21 +454,34 @@ func (s *Server) expireView() {
 	s.cached.at = time.Time{}
 }
 
-func (s *Server) handleShed(w http.ResponseWriter, r *http.Request) {
+// holds are the three positions of the admin control, as the pair of intent flags each one
+// sets. Going through one endpoint is what stops the UI ever setting both.
+var holds = map[string]struct{ shed, on bool }{
+	"shed":  {shed: true},
+	"on":    {on: true},
+	"solar": {},
+}
+
+func (s *Server) handleHold(w http.ResponseWriter, r *http.Request) {
 	id, ok := s.identify(w, r)
 	if !ok {
 		return
 	}
 	if !s.cfg.SelfService.IsAdmin(id.Groups) {
-		s.log.Warn("self-service: denied shed toggle", "user", id.User)
+		s.log.Warn("self-service: denied hold change", "user", id.User)
 		http.Error(w, "admin only", http.StatusForbidden)
 		return
 	}
 	var body struct {
-		Shed *bool `json:"shed"`
+		Hold string `json:"hold"`
 	}
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<10)).Decode(&body); err != nil || body.Shed == nil {
-		http.Error(w, `want {"shed": true|false}`, http.StatusBadRequest)
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<10)).Decode(&body); err != nil {
+		http.Error(w, `want {"hold": "shed"|"on"|"solar"}`, http.StatusBadRequest)
+		return
+	}
+	want, ok := holds[body.Hold]
+	if !ok {
+		http.Error(w, `want {"hold": "shed"|"on"|"solar"}`, http.StatusBadRequest)
 		return
 	}
 	intent, err := s.store.LoadIntent(r.Context())
@@ -473,14 +489,14 @@ func (s *Server) handleShed(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, http.StatusInternalServerError, "read intent", err)
 		return
 	}
-	intent.Shed = *body.Shed
+	intent.Shed, intent.On = want.shed, want.on
 	if err := s.store.SaveIntent(r.Context(), intent); err != nil {
 		s.fail(w, http.StatusInternalServerError, "save intent", err)
 		return
 	}
-	s.log.Warn("self-service: manual shed toggled", "user", id.User, "shed", intent.Shed)
+	s.log.Warn("self-service: hold changed", "user", id.User, "hold", body.Hold)
 	s.nudge.Nudge()
-	writeJSON(w, http.StatusOK, map[string]any{"manualShed": intent.Shed})
+	writeJSON(w, http.StatusOK, map[string]any{"manualShed": intent.Shed, "manualOn": intent.On})
 }
 
 // identify authenticates the caller, writing the error response itself when it fails. A

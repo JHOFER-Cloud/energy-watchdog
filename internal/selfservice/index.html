@@ -82,6 +82,14 @@
   .admin h2 { font-size: .95rem; margin: 0 0 .6rem; }
   .admin p { color: var(--muted); font-size: .85rem; margin: 0 0 .8rem; }
   .row { display: flex; align-items: center; gap: .75rem; }
+  .row + .row { margin-top: .6rem; }
+  .row[hidden] { display: none; } /* the flex above outranks the hidden attribute otherwise */
+  /* Three positions of one control: the override is a choice, never two toggles to reconcile. */
+  .seg { display: inline-flex; border: 1px solid var(--line); border-radius: .45rem; overflow: hidden; }
+  .seg button { background: transparent; color: var(--fg); border: none; border-left: 1px solid var(--line); border-radius: 0; }
+  .seg button:first-child { border-left: none; }
+  .seg button[aria-pressed="true"] { background: var(--accent); color: #fff; }
+  .seg button[data-hold="shed"][aria-pressed="true"] { background: #b3261e; }
   .err { color: var(--warn); font-size: .85rem; min-height: 1.2em; margin-top: 1rem; }
   .warn { color: var(--warn); font-size: .85rem; margin: .8rem 0 0; }
   button.danger { background: #b3261e; color: #fff; border-color: transparent; }
@@ -122,20 +130,33 @@
     <b>Manual shed is on.</b> p1 is being held off on purpose. Starting a desktop VM still
     works and will wake it.
   </div>
+  <div class="banner" id="onBanner">
+    <b>p1 is held on.</b> It stays up regardless of solar surplus until someone hands control
+    back to the sun.
+  </div>
 
   <div id="vms"></div>
   <div class="err" id="err"></div>
 
   <section class="admin" id="admin">
     <h2>Admin</h2>
-    <p>Hold p1 off regardless of solar surplus &mdash; for a heatwave or maintenance. Gaming
-       still works: a desktop VM request wakes it anyway.</p>
+    <p>Override the solar signal. <b>Hold off</b> keeps p1 down through a heatwave or
+       maintenance; <b>hold on</b> keeps it up and restarts the guests the watchdog stopped,
+       for the night you need the whole cluster. Gaming works either way: a desktop VM request
+       wakes p1 regardless.</p>
     <div class="row">
-      <button id="shedBtn" class="secondary"></button>
-      <button id="shedCancel" class="secondary" hidden>Cancel</button>
-      <span class="who" id="shedState"></span>
+      <div class="seg" id="hold">
+        <button data-hold="shed">Hold off</button>
+        <button data-hold="solar">Follow solar</button>
+        <button data-hold="on">Hold on</button>
+      </div>
+      <span class="who" id="holdState"></span>
     </div>
-    <p id="shedWarn" class="warn" hidden></p>
+    <p id="holdWarn" class="warn" hidden></p>
+    <div class="row" id="holdConfirm" hidden>
+      <button id="holdYes" class="danger"></button>
+      <button id="holdCancel" class="secondary">Cancel</button>
+    </div>
   </section>
 </main>
 
@@ -162,12 +183,12 @@ async function api(path, opts) {
 function render(s) {
   document.getElementById("who").textContent = s.user;
   document.getElementById("shedBanner").classList.toggle("on", s.manualShed);
+  document.getElementById("onBanner").classList.toggle("on", s.manualOn);
   document.getElementById("admin").classList.toggle("on", s.admin);
   if (s.admin) {
     lastImpact = s.impact || null;
-    manualShed = s.manualShed;
-    if (!confirming) paintShedButton();
-    document.getElementById("shedState").textContent = s.manualShed ? "manual" : "following solar";
+    hold = s.manualShed ? "shed" : s.manualOn ? "on" : "solar";
+    if (!pending) paintHold();
   }
 
   // If p1 disappeared while a request was outstanding, the loop is mid-shutdown. Say so.
@@ -274,11 +295,19 @@ function powerButton(vm, action, label, confirm) {
   return b;
 }
 
-let manualShed = false, lastImpact = null, confirming = false;
+// hold is the position the loop is actually in; pending is the one awaiting confirmation, and
+// suppresses the repaint so a poll landing mid-confirm can't clear the dialog.
+let hold = "solar", pending = null, lastImpact = null;
 
-const shedBtn = document.getElementById("shedBtn");
-const shedCancel = document.getElementById("shedCancel");
-const shedWarn = document.getElementById("shedWarn");
+const holdSeg = document.getElementById("hold");
+const holdState = document.getElementById("holdState");
+const holdConfirm = document.getElementById("holdConfirm");
+const holdYes = document.getElementById("holdYes");
+const holdWarn = document.getElementById("holdWarn");
+
+const HOLD_STATE = {
+  shed: "held off", solar: "following solar", on: "held on",
+};
 
 // Spells out what holding p1 off does right now. Stopping guests and powering the host down
 // is not something to do on a stray click, and "are you sure?" without numbers is useless.
@@ -292,41 +321,63 @@ function impactText(i) {
          `Migrated guests do not come back automatically.`;
 }
 
-function paintShedButton() {
-  confirming = false;
-  shedBtn.textContent = manualShed ? "Resume solar control" : "Hold p1 off";
-  shedBtn.className = "secondary";
-  shedCancel.hidden = true;
-  shedWarn.hidden = true;
+function paintHold() {
+  pending = null;
+  for (const b of holdSeg.children) b.setAttribute("aria-pressed", b.dataset.hold === hold);
+  holdState.textContent = HOLD_STATE[hold];
+  holdConfirm.hidden = true;
+  holdWarn.hidden = true;
 }
 
-async function setShed(on) {
+// All three positions move power, and which way depends on the surplus at the moment you
+// click, which this page doesn't show. So every one of them confirms.
+function confirmText(target) {
+  if (target === "shed") return impactText(lastImpact);
+  if (target === "on") {
+    return "This wakes p1 if it is off and restarts the guests the watchdog stopped. It then " +
+           "stays up regardless of surplus — overnight that means grid power — until someone " +
+           "switches back to following solar.";
+  }
+  const solar = "The surplus decides from here, not you: with sun p1 wakes and the guests " +
+                "the watchdog stopped come back; without, it stays down.";
+  // Only worth pricing the shed when there is something to shed. With p1 already off the
+  // impact is all zeroes, and quoting it would promise a power-off where a wake is due.
+  if (!lastNodeUp) return solar;
+  return "The surplus decides from here, not you: with sun p1 stays up; without, it sheds on " +
+         "the next tick. " + impactText(lastImpact);
+}
+
+async function setHold(target) {
+  holdYes.disabled = true;
   try {
-    await api("/api/admin/shed", {
+    await api("/api/admin/hold", {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ shed: on }),
+      body: JSON.stringify({ hold: target }),
     });
+    // Only on success: a failed call must leave the control showing where the loop still is.
+    hold = target;
   } catch (err) { show(err.message); }
-  paintShedButton();
+  holdYes.disabled = false;
+  paintHold();
   poll();
 }
 
-shedBtn.onclick = () => {
-  // Resuming solar control is harmless, so it goes straight through. Shedding asks first.
-  if (manualShed) { setShed(false); return; }
-  if (!confirming) {
-    confirming = true;
-    shedBtn.textContent = "Yes, hold p1 off";
-    shedBtn.className = "danger";
-    shedCancel.hidden = false;
-    shedWarn.textContent = impactText(lastImpact);
-    shedWarn.hidden = false;
-    return;
-  }
-  setShed(true);
+const CONFIRM_LABEL = {
+  shed: "Yes, hold p1 off", on: "Yes, hold p1 on", solar: "Yes, follow solar",
 };
 
-shedCancel.onclick = paintShedButton;
+holdSeg.onclick = (e) => {
+  const target = e.target.dataset && e.target.dataset.hold;
+  if (!target || target === hold) return;
+  pending = target;
+  holdYes.textContent = CONFIRM_LABEL[target];
+  holdConfirm.hidden = false;
+  holdWarn.textContent = confirmText(target);
+  holdWarn.hidden = false;
+};
+
+holdYes.onclick = () => setHold(pending);
+document.getElementById("holdCancel").onclick = paintHold;
 
 async function poll() {
   try { render(await api("/api/status")); }

@@ -18,6 +18,7 @@ import (
 	"github.com/JHOFER-Cloud/energy-watchdog/internal/alertmgr"
 	"github.com/JHOFER-Cloud/energy-watchdog/internal/config"
 	"github.com/JHOFER-Cloud/energy-watchdog/internal/metrics"
+	"github.com/JHOFER-Cloud/energy-watchdog/internal/powerapi"
 	"github.com/JHOFER-Cloud/energy-watchdog/internal/prom"
 	"github.com/JHOFER-Cloud/energy-watchdog/internal/proxmox"
 	"github.com/JHOFER-Cloud/energy-watchdog/internal/state"
@@ -25,8 +26,11 @@ import (
 
 // Controller wires the clients and persisted state together.
 type Controller struct {
-	cfg     *config.Config
-	prom    *prom.Client
+	cfg  *config.Config
+	prom *prom.Client
+	// power delegates p1's on/off to nut-dog. nil means this controller powers p1
+	// itself over Proxmox.
+	power   *powerapi.Client
 	px      *proxmox.Client
 	ams     map[string]*alertmgr.Client
 	store   state.Store
@@ -73,8 +77,12 @@ const observeFailEscalate = 5
 // New builds a Controller. ams is keyed by Alertmanager base URL so a persisted
 // silence can be deleted from the same Alertmanager it was created in.
 func New(cfg *config.Config, p *prom.Client, px *proxmox.Client, ams map[string]*alertmgr.Client, store state.Store, m *metrics.Metrics, log *slog.Logger) *Controller {
-	return &Controller{cfg: cfg, prom: p, px: px, ams: ams, store: store, metrics: m, log: log,
+	c := &Controller{cfg: cfg, prom: p, px: px, ams: ams, store: store, metrics: m, log: log,
 		nudge: make(chan struct{}, 1)}
+	if cfg.PowerAPI != nil {
+		c.power = powerapi.New(cfg.PowerAPI.URL, cfg.PowerAPI.Token, cfg.PowerAPI.Load)
+	}
+	return c
 }
 
 // Run reconciles immediately, then on every interval until ctx is cancelled.
@@ -110,6 +118,11 @@ func (c *Controller) reconcile(ctx context.Context) {
 			c.log.Warn("observe failed", "err", err, "consecutive", c.observeFailures)
 		}
 		c.metrics.MarkStale(now.Unix())
+		// Blind, not silent: going quiet leaves nut-dog deciding p1 from a stale request,
+		// which after a UPS recovery means waking it at whatever hour that lands, with no
+		// solar reading behind it. Hold pins p1 where it is until we can decide again. A
+		// UPS shed still overrides - that direction is never gated.
+		c.holdPower(ctx)
 		return
 	}
 	c.observeFailures = 0
@@ -123,7 +136,8 @@ func (c *Controller) reconcile(ctx context.Context) {
 	// minutes, and reporting its mode and success up front hid every failing apply.
 	c.metrics.Update(metrics.Sample{
 		Surplus: snap.Surplus, SurplusRaw: snap.SurplusRaw, SoC: snap.SoC,
-		NodeUp: snap.NodeUp, Gaming: gaming, ManualShed: snap.ManualShed, Tick: now.Unix(),
+		NodeUp: snap.NodeUp, Gaming: gaming, ManualShed: snap.ManualShed, ManualOn: snap.ManualOn,
+		Tick: now.Unix(),
 	})
 
 	if err := c.apply(ctx, plan, snap); err != nil {
@@ -163,6 +177,13 @@ func (c *Controller) apply(ctx context.Context, p Plan, snap Snapshot) error {
 	case config.DryRunFull:
 		if err := c.reconcileSilences(ctx, p.NextMode != state.ModeRunning); err != nil {
 			return err
+		}
+	}
+	// Restate the power wish every tick, not just on transitions. Skipped when the plan
+	// transitions power itself: execute sends that in order, after the guests are handled.
+	if c.cfg.DryRun == config.DryRunFull && c.power != nil && !p.Wake && !p.Poweroff {
+		if err := c.restatePower(ctx, p, snap); err != nil {
+			c.log.Warn("restate power request", "err", err)
 		}
 	}
 	if isNoop(p, snap) {
@@ -219,6 +240,7 @@ func (c *Controller) observe(ctx context.Context, now time.Time) (Snapshot, bool
 			return Snapshot{Mode: st.Mode}, false, err
 		}
 	}
+	manualShed, manualOn := intent.Holds()
 	snap := Snapshot{
 		Surplus:    reading.Surplus,
 		SurplusRaw: reading.SurplusRaw,
@@ -229,7 +251,8 @@ func (c *Controller) observe(ctx context.Context, now time.Time) (Snapshot, bool
 		Mode:       st.Mode,
 		StoppedSet: st.Stopped,
 		GraceSince: st.GraceSince,
-		ManualShed: intent.Shed,
+		ManualShed: manualShed,
+		ManualOn:   manualOn,
 		Wake:       c.requestedWake(intent, now),
 		WakeDone:   st.WakeDone,
 	}
@@ -330,7 +353,7 @@ func (c *Controller) execute(ctx context.Context, p Plan, snap Snapshot) error {
 			c.log.Error("disable replication before power-off", "err", err)
 		}
 		c.log.Warn("powering off node", "node", c.cfg.Proxmox.Node)
-		if err := c.px.ShutdownNode(ctx, c.cfg.Proxmox.Node); err != nil {
+		if err := c.powerOff(ctx); err != nil {
 			return err
 		}
 	}
@@ -508,14 +531,73 @@ func (c *Controller) startRequested(ctx context.Context, ids []int) error {
 }
 
 func (c *Controller) wake(ctx context.Context) error {
-	mac, err := c.px.WakeOnLAN(ctx, c.cfg.Proxmox.Node)
-	if err != nil {
-		return err
+	if c.power != nil {
+		// nut-dog owns the WoL: its packet doesn't need another Proxmox node to relay it,
+		// which is exactly what a full shed leaves us without.
+		if err := c.requestPower(ctx, powerapi.On, "solar surplus"); err != nil {
+			return err
+		}
+		c.log.Info("asked nut-dog to power on", "node", c.cfg.Proxmox.Node)
+	} else {
+		mac, err := c.px.WakeOnLAN(ctx, c.cfg.Proxmox.Node)
+		if err != nil {
+			return err
+		}
+		c.log.Info("sent Wake-on-LAN", "mac", mac, "node", c.cfg.Proxmox.Node)
 	}
-	c.log.Info("sent Wake-on-LAN", "mac", mac, "node", c.cfg.Proxmox.Node)
 	wctx, cancel := context.WithTimeout(ctx, c.cfg.Proxmox.WakeTimeout.Duration)
 	defer cancel()
 	return c.px.WaitNodeUp(wctx, c.cfg.Proxmox.Node)
+}
+
+// powerOff takes p1 down: through nut-dog when it owns the power, else directly.
+func (c *Controller) powerOff(ctx context.Context) error {
+	if c.power != nil {
+		return c.requestPower(ctx, powerapi.Off, "solar deficit")
+	}
+	return c.px.ShutdownNode(ctx, c.cfg.Proxmox.Node)
+}
+
+// powerWish is what to restate for a plan that isn't transitioning power itself. Off comes
+// from the mode already in force, not the planned one: a tick that only corrects the mode to
+// shed hasn't decided anything about power yet, and the next tick may well want p1 back. The
+// same rule covers a shed still in flight - p1 up with the mode already shed - where hold is
+// what stops nut-dog undoing the shed we just asked for.
+func powerWish(p Plan, snap Snapshot) string {
+	switch {
+	case snap.Mode == state.ModeShed && !snap.NodeUp:
+		return powerapi.Off
+	case p.NextMode != state.ModeShed && snap.NodeUp:
+		return powerapi.On
+	default:
+		return powerapi.Hold
+	}
+}
+
+// requestPower sends one power request and records whether it landed. Every path that moves
+// p1 goes through here: all of its power runs over this call now, so a wrong token or load
+// name has to show up on the metric rather than only in a log line.
+func (c *Controller) requestPower(ctx context.Context, desired, reason string) error {
+	err := c.power.Request(ctx, desired, reason)
+	c.metrics.SetPowerRequestOK(err == nil)
+	return err
+}
+
+// holdPower asks nut-dog to leave p1 alone, for when this loop cannot decide. An asserted
+// shed signal survives it: hold emits no action and nut-dog's reconcile is edge-triggered.
+func (c *Controller) holdPower(ctx context.Context) {
+	if c.power == nil || c.cfg.DryRun != config.DryRunFull {
+		return
+	}
+	if err := c.requestPower(ctx, powerapi.Hold, "watchdog cannot observe"); err != nil {
+		c.log.Warn("hold power request", "err", err)
+	}
+}
+
+// restatePower re-sends the wish. nut-dog keeps no state across restarts, so the request has
+// to be level-triggered rather than edge-triggered.
+func (c *Controller) restatePower(ctx context.Context, p Plan, snap Snapshot) error {
+	return c.requestPower(ctx, powerWish(p, snap), "solar")
 }
 
 // replicationMarker prefixes the comment of every replication job the watchdog disables. It
