@@ -326,7 +326,7 @@ func (c *Controller) execute(ctx context.Context, p Plan, snap Snapshot) error {
 		}
 	}
 	if p.Wake {
-		if err := c.wake(ctx); err != nil {
+		if err := c.wake(ctx, p.Reason); err != nil {
 			return err
 		}
 	}
@@ -353,7 +353,7 @@ func (c *Controller) execute(ctx context.Context, p Plan, snap Snapshot) error {
 			c.log.Error("disable replication before power-off", "err", err)
 		}
 		c.log.Warn("powering off node", "node", c.cfg.Proxmox.Node)
-		if err := c.powerOff(ctx); err != nil {
+		if err := c.powerOff(ctx, p.Reason); err != nil {
 			return err
 		}
 	}
@@ -530,11 +530,11 @@ func (c *Controller) startRequested(ctx context.Context, ids []int) error {
 	return nil
 }
 
-func (c *Controller) wake(ctx context.Context) error {
+func (c *Controller) wake(ctx context.Context, reason string) error {
 	if c.power != nil {
 		// nut-dog owns the WoL: its packet doesn't need another Proxmox node to relay it,
 		// which is exactly what a full shed leaves us without.
-		if err := c.requestPower(ctx, powerapi.On, "solar surplus"); err != nil {
+		if err := c.requestPower(ctx, powerapi.On, reason); err != nil {
 			return err
 		}
 		c.log.Info("asked nut-dog to power on", "node", c.cfg.Proxmox.Node)
@@ -551,9 +551,9 @@ func (c *Controller) wake(ctx context.Context) error {
 }
 
 // powerOff takes p1 down: through nut-dog when it owns the power, else directly.
-func (c *Controller) powerOff(ctx context.Context) error {
+func (c *Controller) powerOff(ctx context.Context, reason string) error {
 	if c.power != nil {
-		return c.requestPower(ctx, powerapi.Off, "solar deficit")
+		return c.requestPower(ctx, powerapi.Off, reason)
 	}
 	return c.px.ShutdownNode(ctx, c.cfg.Proxmox.Node)
 }
