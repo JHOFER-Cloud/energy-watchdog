@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/JHOFER-Cloud/energy-watchdog/internal/config"
+	"github.com/JHOFER-Cloud/energy-watchdog/internal/controller"
 	"github.com/JHOFER-Cloud/energy-watchdog/internal/proxmox"
 	"github.com/JHOFER-Cloud/energy-watchdog/internal/state"
 	"gopkg.in/yaml.v3"
@@ -62,11 +63,14 @@ func (f *fakeStore) SaveIntent(_ context.Context, i state.Intent) error {
 type fakeNudge struct {
 	n        int
 	activity string
+	failed   map[int]controller.StartFailure
 }
 
 func (f *fakeNudge) Nudge() { f.n++ }
 
 func (f *fakeNudge) Activity() string { return f.activity }
+
+func (f *fakeNudge) StartFailures() map[int]controller.StartFailure { return f.failed }
 
 // denyAuth stands in for a caller with no valid session.
 type denyAuth struct{}
@@ -93,8 +97,11 @@ func testServer(t *testing.T, auth authenticator, cluster *fakeCluster, store *f
 		t.Fatal(err)
 	}
 	cfg := &config.Config{
-		Guests:  g,
-		Proxmox: config.Proxmox{Node: "pve-1"},
+		Guests: g,
+		// Wake requests are filtered by this, so a zero here silently makes every request in
+		// a fixture dead on arrival.
+		GamingGrace: config.Duration{Duration: 10 * time.Minute},
+		Proxmox:     config.Proxmox{Node: "pve-1"},
 		SelfService: config.SelfService{
 			Addr:        ":8080",
 			AdminGroups: []string{"jhc-admins"},
@@ -274,17 +281,22 @@ func TestPhaseCopy(t *testing.T) {
 		nodeUp    bool
 		running   bool
 		requested bool
+		failed    bool
 		want      string
 	}{
-		{"nothing asked for", false, false, false, "off"},
-		{"asked while p1 is down", false, false, true, "waking"},
-		{"p1 up, VM still booting", true, false, true, "starting"},
-		{"VM running", true, true, true, "ready"},
-		{"running without a request", true, true, false, "ready"},
+		{"nothing asked for", false, false, false, false, "off"},
+		{"asked while p1 is down", false, false, true, false, "waking"},
+		{"p1 up, VM still booting", true, false, true, false, "starting"},
+		{"VM running", true, true, true, false, "ready"},
+		{"running without a request", true, true, false, false, "ready"},
+		{"gave up starting it", true, false, false, true, "failed"},
+		// A VM that came up after the loop gave up reads as ready: the user started it by
+		// hand, and "couldn't start" over a running VM is just wrong.
+		{"failed but running anyway", true, true, false, true, "ready"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := phase(clusterView{nodeUp: tt.nodeUp}, "", tt.running, tt.requested)
+			got := phase(clusterView{nodeUp: tt.nodeUp}, "", tt.running, tt.requested, tt.failed)
 			if got != tt.want {
 				t.Errorf("phase = %q, want %q", got, tt.want)
 			}
@@ -292,8 +304,57 @@ func TestPhaseCopy(t *testing.T) {
 	}
 }
 
-// Proxmox being unreachable must degrade to a message, not a 500: the page still has to
-// render so an admin can toggle the shed.
+// The loop having given up has to reach the user. Leaving the request reading as outstanding
+// would keep the card on "Starting…" with the button disabled until the TTL ran out, which is
+// the state that left editing the ConfigMap as the only way out.
+func TestStatusReportsAVMTheLoopGaveUpOn(t *testing.T) {
+	auth := staticAuth{User: "josef", Groups: []string{"deskvm-josef"}}
+	at := time.Now().Unix()
+	store := &fakeStore{intent: state.Intent{
+		Wake: []state.WakeRequest{{VMID: 601, User: "josef", RequestedAt: at}},
+	}}
+	s, nudge := testServer(t, auth, &fakeCluster{up: true, guests: []proxmox.Guest{{VMID: 601}}}, store)
+	nudge.failed = map[int]controller.StartFailure{
+		601: {Err: "task UPID:x failed: timeout waiting on systemd", RequestedAt: at},
+	}
+
+	var got statusResponse
+	if err := json.Unmarshal(do(t, s, http.MethodGet, "/api/status", "").Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	vm := got.VMs[0]
+	if vm.Phase != "failed" {
+		t.Errorf("phase = %q, want failed", vm.Phase)
+	}
+	if vm.Requested {
+		t.Error("a request the loop has retired still reads as outstanding")
+	}
+	if !strings.Contains(vm.Error, "timeout waiting on systemd") {
+		t.Errorf("error = %q, want the reason in it", vm.Error)
+	}
+}
+
+// A VM that came up anyway - started by hand after the loop gave up - is running, and must
+// read that way rather than carrying the stale failure.
+func TestARunningVMDropsItsRecordedFailure(t *testing.T) {
+	auth := staticAuth{User: "josef", Groups: []string{"deskvm-josef"}}
+	at := time.Now().Unix()
+	store := &fakeStore{intent: state.Intent{
+		Wake: []state.WakeRequest{{VMID: 601, User: "josef", RequestedAt: at}},
+	}}
+	s, nudge := testServer(t, auth,
+		&fakeCluster{up: true, guests: []proxmox.Guest{{VMID: 601, Running: true}}}, store)
+	nudge.failed = map[int]controller.StartFailure{601: {Err: "timeout waiting on systemd", RequestedAt: at}}
+
+	var got statusResponse
+	if err := json.Unmarshal(do(t, s, http.MethodGet, "/api/status", "").Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.VMs[0].Phase != "ready" || got.VMs[0].Error != "" {
+		t.Errorf("vm = %+v, want ready with no error", got.VMs[0])
+	}
+}
+
 func TestStatusSurvivesProxmoxOutage(t *testing.T) {
 	auth := staticAuth{User: "josef", Groups: []string{"deskvm-josef"}}
 	s, _ := testServer(t, auth, &fakeCluster{err: fmt.Errorf("502 bad gateway")}, &fakeStore{})
@@ -319,12 +380,11 @@ func decode(t *testing.T, w *httptest.ResponseRecorder, into any) {
 }
 
 // bothVMs is a caller allowed both desktop VMs, which is what makes a GPU conflict reachable.
-func bothVMs(t *testing.T, cluster *fakeCluster, store *fakeStore) *Server {
+func bothVMs(t *testing.T, cluster *fakeCluster, store *fakeStore) (*Server, *fakeNudge) {
 	t.Helper()
-	s, _ := testServer(t, staticAuth{User: "josef", Groups: []string{"deskvm-josef", "deskvm-other"}}, cluster, store)
+	s, nudge := testServer(t, staticAuth{User: "josef", Groups: []string{"deskvm-josef", "deskvm-other"}}, cluster, store)
 	s.cfg.SelfService.VMs[1].Groups = []string{"deskvm-other", "deskvm-josef"}
-	s.cfg.GamingGrace = config.Duration{Duration: 10 * time.Minute}
-	return s
+	return s, nudge
 }
 
 // Proxmox maps a GPU into one guest at a time, so starting the second is a guaranteed failure.
@@ -335,7 +395,7 @@ func TestStartBlockedByGPUInUse(t *testing.T) {
 		{VMID: 602, Type: proxmox.TypeQEMU},
 	}}
 	store := &fakeStore{}
-	s := bothVMs(t, cluster, store)
+	s, _ := bothVMs(t, cluster, store)
 
 	if rec := do(t, s, "POST", "/api/vms/602/start", ""); rec.Code != http.StatusConflict {
 		t.Errorf("start = %d, want 409 while 601 holds the GPU", rec.Code)
@@ -366,7 +426,7 @@ func TestStartBlockedByGPURequestedWhileNodeDown(t *testing.T) {
 		{VMID: 602, Type: proxmox.TypeQEMU},
 	}}
 	store := &fakeStore{}
-	s := bothVMs(t, cluster, store)
+	s, _ := bothVMs(t, cluster, store)
 
 	if rec := do(t, s, "POST", "/api/vms/601/start", ""); rec.Code != http.StatusAccepted {
 		t.Fatalf("first start = %d, want 202", rec.Code)
@@ -384,7 +444,7 @@ func TestStartNotBlockedByADifferentGPU(t *testing.T) {
 		{VMID: 601, Type: proxmox.TypeQEMU, Running: true},
 		{VMID: 602, Type: proxmox.TypeQEMU},
 	}}
-	s := bothVMs(t, cluster, &fakeStore{})
+	s, _ := bothVMs(t, cluster, &fakeStore{})
 	if rec := do(t, s, "POST", "/api/vms/602/start", ""); rec.Code != http.StatusAccepted {
 		t.Errorf("start = %d, want 202: the VMs are on different GPUs", rec.Code)
 	}
@@ -394,7 +454,7 @@ func TestPowerActions(t *testing.T) {
 	for _, action := range []string{"shutdown", "reboot", "reset", "stop"} {
 		t.Run(action, func(t *testing.T) {
 			cluster := &fakeCluster{up: true, guests: []proxmox.Guest{{VMID: 601, Type: proxmox.TypeQEMU, Running: true}}}
-			s := bothVMs(t, cluster, &fakeStore{})
+			s, _ := bothVMs(t, cluster, &fakeStore{})
 			if rec := do(t, s, "POST", "/api/vms/601/power/"+action, ""); rec.Code != http.StatusAccepted {
 				t.Fatalf("%s = %d, want 202", action, rec.Code)
 			}
@@ -416,7 +476,7 @@ func TestShutdownRetiresTheWakeRequest(t *testing.T) {
 		{VMID: 601, User: "josef", RequestedAt: time.Now().Unix()},
 		{VMID: 602, User: "josef", RequestedAt: time.Now().Unix()},
 	}}}
-	s := bothVMs(t, cluster, store)
+	s, _ := bothVMs(t, cluster, store)
 
 	if rec := do(t, s, "POST", "/api/vms/601/power/shutdown", ""); rec.Code != http.StatusAccepted {
 		t.Fatalf("shutdown = %d, want 202", rec.Code)
@@ -432,7 +492,7 @@ func TestRebootKeepsTheWakeRequest(t *testing.T) {
 	store := &fakeStore{intent: state.Intent{Wake: []state.WakeRequest{
 		{VMID: 601, User: "josef", RequestedAt: time.Now().Unix()},
 	}}}
-	s := bothVMs(t, cluster, store)
+	s, _ := bothVMs(t, cluster, store)
 
 	if rec := do(t, s, "POST", "/api/vms/601/power/reboot", ""); rec.Code != http.StatusAccepted {
 		t.Fatalf("reboot = %d, want 202", rec.Code)
@@ -464,7 +524,7 @@ func TestSpentRequestStopsShowingAsStarting(t *testing.T) {
 		intent: state.Intent{Wake: []state.WakeRequest{{VMID: 601, User: "josef", RequestedAt: clicked}}},
 		st:     state.State{WakeDone: map[int]int64{601: clicked}},
 	}
-	s := bothVMs(t, cluster, store)
+	s, _ := bothVMs(t, cluster, store)
 
 	var resp statusResponse
 	decode(t, do(t, s, "GET", "/api/status", ""), &resp)
@@ -479,6 +539,65 @@ func TestSpentRequestStopsShowingAsStarting(t *testing.T) {
 	}
 }
 
+// A request the loop gave up on is as dead as a spent one, and must release the GPU on the
+// same grounds - all the more so when the GPU conflict is why the start failed.
+func TestRetiredRequestReleasesTheGPU(t *testing.T) {
+	clicked := time.Now().Unix()
+	cluster := &fakeCluster{up: true, gpu: map[int]string{601: "gpu0", 602: "gpu0"}, guests: []proxmox.Guest{
+		{VMID: 601, Type: proxmox.TypeQEMU},
+		{VMID: 602, Type: proxmox.TypeQEMU},
+	}}
+	store := &fakeStore{
+		intent: state.Intent{Wake: []state.WakeRequest{{VMID: 601, User: "josef", RequestedAt: clicked}}},
+	}
+	s, nudge := bothVMs(t, cluster, store)
+	nudge.failed = map[int]controller.StartFailure{601: {Err: "no free GPU", RequestedAt: clicked}}
+
+	if rec := do(t, s, "POST", "/api/vms/602/start", ""); rec.Code != http.StatusAccepted {
+		t.Errorf("start = %d, want 202: 601's request was given up on and its VM is down", rec.Code)
+	}
+}
+
+// Pressing Start again must read as a wake in progress, not as the failure it replaced. The
+// loop retries on the new request, so reporting the old error over it says the click did
+// nothing - and while p1 is off the next attempt is minutes away behind the wake.
+func TestAFreshRequestIsNotPaintedWithTheOldFailure(t *testing.T) {
+	old := time.Now().Add(-time.Minute).Unix()
+	store := &fakeStore{intent: state.Intent{
+		Wake: []state.WakeRequest{{VMID: 601, User: "josef", RequestedAt: old + 30}},
+	}}
+	s, nudge := testServer(t, staticAuth{User: "josef", Groups: []string{"deskvm-josef"}},
+		&fakeCluster{up: false}, store)
+	nudge.failed = map[int]controller.StartFailure{601: {Err: "timeout waiting on systemd", RequestedAt: old}}
+
+	var got statusResponse
+	decode(t, do(t, s, "GET", "/api/status", ""), &got)
+	if got.VMs[0].Error != "" {
+		t.Errorf("error = %q, want none: this failure belongs to a request already replaced", got.VMs[0].Error)
+	}
+	if !got.VMs[0].Requested || got.VMs[0].Phase != "waking" {
+		t.Errorf("vm = %+v, want an outstanding request waking p1", got.VMs[0])
+	}
+}
+
+// Once the failing request ages out there is nothing left to explain, so the card must not
+// keep the amber "Couldn't start" for the rest of the process's life.
+func TestAFailureDiesWithItsRequest(t *testing.T) {
+	stale := time.Now().Add(-time.Hour).Unix()
+	store := &fakeStore{intent: state.Intent{
+		Wake: []state.WakeRequest{{VMID: 601, User: "josef", RequestedAt: stale}},
+	}}
+	s, nudge := testServer(t, staticAuth{User: "josef", Groups: []string{"deskvm-josef"}},
+		&fakeCluster{up: true, guests: []proxmox.Guest{{VMID: 601}}}, store)
+	nudge.failed = map[int]controller.StartFailure{601: {Err: "timeout waiting on systemd", RequestedAt: stale}}
+
+	var got statusResponse
+	decode(t, do(t, s, "GET", "/api/status", ""), &got)
+	if got.VMs[0].Phase != "off" || got.VMs[0].Error != "" {
+		t.Errorf("vm = %+v, want a plain off card once the request has aged out", got.VMs[0])
+	}
+}
+
 // A spent request must not keep holding the GPU either, or the other VM stays blocked forever.
 func TestSpentRequestReleasesTheGPU(t *testing.T) {
 	clicked := time.Now().Unix()
@@ -490,7 +609,7 @@ func TestSpentRequestReleasesTheGPU(t *testing.T) {
 		intent: state.Intent{Wake: []state.WakeRequest{{VMID: 601, User: "josef", RequestedAt: clicked}}},
 		st:     state.State{WakeDone: map[int]int64{601: clicked}},
 	}
-	s := bothVMs(t, cluster, store)
+	s, _ := bothVMs(t, cluster, store)
 	if rec := do(t, s, "POST", "/api/vms/602/start", ""); rec.Code != http.StatusAccepted {
 		t.Errorf("start = %d, want 202: 601's request is spent and its VM is down", rec.Code)
 	}
@@ -505,7 +624,6 @@ func TestRequestDuringAShedSaysSo(t *testing.T) {
 		Wake: []state.WakeRequest{{VMID: 601, User: "josef", RequestedAt: time.Now().Unix()}},
 	}}
 	s, nudge := testServer(t, staticAuth{User: "josef", Groups: []string{"deskvm-josef"}}, cluster, store)
-	s.cfg.GamingGrace = config.Duration{Duration: 10 * time.Minute}
 
 	nudge.activity = "shedding"
 	var resp statusResponse

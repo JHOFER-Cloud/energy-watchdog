@@ -39,6 +39,9 @@ type Store interface {
 type Nudger interface {
 	Nudge()
 	Activity() string
+	// StartFailures is the desktop VMs the loop has given up on starting, so the UI can say
+	// what went wrong instead of showing "Starting…" until the request ages out.
+	StartFailures() map[int]controller.StartFailure
 }
 
 // Server serves the UI and its API.
@@ -166,21 +169,38 @@ func (s *Server) refreshGPUs(ctx context.Context, guests []proxmox.Guest) {
 	s.gpu = next
 }
 
-// liveRequests is the desktop VMs with a wake request still waiting to be acted on. A request
-// whose VM has already been up is spent - it will never start anything again - so counting it
-// would leave the UI stuck on "starting" until the TTL ran out.
-func (s *Server) liveRequests(ctx context.Context, intent state.Intent) map[int]bool {
+// wakeState is one VM's outstanding wake request as the UI needs it: whether the loop is
+// still acting on it, and why it stopped if it has.
+type wakeState struct {
+	pending bool
+	err     string
+}
+
+// liveRequests is each desktop VM's wake request. A request whose VM has already been up is
+// spent - it will never start anything again - so counting it would leave the UI stuck on
+// "starting" until the TTL ran out. One the loop has given up on is equally dead: it is not
+// pending either, so it neither reads as outstanding nor keeps holding its GPU. The failure
+// is only reported while it belongs to the request still outstanding - an older one must not
+// be painted over a newer press of Start, and once the request ages out there is nothing left
+// to explain.
+func (s *Server) liveRequests(ctx context.Context, intent state.Intent) map[int]wakeState {
 	var done map[int]int64
 	if st, err := s.store.Load(ctx); err != nil {
 		s.log.Warn("read state", "err", err)
 	} else {
 		done = st.WakeDone
 	}
-	out := map[int]bool{}
+	failed := s.nudge.StartFailures()
+	out := map[int]wakeState{}
 	for _, req := range intent.LiveWake(time.Now(), s.cfg.GamingGrace.Duration) {
-		if req.RequestedAt > done[req.VMID] {
-			out[req.VMID] = true
+		if req.RequestedAt <= done[req.VMID] {
+			continue
 		}
+		if f, ok := failed[req.VMID]; ok && f.RequestedAt == req.RequestedAt {
+			out[req.VMID] = wakeState{err: f.Err}
+			continue
+		}
+		out[req.VMID] = wakeState{pending: true}
 	}
 	return out
 }
@@ -188,13 +208,13 @@ func (s *Server) liveRequests(ctx context.Context, intent state.Intent) map[int]
 // gpuBlocker reports the VM currently holding vmid's GPU, if any. Proxmox can only map a GPU
 // into one guest at a time, so starting the second is a guaranteed failure. A VM that's only
 // been requested counts: while p1 is off both look equally stopped.
-func (s *Server) gpuBlocker(vmid int, running, requested map[int]bool) (int, bool) {
+func (s *Server) gpuBlocker(vmid int, running map[int]bool, wake map[int]wakeState) (int, bool) {
 	key, ok := s.gpu[vmid]
 	if !ok {
 		return 0, false
 	}
 	for other, otherKey := range s.gpu {
-		if other != vmid && otherKey == key && (running[other] || requested[other]) {
+		if other != vmid && otherKey == key && (running[other] || wake[other].pending) {
 			return other, true
 		}
 	}
@@ -208,10 +228,12 @@ type vmStatus struct {
 	Running    bool   `json:"running"`
 	Requested  bool   `json:"requested"`
 	StreamHost string `json:"streamHost,omitempty"`
-	// Phase drives the UI copy: off, waking, starting, ready.
+	// Phase drives the UI copy: off, waking, starting, failed, ready.
 	Phase string `json:"phase"`
 	// BlockedBy names the VM holding this one's GPU; empty when it is free to start.
 	BlockedBy string `json:"blockedBy,omitempty"`
+	// Error is why the loop stopped trying to start this VM. Pressing Start again re-arms it.
+	Error string `json:"error,omitempty"`
 }
 
 type statusResponse struct {
@@ -288,8 +310,14 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	for _, vm := range s.cfg.SelfService.Allowed(id.Groups) {
 		st := vmStatus{VMID: vm.VMID, Name: vm.Name, StreamHost: vm.StreamHost}
 		st.Running = v.running[vm.VMID]
-		st.Requested = requested[vm.VMID]
-		st.Phase = phase(v, resp.Activity, st.Running, st.Requested)
+		wake := requested[vm.VMID]
+		st.Requested = wake.pending
+		// A VM that came up anyway - started by hand after the loop gave up - is running,
+		// and must read that way rather than carrying the stale failure.
+		if !st.Running {
+			st.Error = wake.err
+		}
+		st.Phase = phase(v, resp.Activity, st.Running, st.Requested, st.Error != "")
 		if other, blocked := s.gpuBlocker(vm.VMID, v.running, requested); blocked && !st.Running {
 			st.BlockedBy = s.cfg.SelfService.NameOf(other)
 		}
@@ -300,10 +328,12 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 
 // phase is the copy the UI shows. "shedding" is a request made while the shed is still running:
 // Proxmox reports the node online throughout, so only the loop's activity gives it away.
-func phase(v clusterView, activity string, running, requested bool) string {
+func phase(v clusterView, activity string, running, requested, failed bool) string {
 	switch {
 	case running:
 		return "ready"
+	case failed:
+		return "failed"
 	case requested && !v.nodeUp:
 		return "waking"
 	case requested && activity == controller.ActivityShedding:

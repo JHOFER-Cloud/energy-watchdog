@@ -54,7 +54,10 @@
     margin-left: auto; color: var(--muted); font-size: .85rem; text-align: right;
     max-width: 26rem; /* the shed copy is a sentence; wrap it rather than crushing the name */
   }
-  .vm[data-phase="shedding"] .phase, .vm[data-phase="waking"] .phase { color: var(--warn); }
+  /* Failed needs attention but nothing is in flight, so it takes the colour without the pulse. */
+  .vm[data-phase="failed"]::before { background: var(--warn); }
+  .vm[data-phase="shedding"] .phase, .vm[data-phase="waking"] .phase,
+  .vm[data-phase="failed"] .phase { color: var(--warn); }
   .vm[data-phase="ready"] .phase { color: var(--ok); }
   .dot { width: .5rem; height: .5rem; border-radius: 50%; background: var(--muted); flex: none; }
   .dot.ready { background: var(--ok); }
@@ -166,6 +169,7 @@ const PHASES = {
   shedding: { text: "p1 is shutting down — your VM starts once it's back. Grab a coffee, this takes a few minutes.", dot: "busy" },
   waking:   { text: "Waking the server…",                      dot: "busy" },
   starting: { text: "Server up, starting the VM…",             dot: "busy" },
+  failed:   { text: "Couldn't start",                          dot: "" },
   ready:    { text: "Running",                                 dot: "ready" },
 };
 // Shown instead of "waking" when the host is on its way down: the request stays live and the
@@ -195,6 +199,11 @@ function render(s) {
   if (lastNodeUp === true && s.nodeUp === false && s.vms.some(v => v.requested)) sawShutdown = true;
   if (s.nodeUp) sawShutdown = false;
   lastNodeUp = s.nodeUp;
+
+  // Release this tab's optimistic "Starting…" before the cards are built, not after, or a
+  // VM the loop just gave up on renders its error beside a button still disabled from the
+  // click that failed.
+  s.vms.forEach(vm => { if (vm.phase === "ready" || vm.phase === "failed") busy.delete(vm.vmid); });
 
   const host = document.getElementById("vms");
   host.replaceChildren(...s.vms.map(vm => {
@@ -250,6 +259,14 @@ function render(s) {
       note.textContent = `${vm.blockedBy} is using this GPU — shut it down first`;
       el.appendChild(note);
     } else {
+      if (vm.error) {
+        // The loop has given up, so the button is live again: pressing it files a new
+        // request, and a new request is what re-arms it.
+        const note = document.createElement("div");
+        note.className = "note";
+        note.textContent = `Couldn't start this VM: ${vm.error} — try again, and ask an admin if it keeps failing.`;
+        el.appendChild(note);
+      }
       const b = document.createElement("button");
       const working = vm.requested || busy.has(vm.vmid);
       b.textContent = working ? "Starting…" : "Start";
@@ -265,7 +282,6 @@ function render(s) {
     if (bar.childElementCount) el.appendChild(bar);
     return el;
   }));
-  s.vms.forEach(vm => { if (vm.phase === "ready") busy.delete(vm.vmid); });
   show(s.error || "");
 }
 
