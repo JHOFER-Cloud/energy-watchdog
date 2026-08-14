@@ -37,6 +37,12 @@ type Controller struct {
 	metrics *metrics.Metrics
 	log     *slog.Logger
 
+	// askedOff records that this loop requested the power-off and p1 is still on its way
+	// down, so the restate keeps re-asserting it. Cleared once p1 is observed down or woken.
+	// Not persisted: a restart inside that window reads false and re-opens the same race -
+	// mode stays shed with p1 up, and ModeShed plans nothing more, so it idles powered-up.
+	askedOff bool
+
 	observeFailures int  // consecutive failed observes, for log-level escalation
 	warnedNoUptime  bool // the missing-uptime warning is logged once, not every tick
 
@@ -120,12 +126,15 @@ func (c *Controller) reconcile(ctx context.Context) {
 		c.metrics.MarkStale(now.Unix())
 		// Blind, not silent: going quiet leaves nut-dog deciding p1 from a stale request,
 		// which after a UPS recovery means waking it at whatever hour that lands, with no
-		// solar reading behind it. Hold pins p1 where it is until we can decide again. A
-		// UPS shed still overrides - that direction is never gated.
+		// solar reading behind it. This pins p1 where it is until we can decide again, except
+		// for a shed of ours in flight, which keeps being asserted. A UPS shed still overrides.
 		c.holdPower(ctx)
 		return
 	}
 	c.observeFailures = 0
+	if !snap.NodeUp {
+		c.askedOff = false // the shed landed; a later hand-start must not be shut back down
+	}
 
 	plan := Decide(snap, c.cfg, now)
 	c.log.Info("decision",
@@ -552,6 +561,7 @@ func (c *Controller) startRequested(ctx context.Context, ids []int) error {
 }
 
 func (c *Controller) wake(ctx context.Context, reason string) error {
+	c.askedOff = false
 	if c.power != nil {
 		// nut-dog owns the WoL: its packet doesn't need another Proxmox node to relay it,
 		// which is exactly what a full shed leaves us without.
@@ -574,22 +584,23 @@ func (c *Controller) wake(ctx context.Context, reason string) error {
 // powerOff takes p1 down: through nut-dog when it owns the power, else directly.
 func (c *Controller) powerOff(ctx context.Context, reason string) error {
 	if c.power != nil {
+		c.askedOff = true
 		return c.requestPower(ctx, powerapi.Off, reason)
 	}
 	return c.px.ShutdownNode(ctx, c.cfg.Proxmox.Node)
 }
 
-// powerWish is what to restate for a plan that isn't transitioning power itself. Off comes
-// from the mode already in force, not the planned one: a tick that only corrects the mode to
-// shed hasn't decided anything about power yet, and the next tick may well want p1 back. The
-// same rule covers a shed still in flight - p1 up with the mode already shed - where hold is
-// what stops nut-dog undoing the shed we just asked for.
-func powerWish(p Plan, snap Snapshot) string {
+// powerWish is what to restate for a plan that isn't transitioning power itself. askedOff says
+// we requested this shed and p1 hasn't gone down yet; without it that state is
+// indistinguishable from a p1 started by hand during a shed, where asserting off would cut
+// power under running guests. Restating hold there instead replaced an off nut-dog had not yet
+// polled (15s) and silently dropped the shed - off is idempotent, hold is not a no-op.
+func powerWish(p Plan, snap Snapshot, askedOff bool) string {
 	switch {
-	case snap.Mode == state.ModeShed && !snap.NodeUp:
-		return powerapi.Off
 	case p.NextMode != state.ModeShed && snap.NodeUp:
 		return powerapi.On
+	case snap.Mode == state.ModeShed && (!snap.NodeUp || askedOff):
+		return powerapi.Off
 	default:
 		return powerapi.Hold
 	}
@@ -604,21 +615,26 @@ func (c *Controller) requestPower(ctx context.Context, desired, reason string) e
 	return err
 }
 
-// holdPower asks nut-dog to leave p1 alone, for when this loop cannot decide. An asserted
-// shed signal survives it: hold emits no action and nut-dog's reconcile is edge-triggered.
+// holdPower is what this loop says when it cannot decide: leave p1 alone - unless a shed of
+// ours is in flight, where it re-asserts off instead. Hold survives an asserted shed signal but
+// not one nut-dog has yet to poll, since it would replace that off and emit no action.
 func (c *Controller) holdPower(ctx context.Context) {
 	if c.power == nil || c.cfg.DryRun != config.DryRunFull {
 		return
 	}
-	if err := c.requestPower(ctx, powerapi.Hold, "watchdog cannot observe"); err != nil {
-		c.log.Warn("hold power request", "err", err)
+	desired, reason := powerapi.Hold, "watchdog cannot observe"
+	if c.askedOff {
+		desired, reason = powerapi.Off, "watchdog cannot observe; shed still in flight"
+	}
+	if err := c.requestPower(ctx, desired, reason); err != nil {
+		c.log.Warn("blind power request", "desired", desired, "err", err)
 	}
 }
 
 // restatePower re-sends the wish. nut-dog keeps no state across restarts, so the request has
 // to be level-triggered rather than edge-triggered.
 func (c *Controller) restatePower(ctx context.Context, p Plan, snap Snapshot) error {
-	return c.requestPower(ctx, powerWish(p, snap), "solar")
+	return c.requestPower(ctx, powerWish(p, snap, c.askedOff), "solar")
 }
 
 // replicationMarker prefixes the comment of every replication job the watchdog disables. It

@@ -145,6 +145,23 @@ func TestShedDelegatesPowerOff(t *testing.T) {
 	}
 }
 
+// The production failure: the UI nudges a reconcile straight after the shed, p1 is still on
+// its way down, and the restate sent hold - which replaced an off nut-dog had not yet polled
+// (it reconciles every 15s) and left the shed signal released, so p1 never went down.
+func TestShedSurvivesAnImmediateRestate(t *testing.T) {
+	nut := &fakeNutDog{}
+	srv := nut.server(t)
+	defer srv.Close()
+
+	c, _ := delegateFixture(t, "-800", srv.URL, state.ModeRunning, true)
+	c.reconcile(context.Background()) // sheds; requests off
+	c.reconcile(context.Background()) // nudged tick: mode is shed, p1 still up
+
+	if got := nut.requests(); len(got) != 2 || got[0] != "off" || got[1] != "off" {
+		t.Fatalf("power requests = %v, want [off off]; a hold here cancels the shed", got)
+	}
+}
+
 // A settled mode still restates its wish, so a nut-dog that restarted and forgot is told
 // again within one tick - which is what its startup grace is sized for.
 func TestSettledModeRestatesPower(t *testing.T) {
@@ -163,25 +180,31 @@ func TestSettledModeRestatesPower(t *testing.T) {
 	}
 }
 
-// The wish must come from what the loop established, not from the mode label. Both cases
-// here are ones where Decide deliberately plans nothing, so nut-dog must be told nothing.
+// The wish must come from what the loop established, not from the mode label: the same
+// (mode, nodeUp) pair means "our shed is in flight" or "p1 was started by hand", and those
+// need opposite answers.
 func TestRestateNeverOverridesTheLoop(t *testing.T) {
 	tests := []struct {
-		name    string
-		surplus string
-		mode    state.Mode
-		nodeUp  bool
-		want    string
+		name     string
+		surplus  string
+		mode     state.Mode
+		nodeUp   bool
+		askedOff bool
+		want     string
 	}{
 		// p1 down while the mode still says running: the tick only corrects the mode, so
 		// nothing is asserted about power until the next one decides.
-		{"running, p1 down, neutral signal", "500", state.ModeRunning, false, "hold"},
-		{"running, p1 down, surplus", "5000", state.ModeRunning, false, "hold"},
+		{"running, p1 down, neutral signal", "500", state.ModeRunning, false, false, "hold"},
+		{"running, p1 down, surplus", "5000", state.ModeRunning, false, false, "hold"},
 		// p1 started by hand during a shed, seen outside the fresh-boot window: no migrate
 		// and no stop are planned, so asserting "off" would cut power under running guests.
-		{"shed, p1 up, deficit", "-800", state.ModeShed, true, "hold"},
-		{"shed, p1 down, deficit", "-800", state.ModeShed, false, "off"},
-		{"running, p1 up, surplus", "5000", state.ModeRunning, true, "on"},
+		{"shed, p1 up, deficit", "-800", state.ModeShed, true, false, "hold"},
+		{"shed, p1 down, deficit", "-800", state.ModeShed, false, false, "off"},
+		{"running, p1 up, surplus", "5000", state.ModeRunning, true, false, "on"},
+		// Same state as the hand-start above, but this shed is ours and p1 hasn't gone down
+		// yet. Restating hold here replaced an off nut-dog had not polled, and the shed was
+		// silently dropped - p1 stayed up with its guests stopped until someone noticed.
+		{"shed we asked for, p1 still up", "-800", state.ModeShed, true, true, "off"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -189,6 +212,7 @@ func TestRestateNeverOverridesTheLoop(t *testing.T) {
 			srv := nut.server(t)
 			defer srv.Close()
 			c, _ := delegateFixture(t, tt.surplus, srv.URL, tt.mode, tt.nodeUp)
+			c.askedOff = tt.askedOff
 
 			c.reconcile(context.Background())
 
@@ -218,6 +242,27 @@ func TestBlindWatchdogHoldsPower(t *testing.T) {
 	got := nut.requests()
 	if len(got) != 2 || got[0] != "hold" || got[1] != "hold" {
 		t.Errorf("power requests = %v, want [hold hold] - one per blind tick", got)
+	}
+}
+
+// Going blind must not cancel a shed already in flight: hold would replace an off nut-dog had
+// not polled and would emit no action, leaving p1 up with its guests stopped. One failed observe
+// - a Prometheus or Proxmox blip - is enough, so this is the same race the restate had.
+func TestBlindWatchdogKeepsAssertingItsShed(t *testing.T) {
+	nut := &fakeNutDog{}
+	srv := nut.server(t)
+	defer srv.Close()
+
+	c, _ := delegateFixture(t, "-800", srv.URL, state.ModeRunning, true)
+	c.reconcile(context.Background()) // sheds; requests off
+
+	dead := httptest.NewServer(nil)
+	dead.Close()
+	c.prom = prom.New(dead.URL) // now blind, p1 still on its way down
+	c.reconcile(context.Background())
+
+	if got := nut.requests(); len(got) != 2 || got[0] != "off" || got[1] != "off" {
+		t.Fatalf("power requests = %v, want [off off]; a hold here cancels the shed", got)
 	}
 }
 

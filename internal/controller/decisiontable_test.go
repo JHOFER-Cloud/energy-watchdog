@@ -78,7 +78,10 @@ func TestGenerateDecisionTable(t *testing.T) {
 									Node:    map[bool]string{true: "up", false: "down"}[nodeUp],
 									Guest:   map[bool]string{true: "yes", false: "no"}[guest],
 									Request: map[bool]string{true: "yes", false: "no"}[req],
-									Grace:   grace, NextMode: string(p.NextMode), Wish: powerWish(p, s),
+									// askedOff is controller state, not a Decide input, so it stays out of the
+									// enumeration: Wish is the steady-state answer. Mid-shed (we asked for the
+									// power-off, p1 not down yet) it is off wherever this shows hold.
+									Grace: grace, NextMode: string(p.NextMode), Wish: powerWish(p, s, false),
 									Migrate: ids(p.Migrate), Stop: ids(p.Stop), RestoreStopped: p.RestoreStopped,
 									StartReq: p.StartRequested, Poweroff: p.Poweroff, Wake: p.Wake,
 									GraceAction: ga, Reason: p.Reason,
