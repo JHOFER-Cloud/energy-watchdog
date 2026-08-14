@@ -245,9 +245,9 @@ func TestBlindWatchdogHoldsPower(t *testing.T) {
 	}
 }
 
-// Going blind must not cancel a shed already in flight: hold would replace an off nut-dog has
-// not polled and emit no action, leaving p1 up with its guests stopped. One failed observe -
-// a Prometheus or Proxmox blip - is enough, so this is the same race the restate had.
+// Going blind must not cancel a shed already in flight: hold would replace an off nut-dog had
+// not polled and would emit no action, leaving p1 up with its guests stopped. One failed observe
+// - a Prometheus or Proxmox blip - is enough, so this is the same race the restate had.
 func TestBlindWatchdogKeepsAssertingItsShed(t *testing.T) {
 	nut := &fakeNutDog{}
 	srv := nut.server(t)

@@ -126,8 +126,8 @@ func (c *Controller) reconcile(ctx context.Context) {
 		c.metrics.MarkStale(now.Unix())
 		// Blind, not silent: going quiet leaves nut-dog deciding p1 from a stale request,
 		// which after a UPS recovery means waking it at whatever hour that lands, with no
-		// solar reading behind it. Hold pins p1 where it is until we can decide again. A
-		// UPS shed still overrides - that direction is never gated.
+		// solar reading behind it. This pins p1 where it is until we can decide again, except
+		// for a shed of ours in flight, which keeps being asserted. A UPS shed still overrides.
 		c.holdPower(ctx)
 		return
 	}
@@ -615,9 +615,9 @@ func (c *Controller) requestPower(ctx context.Context, desired, reason string) e
 	return err
 }
 
-// holdPower asks nut-dog to leave p1 alone, for when this loop cannot decide. Hold survives an
-// asserted shed signal, but not one nut-dog has yet to poll: it would replace that off and emit
-// no action, so a shed of ours in flight keeps being asserted instead.
+// holdPower is what this loop says when it cannot decide: leave p1 alone - unless a shed of
+// ours is in flight, where it re-asserts off instead. Hold survives an asserted shed signal but
+// not one nut-dog has yet to poll, since it would replace that off and emit no action.
 func (c *Controller) holdPower(ctx context.Context) {
 	if c.power == nil || c.cfg.DryRun != config.DryRunFull {
 		return
