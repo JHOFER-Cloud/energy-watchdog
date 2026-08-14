@@ -100,11 +100,14 @@ func delegateFixture(t *testing.T, surplus, nutURL string, mode state.Mode, node
 		t.Fatal(err)
 	}
 	var guests config.Guests
-	if err := yaml.Unmarshal([]byte("stop: [\"300-399\"]\n"), &guests); err != nil {
+	if err := yaml.Unmarshal([]byte("stop: [\"300-399\"]\ngamingGuard: [\"600-699\"]\n"), &guests); err != nil {
 		t.Fatal(err)
 	}
 
 	cfg := &config.Config{
+		// Wake requests are filtered by both of these, so leaving either out silently makes
+		// every request in a fixture dead on arrival.
+		GamingGrace: config.Duration{Duration: 10 * time.Minute},
 		Prometheus: config.Prometheus{
 			URL: promSrv.URL, Window: "30m", HeadroomWatts: 1000, MinBatteryPercent: 0,
 			ProductionMetric: "prod", ConsumptionMetric: "cons",

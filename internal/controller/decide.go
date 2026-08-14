@@ -31,6 +31,12 @@ type Snapshot struct {
 	ManualShed bool
 	// ManualOn holds the node up regardless of surplus (state.Intent.On).
 	ManualOn bool
+	// ShedInFlight means this loop has already told nut-dog to power p1 off and p1 has not
+	// been seen down since. p1's upsmon has the signal by then and cannot be told to stop, so
+	// the host is unusable however up it still looks: nothing may be planned on it until the
+	// shed lands. Before that point a shed is still just a plan, and a desktop VM asked for
+	// while the guests are stopping can simply be started.
+	ShedInFlight bool
 	// Wake are the live self-service requests, already filtered to the gaming guard and deduped.
 	Wake []state.WakeRequest
 	// WakeDone is the persisted spent-request marker; see state.State.WakeDone.
@@ -191,9 +197,11 @@ func Decide(s Snapshot, cfg *config.Config, now time.Time) Plan {
 			p.RestoreStopped = true
 			p.NextMode = state.ModeRunning
 			p.Reason = "surplus returned: wake p1 and restart the guests we stopped"
-		case requested:
+		case requested && !s.ShedInFlight:
 			// Someone asked for their desktop VM. Wake p1 and adopt it as a gaming session, so
-			// the grace clock - not the surplus - is what decides whether it stays up.
+			// the grace clock - not the surplus - is what decides whether it stays up. Held off
+			// while our shed is in flight: p1 still reads up, but it is going down, and
+			// adopting it there starts a session that dies with the host.
 			p.Wake = !s.NodeUp
 			p.NextMode = state.ModeGaming
 			p.GraceSince = graceStart()
@@ -258,8 +266,10 @@ func Decide(s Snapshot, cfg *config.Config, now time.Time) Plan {
 		p.Reason += " (held on by hand)"
 	}
 	// One rule for every mode: start what was asked for wherever the node is up, or about to
-	// be. Never on the way down - a VM started into a power-off would just die with it.
-	if !p.Poweroff && (s.NodeUp || p.Wake) {
+	// be. Never on the way down - a VM started into a power-off just dies with it, and its
+	// few seconds of running mark the request satisfied, so the wake that follows has nothing
+	// left to act on. That covers both a power-off planned here and one already sent.
+	if !p.Poweroff && !s.ShedInFlight && (s.NodeUp || p.Wake) {
 		p.StartRequested = pending
 	}
 	return p

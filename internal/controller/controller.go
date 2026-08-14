@@ -337,18 +337,19 @@ func (c *Controller) observe(ctx context.Context, now time.Time) (Snapshot, bool
 	}
 	manualShed, manualOn := intent.Holds()
 	snap := Snapshot{
-		Surplus:    reading.Surplus,
-		SurplusRaw: reading.SurplusRaw,
-		SoC:        reading.SoC,
-		NodeUp:     nodeUp,
-		NodeUptime: uptime,
-		Guests:     guests,
-		Mode:       st.Mode,
-		GraceSince: st.GraceSince,
-		ManualShed: manualShed,
-		ManualOn:   manualOn,
-		Wake:       c.requestedWake(intent, now),
-		WakeDone:   st.WakeDone,
+		Surplus:      reading.Surplus,
+		SurplusRaw:   reading.SurplusRaw,
+		SoC:          reading.SoC,
+		NodeUp:       nodeUp,
+		NodeUptime:   uptime,
+		Guests:       guests,
+		Mode:         st.Mode,
+		GraceSince:   st.GraceSince,
+		ManualShed:   manualShed,
+		ManualOn:     manualOn,
+		ShedInFlight: c.askedOff,
+		Wake:         c.requestedWake(intent, now),
+		WakeDone:     st.WakeDone,
 	}
 	return snap, nodeUp && gamingActive(guests, c.cfg.Guests.GamingGuard), nil
 }
@@ -440,6 +441,15 @@ func (c *Controller) execute(ctx context.Context, p Plan, snap Snapshot) error {
 		}
 	}
 	if p.Poweroff {
+		// The last moment this is still a decision. Stopping the guests runs for minutes with
+		// the loop busy throughout, so a desktop VM asked for at the start of a shed is first
+		// read here - p1 still up, nothing yet told to shut it down. Leave it up and let the
+		// queued tick adopt the gaming session, instead of powering off and making someone
+		// wait out a shutdown and a boot for a host that never had to go down.
+		if c.wakeRequestedNow(ctx, p.WakeDone) {
+			c.log.Info("desktop VM requested while shedding: leaving p1 up", "node", c.cfg.Proxmox.Node)
+			return c.saveMode(ctx, st, p)
+		}
 		// Disable replication ahead of the power-off instead of waiting for the next tick to
 		// observe the node as down: a run landing inside the shutdown window is exactly the
 		// failed run we're trying to avoid. Re-enabling needs no such treatment - the first
@@ -453,9 +463,32 @@ func (c *Controller) execute(ctx context.Context, p Plan, snap Snapshot) error {
 			return err
 		}
 	}
+	return c.saveMode(ctx, st, p)
+}
+
+func (c *Controller) saveMode(ctx context.Context, st state.State, p Plan) error {
 	st.Mode = p.NextMode
 	st.GraceSince = p.GraceSince
 	return c.store.Save(ctx, st)
+}
+
+// wakeRequestedNow reports whether a desktop VM is being asked for right now, re-read from
+// the store rather than taken from the snapshot: the plan holding that snapshot was made
+// before the stop phase, which runs for minutes. done is the plan's spent-request markers, so
+// a request already seen through to a running VM doesn't count. A failed read reports none -
+// the shed the plan asked for is what happens by default.
+func (c *Controller) wakeRequestedNow(ctx context.Context, done map[int]int64) bool {
+	intent, err := c.store.LoadIntent(ctx)
+	if err != nil {
+		c.log.Warn("re-read intent before power-off", "err", err)
+		return false
+	}
+	for _, w := range c.requestedWake(intent, time.Now()) {
+		if w.RequestedAt > done[w.VMID] {
+			return true
+		}
+	}
+	return false
 }
 
 // migrateAll runs one bulk migration per target node, concurrently. Guests still on the node
@@ -722,16 +755,20 @@ func (c *Controller) powerOff(ctx context.Context, reason string) error {
 	return c.px.ShutdownNode(ctx, c.cfg.Proxmox.Node)
 }
 
-// powerWish is what to restate for a plan that isn't transitioning power itself. askedOff says
-// we requested this shed and p1 hasn't gone down yet; without it that state is
-// indistinguishable from a p1 started by hand during a shed, where asserting off would cut
-// power under running guests. Restating hold there instead replaced an off nut-dog had not yet
-// polled (15s) and silently dropped the shed - off is idempotent, hold is not a no-op.
+// powerWish is what to restate for a plan that isn't transitioning power itself.
+//
+// askedOff answers first because it is the one thing here that is not a wish but a fact: p1's
+// upsmon already has the signal and cannot be told to stop, so anything else would only
+// release it and leave the shed half-applied - which is how a shed came to stop every guest
+// and leave p1 running. Without that flag the state is indistinguishable from a p1 started by
+// hand during a shed, where asserting off would cut power under running guests.
 func powerWish(p Plan, snap Snapshot, askedOff bool) string {
 	switch {
+	case askedOff:
+		return powerapi.Off
 	case p.NextMode != state.ModeShed && snap.NodeUp:
 		return powerapi.On
-	case snap.Mode == state.ModeShed && (!snap.NodeUp || askedOff):
+	case snap.Mode == state.ModeShed && !snap.NodeUp:
 		return powerapi.Off
 	default:
 		return powerapi.Hold
