@@ -149,6 +149,11 @@ the host. Guest power actions go straight to Proxmox, which can't turn `p1` on o
 can't break that. A request stops acting the moment its VM has been up, so shutting the VM down
 again — from the UI or from inside the guest — leaves it down instead of being started back up.
 
+A request that cannot be made to work is also given up on: after three tries whose guest never
+came up, the loop stops retrying, the host is no longer held up waiting for it, and the card
+shows what Proxmox said with Start live again. Pressing it is a new request and gets its own
+three tries, so whatever broke needs no restart here once it is fixed.
+
 Off unless `selfService.addr` is set. See [DEVELOPMENT.md](./DEVELOPMENT.md) for how it fits
 together and how to run the whole thing locally.
 

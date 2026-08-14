@@ -46,6 +46,14 @@ type Controller struct {
 	observeFailures int  // consecutive failed observes, for log-level escalation
 	warnedNoUptime  bool // the missing-uptime warning is logged once, not every tick
 
+	// startFails tracks desktop VMs that will not start, by VMID. Read by the self-service
+	// API from its own goroutines, hence the mutex. Not persisted: a restart inside the
+	// request's TTL re-arms every retired request, so p1 is woken and the VM tried three
+	// more times. That is bounded and self-limiting, and cheaper than a persisted record
+	// that could strand a VM as unstartable across the fix for whatever broke it.
+	startMu    sync.Mutex
+	startFails map[int]startFailure
+
 	nudge chan struct{} // out-of-band reconcile requests from the self-service API
 
 	// activity is what an in-flight apply is doing. Proxmox reports the node online for the
@@ -80,11 +88,90 @@ func (c *Controller) Nudge() {
 // the failure is logged at error: a transient blip stays quiet, a sustained outage gets loud.
 const observeFailEscalate = 5
 
+// startFailLimit is how many tries a requested desktop VM gets before the request is
+// retired, at most one per reconcile interval. Without it a VM that cannot boot is retried
+// every tick for the rest of the request's TTL, which holds p1 up on a session that will
+// never happen and leaves the user watching "Starting…" with the error only in the pod log.
+const startFailLimit = 3
+
+// startFailure is one desktop VM that would not start: how many tries it has had, the
+// request those tries belong to, and what Proxmox last said. Keying on the request is what
+// lets a fresh press of Start re-arm it - the same request never gets another run of tries.
+type startFailure struct {
+	tries int
+	reqAt int64
+	err   string
+	last  time.Time // when a try was last counted; see recordStartFailure
+}
+
+// StartFailure is a retired wake request as the API surfaces it. RequestedAt is what makes
+// it usable: the caller has to be able to tell whether the failure belongs to the request
+// still outstanding, or to an older one the user has since pressed Start past.
+type StartFailure struct {
+	Err         string
+	RequestedAt int64
+}
+
+// StartFailures is the last error for each desktop VM whose wake request has been retired.
+// The self-service API turns it into something the user can read.
+func (c *Controller) StartFailures() map[int]StartFailure {
+	c.startMu.Lock()
+	defer c.startMu.Unlock()
+	out := map[int]StartFailure{}
+	for vmid, f := range c.startFails {
+		if f.tries >= startFailLimit {
+			out[vmid] = StartFailure{Err: f.err, RequestedAt: f.reqAt}
+		}
+	}
+	return out
+}
+
+// recordStartFailure counts one failed attempt for vmid, and logs the try that retires it.
+func (c *Controller) recordStartFailure(vmid int, reqAt int64, msg string) {
+	c.startMu.Lock()
+	defer c.startMu.Unlock()
+	f := c.startFails[vmid]
+	if f.reqAt != reqAt {
+		f = startFailure{reqAt: reqAt} // a different request: start counting again
+	}
+	f.err = msg
+	// Tries are not evenly spaced: the API nudges a reconcile on every button press, by
+	// anyone, so unrelated clicks would otherwise burn the whole budget seconds after the
+	// first failure - well before a transient Proxmox condition has had a chance to clear.
+	// One per interval keeps the limit meaning what its comment says.
+	now := time.Now()
+	if f.tries > 0 && now.Sub(f.last) < c.cfg.Interval.Duration {
+		c.startFails[vmid] = f
+		return
+	}
+	f.tries++
+	f.last = now
+	c.startFails[vmid] = f
+	if f.tries == startFailLimit {
+		c.log.Error("giving up on a requested desktop VM", "vmid", vmid, "tries", f.tries, "err", msg)
+	}
+}
+
+func (c *Controller) clearStartFailure(vmid int) {
+	c.startMu.Lock()
+	defer c.startMu.Unlock()
+	delete(c.startFails, vmid)
+}
+
+// retired reports that w has had its tries and must not be acted on again. A newer request
+// for the same VM is a new ask and gets its own tries.
+func (c *Controller) retired(w state.WakeRequest) bool {
+	c.startMu.Lock()
+	defer c.startMu.Unlock()
+	f, ok := c.startFails[w.VMID]
+	return ok && f.reqAt == w.RequestedAt && f.tries >= startFailLimit
+}
+
 // New builds a Controller. ams is keyed by Alertmanager base URL so a persisted
 // silence can be deleted from the same Alertmanager it was created in.
 func New(cfg *config.Config, p *prom.Client, px *proxmox.Client, ams map[string]*alertmgr.Client, store state.Store, m *metrics.Metrics, log *slog.Logger) *Controller {
 	c := &Controller{cfg: cfg, prom: p, px: px, ams: ams, store: store, metrics: m, log: log,
-		nudge: make(chan struct{}, 1)}
+		nudge: make(chan struct{}, 1), startFails: map[int]startFailure{}}
 	if cfg.PowerAPI != nil {
 		c.power = powerapi.New(cfg.PowerAPI.URL, cfg.PowerAPI.Token, cfg.PowerAPI.Load)
 	}
@@ -277,6 +364,12 @@ func (c *Controller) requestedWake(intent state.Intent, now time.Time) []state.W
 			c.log.Warn("ignoring wake request outside the gaming-guard range", "vmid", w.VMID, "user", w.User)
 			continue
 		}
+		// A request we have given up on is dropped here rather than in Decide: it then holds
+		// no grace clock and plans no start, so p1 sheds on schedule instead of waiting out a
+		// VM that isn't coming.
+		if c.retired(w) {
+			continue
+		}
 		// The API replaces a VM's request rather than appending, but intent.json is meant to be
 		// hand-editable, and a repeated entry there would otherwise mean starting it twice.
 		if seen[w.VMID] {
@@ -342,7 +435,7 @@ func (c *Controller) execute(ctx context.Context, p Plan, snap Snapshot) error {
 	if len(p.StartRequested) > 0 {
 		// Best-effort: a desktop VM that won't boot is the user's problem, and failing the
 		// reconcile here would roll back the mode the wake just established.
-		if err := c.startRequested(ctx, p.StartRequested); err != nil {
+		if err := c.startRequested(ctx, p.StartRequested, snap.Wake); err != nil {
 			c.log.Warn("start requested desktop VMs", "err", err)
 		}
 	}
@@ -526,7 +619,16 @@ func (c *Controller) startAll(ctx context.Context, guests []state.GuestRef) erro
 // startRequested boots the desktop VMs a self-service request asked for. The ids come from
 // Decide without a guest type, because the node may still have been down then; now that it is
 // up its guest list resolves them.
-func (c *Controller) startRequested(ctx context.Context, ids []int) error {
+//
+// Every attempt counts against the request, whatever the start task reported, so a VM that
+// will not come up is given up on rather than retried until the request ages out. Success is
+// then established by reading the node back, not by trusting the task: a bulk start can
+// report OK while one of its guests stayed down, and that guest is the whole point here.
+func (c *Controller) startRequested(ctx context.Context, ids []int, wake []state.WakeRequest) error {
+	reqAt := make(map[int]int64, len(wake))
+	for _, w := range wake {
+		reqAt[w.VMID] = w.RequestedAt
+	}
 	guests, err := c.px.Guests(ctx, c.cfg.Proxmox.Node)
 	if err != nil {
 		return err
@@ -540,11 +642,14 @@ func (c *Controller) startRequested(ctx context.Context, ids []int) error {
 		g, ok := byID[id]
 		if !ok {
 			c.log.Warn("requested guest is not on the node", "vmid", id, "node", c.cfg.Proxmox.Node)
+			c.recordStartFailure(id, reqAt[id], "this VM is not on "+c.cfg.Proxmox.Node)
 			continue
 		}
-		if !g.Running {
-			want = append(want, id)
+		if g.Running {
+			c.clearStartFailure(id)
+			continue
 		}
+		want = append(want, id)
 	}
 	if len(want) == 0 {
 		return nil
@@ -553,11 +658,38 @@ func (c *Controller) startRequested(ctx context.Context, ids []int) error {
 	if err == nil {
 		err = c.px.WaitTask(ctx, c.cfg.Proxmox.Node, upid)
 	}
-	if err != nil {
-		return err
+	// The node decides what counts, not the task: one task covers the whole batch and can
+	// come back OK over a guest that stayed down. If that read fails, fall back to the task's
+	// word - counting a start that worked would retire a healthy VM, the worse of the two
+	// mistakes.
+	up := map[int]bool{}
+	if after, rerr := c.px.Guests(ctx, c.cfg.Proxmox.Node); rerr == nil {
+		for _, g := range after {
+			up[g.VMID] = g.Running
+		}
+	} else {
+		c.log.Warn("cannot confirm requested starts", "vmids", want, "err", rerr)
+		for _, id := range want {
+			up[id] = err == nil
+		}
 	}
-	c.log.Info("started requested guests", "vmids", want)
-	return nil
+	msg := "the VM did not come up"
+	if err != nil {
+		msg = err.Error() // one task covers the batch, so its error is all any of them gets
+	}
+	var started []int
+	for _, id := range want {
+		if up[id] {
+			c.clearStartFailure(id)
+			started = append(started, id)
+			continue
+		}
+		c.recordStartFailure(id, reqAt[id], msg)
+	}
+	if len(started) > 0 {
+		c.log.Info("started requested guests", "vmids", started)
+	}
+	return err
 }
 
 func (c *Controller) wake(ctx context.Context, reason string) error {
