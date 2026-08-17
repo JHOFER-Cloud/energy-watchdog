@@ -273,7 +273,7 @@ func TestStopAllRecordsOnlyWhatStopped(t *testing.T) {
 	stopped, err := c.stopAll(context.Background(), []proxmox.Guest{
 		{VMID: 301, Type: proxmox.TypeQEMU, Running: true},
 		{VMID: 302, Type: proxmox.TypeQEMU, Running: true},
-	})
+	}, nil)
 	if err == nil {
 		t.Error("stopAll = nil error, want the failed task surfaced (302 never went down)")
 	}
@@ -304,7 +304,7 @@ func TestStopAllBoundsAWedgedTask(t *testing.T) {
 
 	done := make(chan []state.GuestRef, 1)
 	go func() {
-		stopped, err := c.stopAll(context.Background(), []proxmox.Guest{{VMID: 301, Type: proxmox.TypeQEMU}})
+		stopped, err := c.stopAll(context.Background(), []proxmox.Guest{{VMID: 301, Type: proxmox.TypeQEMU}}, nil)
 		if err == nil {
 			t.Error("stopAll = nil error, want the wait deadline surfaced")
 		}

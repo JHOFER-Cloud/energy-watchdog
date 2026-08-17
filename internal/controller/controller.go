@@ -56,6 +56,17 @@ type Controller struct {
 
 	nudge chan struct{} // out-of-band reconcile requests from the self-service API
 
+	// wakePoll is how often the stop phase re-reads intent to notice a desktop VM being asked
+	// for. A field so tests don't have to wait it out; see waitStop.
+	wakePoll time.Duration
+
+	// pendingStop is a bulk stop task we stopped waiting for, kept so the restore can let it
+	// finish first. Without it good-morning reads the guest list mid-task, sees a guest the task
+	// has not reached yet as running, leaves it out of the restart - and the task stops it
+	// moments later, leaving it down until the next shed and restore, a day away. Not persisted
+	// and dropped the moment p1 is seen down: the task died with the host either way.
+	pendingStop stopTask
+
 	// activity is what an in-flight apply is doing. Proxmox reports the node online for the
 	// whole shed, so the UI can't tell "starting your VM" from "host on its way down" without it.
 	activity atomic.Value
@@ -88,11 +99,24 @@ func (c *Controller) Nudge() {
 // the failure is logged at error: a transient blip stays quiet, a sustained outage gets loud.
 const observeFailEscalate = 5
 
+// wakePoll is how often the stop phase re-reads intent while the guests go down. Cheap - one
+// ConfigMap read against the local apiserver - and only while a shed is actually running.
+const wakePoll = 5 * time.Second
+
 // startFailLimit is how many tries a requested desktop VM gets before the request is
 // retired, at most one per reconcile interval. Without it a VM that cannot boot is retried
 // every tick for the rest of the request's TTL, which holds p1 up on a session that will
 // never happen and leaves the user watching "Starting…" with the error only in the pod log.
 const startFailLimit = 3
+
+// stopTask is a bulk stop task and the budget stopAll gave it. The deadline travels with the
+// UPID because it is not derivable from config: stopAll allows the task every guest's
+// stopTimeout in turn, so a settle bounded at a single one would give up while the task still
+// had guests to go - which is the mid-task guest list read the settle exists to prevent.
+type stopTask struct {
+	upid     string
+	deadline time.Time
+}
 
 // startFailure is one desktop VM that would not start: how many tries it has had, the
 // request those tries belong to, and what Proxmox last said. Keying on the request is what
@@ -171,7 +195,7 @@ func (c *Controller) retired(w state.WakeRequest) bool {
 // silence can be deleted from the same Alertmanager it was created in.
 func New(cfg *config.Config, p *prom.Client, px *proxmox.Client, ams map[string]*alertmgr.Client, store state.Store, m *metrics.Metrics, log *slog.Logger) *Controller {
 	c := &Controller{cfg: cfg, prom: p, px: px, ams: ams, store: store, metrics: m, log: log,
-		nudge: make(chan struct{}, 1), startFails: map[int]startFailure{}}
+		nudge: make(chan struct{}, 1), startFails: map[int]startFailure{}, wakePoll: wakePoll}
 	if cfg.PowerAPI != nil {
 		c.power = powerapi.New(cfg.PowerAPI.URL, cfg.PowerAPI.Token, cfg.PowerAPI.Load)
 	}
@@ -220,7 +244,8 @@ func (c *Controller) reconcile(ctx context.Context) {
 	}
 	c.observeFailures = 0
 	if !snap.NodeUp {
-		c.askedOff = false // the shed landed; a later hand-start must not be shut back down
+		c.askedOff = false         // the shed landed; a later hand-start must not be shut back down
+		c.pendingStop = stopTask{} // whatever it still had to stop went down with the host
 	}
 
 	plan := Decide(snap, c.cfg, now)
@@ -419,8 +444,18 @@ func (c *Controller) execute(ctx context.Context, p Plan, snap Snapshot) error {
 		}
 	}
 	if len(p.Stop) > 0 {
-		if _, err := c.stopAll(ctx, p.Stop); err != nil {
-			return err
+		if _, err := c.stopAll(ctx, p.Stop, c.wakeInterrupt(ctx, p)); err != nil {
+			if !errors.Is(err, errStopInterrupted) {
+				return err
+			}
+			// Someone asked for their desktop VM while the guests were going down. The stop task
+			// carries on - that load is shed either way - but the power-off this shed was headed
+			// for is off the table, so there is nothing left worth waiting for. Latch the mode
+			// and let the queued nudge adopt the session: the same landing state as the re-check
+			// below, minutes earlier.
+			c.log.Info("desktop VM requested while the guests were stopping: leaving p1 up",
+				"node", c.cfg.Proxmox.Node)
+			return c.saveMode(ctx, st, p)
 		}
 	}
 	if p.Wake {
@@ -428,11 +463,9 @@ func (c *Controller) execute(ctx context.Context, p Plan, snap Snapshot) error {
 			return err
 		}
 	}
-	if p.RestoreStopped {
-		if err := c.restoreStopped(ctx); err != nil {
-			return err
-		}
-	}
+	// Ahead of the restore: someone is waiting on this one, and nothing about it needs the
+	// restore first - config refuses a stop class overlapping the gaming guard, so the guests
+	// being restarted and the VM being started are always disjoint.
 	if len(p.StartRequested) > 0 {
 		// Best-effort: a desktop VM that won't boot is the user's problem, and failing the
 		// reconcile here would roll back the mode the wake just established.
@@ -440,12 +473,17 @@ func (c *Controller) execute(ctx context.Context, p Plan, snap Snapshot) error {
 			c.log.Warn("start requested desktop VMs", "err", err)
 		}
 	}
+	if p.RestoreStopped {
+		if err := c.restoreStopped(ctx); err != nil {
+			return err
+		}
+	}
 	if p.Poweroff {
-		// The last moment this is still a decision. Stopping the guests runs for minutes with
-		// the loop busy throughout, so a desktop VM asked for at the start of a shed is first
-		// read here - p1 still up, nothing yet told to shut it down. Leave it up and let the
-		// queued tick adopt the gaming session, instead of powering off and making someone
-		// wait out a shutdown and a boot for a host that never had to go down.
+		// The last moment this is still a decision, and the backstop for the poll in the stop
+		// phase: a request landing after that phase ends, or during a shed with no guests to
+		// stop at all, is first read here - p1 still up, nothing yet told to shut it down.
+		// Leave it up and let the queued tick adopt the gaming session, instead of powering off
+		// and making someone wait out a shutdown and a boot for a host that never had to go down.
 		if c.wakeRequestedNow(ctx, p.WakeDone) {
 			c.log.Info("desktop VM requested while shedding: leaving p1 up", "node", c.cfg.Proxmox.Node)
 			return c.saveMode(ctx, st, p)
@@ -489,6 +527,83 @@ func (c *Controller) wakeRequestedNow(ctx context.Context, done map[int]int64) b
 		}
 	}
 	return false
+}
+
+// wakeInterrupt is what cuts the stop phase short: a desktop VM asked for during a shed that
+// is still headed for a power-off. nil for every other plan, and in particular for the one that
+// already knows about the request - it stops the same guests and then starts the VM in the same
+// run, so interrupting it would abandon that stop only to put the start off until the next
+// tick. There is nothing to rescue there: p1 was never going down.
+//
+// Only the stop phase gets this. It is the last thing a shed does before the power-off, so
+// everything else has already been dispatched to Proxmox by then; giving up the wait during
+// the migrate phase instead would skip the stop entirely, and the plan that follows - ModeShed
+// adopting the session - plans no stop of its own, so that load would stay up all session.
+func (c *Controller) wakeInterrupt(ctx context.Context, p Plan) func() bool {
+	if !p.Poweroff {
+		return nil
+	}
+	return func() bool { return c.wakeRequestedNow(ctx, p.WakeDone) }
+}
+
+// errStopInterrupted reports that the wait for the bulk stop task was given up because a
+// desktop VM was asked for. The task itself is untouched and still running; only our waiting
+// on it ended.
+var errStopInterrupted = errors.New("desktop VM requested while the guests were stopping")
+
+// waitStop waits out the bulk stop task, polling interrupt alongside it. The guests are left to
+// finish going down either way: they are shed load whichever way the session goes, and the
+// point here is only that p1 is up and usable for the minutes that takes - which is exactly
+// how long a user who pressed Start seconds into a shed used to sit watching "shedding".
+func (c *Controller) waitStop(ctx context.Context, upid string, interrupt func() bool) error {
+	poll := c.wakePoll
+	if interrupt == nil || poll <= 0 {
+		// A Controller built by hand rather than by New has no poll interval, and NewTicker
+		// panics on one - inside the reconcile goroutine, mid-shed. Wait it out instead.
+		return c.px.WaitTask(ctx, c.cfg.Proxmox.Node, upid)
+	}
+	wctx, cancel := context.WithCancel(ctx)
+	defer cancel() // ends the waiter on every path out, including the interrupted one
+	done := make(chan error, 1)
+	go func() { done <- c.px.WaitTask(wctx, c.cfg.Proxmox.Node, upid) }()
+	t := time.NewTicker(poll)
+	defer t.Stop()
+	for {
+		select {
+		case err := <-done:
+			return err
+		case <-t.C:
+			// The task first: a select with both cases ready picks uniformly, so checking the
+			// interrupt straight away would now and then report a task that had just *failed*
+			// as interrupted - and an interrupted stop is never retried, while a failed one is.
+			select {
+			case err := <-done:
+				return err
+			default:
+			}
+			if interrupt() {
+				return errStopInterrupted
+			}
+		}
+	}
+}
+
+// settlePendingStop lets a stop task we walked away from finish before the guest list is read
+// for the restore, so a guest it had not reached yet is seen as stopped and started again
+// rather than left down. Bounded, and never fatal: the restore is best-effort, and a guest the
+// task never got to is still running, which is the harmless direction.
+func (c *Controller) settlePendingStop(ctx context.Context) {
+	task := c.pendingStop
+	if task.upid == "" {
+		return
+	}
+	c.pendingStop = stopTask{} // cleared before the wait: a wedged task is never re-entered
+	wctx, cancel := context.WithDeadline(ctx, task.deadline)
+	defer cancel()
+	c.log.Info("waiting for the abandoned stop task before restoring guests", "upid", task.upid)
+	if err := c.px.WaitTask(wctx, c.cfg.Proxmox.Node, task.upid); err != nil {
+		c.log.Warn("abandoned stop task did not finish cleanly", "upid", task.upid, "err", err)
+	}
 }
 
 // migrateAll runs one bulk migration per target node, concurrently. Guests still on the node
@@ -568,14 +683,21 @@ func (c *Controller) stillOnNode(ctx context.Context, vmids []int) ([]int, error
 
 // stopAll shuts the guests down in one bulk task: reverse startup order, max_workers at a
 // time, each guest given stopTimeout to go down cleanly before the task reports it failed.
-func (c *Controller) stopAll(ctx context.Context, guests []proxmox.Guest) ([]state.GuestRef, error) {
+// interrupt, when set, can give up the wait early; see waitStop.
+func (c *Controller) stopAll(ctx context.Context, guests []proxmox.Guest, interrupt func() bool) ([]state.GuestRef, error) {
 	// Proxmox gives each guest stopTimeout; bound the whole task at the worst case of every
 	// guest in its own order group, so a task that never reports done can't wedge the loop.
 	sctx, cancel := context.WithTimeout(ctx, time.Duration(len(guests))*c.cfg.Proxmox.StopTimeout.Duration)
 	defer cancel()
 	upid, err := c.px.StopAll(sctx, c.cfg.Proxmox.Node, guestIDs(guests), c.cfg.Proxmox.StopTimeout.Duration)
 	if err == nil {
-		err = c.px.WaitTask(sctx, c.cfg.Proxmox.Node, upid)
+		err = c.waitStop(sctx, upid, interrupt)
+		if errors.Is(err, errStopInterrupted) {
+			// Still working through the guests; the restore waits for it, on the budget it was
+			// given here rather than one invented at the far end.
+			deadline, _ := sctx.Deadline()
+			c.pendingStop = stopTask{upid: upid, deadline: deadline}
+		}
 	}
 	// Read back what stopped on the caller's ctx, not sctx: a stop that timed out still has to
 	// record what did go down, or good-morning never starts those guests again.
@@ -614,6 +736,7 @@ func (c *Controller) stoppedOf(ctx context.Context, want []proxmox.Guest) ([]sta
 // then empty exactly when it is needed. Guests tagged NoAutostartTag stay off - the watchdog
 // cannot tell a hand-stopped guest from one a shutdown killed, so that intent is declared.
 func (c *Controller) restoreStopped(ctx context.Context) error {
+	c.settlePendingStop(ctx)
 	guests, err := c.px.Guests(ctx, c.cfg.Proxmox.Node)
 	if err != nil {
 		return err
