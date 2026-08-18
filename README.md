@@ -143,9 +143,14 @@ the next poll rather than needing a config change here.
 
 Starting the host is the one thing the UI doesn't do itself: it records intent and the
 reconcile loop acts on it, so there's still exactly one owner of the host's power state — a
-click while a shed is halfway through migrating guests can't fight it. A request that lands
-during a shutdown simply stays outstanding until the shutdown finishes, and the loop then wakes
-the host. Guest power actions go straight to Proxmox, which can't turn `p1` on or off and so
+click while a shed is halfway through migrating guests can't fight it. Where the click lands is
+what decides how long it takes: until the power-off is actually sent a shed is still only a
+plan, so a request while the guests are stopping cancels it outright — the stop carries on, but
+the host stays up and the VM starts on it within seconds rather than after the whole shutdown.
+Once the power-off has gone out there is no taking it back, and the request simply stays
+outstanding until the shutdown finishes, with the loop then waking the host — which is a
+shutdown plus a boot, so it is worth catching the earlier window when you can.
+Guest power actions go straight to Proxmox, which can't turn `p1` on or off and so
 can't break that. A request stops acting the moment its VM has been up, so shutting the VM down
 again — from the UI or from inside the guest — leaves it down instead of being started back up.
 

@@ -2,10 +2,18 @@ package controller
 
 import (
 	"context"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"slices"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/JHOFER-Cloud/energy-watchdog/internal/config"
 	"github.com/JHOFER-Cloud/energy-watchdog/internal/powerapi"
+	"github.com/JHOFER-Cloud/energy-watchdog/internal/proxmox"
 	"github.com/JHOFER-Cloud/energy-watchdog/internal/state"
 )
 
@@ -29,6 +37,266 @@ func (s *lateIntent) LoadIntent(ctx context.Context) (state.Intent, error) {
 		i.Wake = append(i.Wake, s.req)
 	}
 	return i, nil
+}
+
+// hangingStop is delegateFixture's Proxmox fake with one change: the bulk stop task is never
+// reported finished. That is the production shape - 211, 212, 202 and 201 took 5m51s to go
+// down, and the loop sat in WaitTask for every second of it.
+func hangingStop(t *testing.T) (*proxmox.Client, func() []string) {
+	t.Helper()
+	var mu sync.Mutex
+	var calls []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		calls = append(calls, r.URL.Path)
+		mu.Unlock()
+		switch p := r.URL.Path; {
+		case p == "/api2/json/nodes":
+			_, _ = w.Write([]byte(`{"data":[{"node":"pve-1","status":"online","uptime":100000}]}`))
+		case p == "/api2/json/nodes/pve-1/qemu":
+			_, _ = w.Write([]byte(`{"data":[{"vmid":301,"status":"running","name":"g"}]}`))
+		case p == "/api2/json/nodes/pve-1/lxc", p == "/api2/json/cluster/replication":
+			_, _ = w.Write([]byte(`{"data":[]}`))
+		case strings.Contains(p, "/tasks/UPID:stopping/"):
+			_, _ = w.Write([]byte(`{"data":{"status":"running"}}`))
+		default: // stopall and the other task-returning calls
+			_, _ = w.Write([]byte(`{"data":"UPID:stopping"}`))
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return proxmox.New(srv.URL, "u@pam!t", "s", nil), func() []string {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]string(nil), calls...)
+	}
+}
+
+// The half of the production failure that survived the fix at the power-off. No power-off was
+// ever sent - the re-check saw the request and left p1 up, exactly as designed - but it only
+// got to run once the guests were down. p1 was up and usable for all 5m51s of that, and the
+// user who pressed Start 4 seconds in watched "shedding" for the whole of it.
+//
+// The stop phase is the last thing between the plan and the power-off, so once a request lands
+// there is nothing left worth waiting for: the guests carry on going down on Proxmox's side
+// while the loop latches the mode and lets the queued nudge start the VM.
+func TestARequestDuringTheStopPhaseCutsTheWaitShort(t *testing.T) {
+	nut := &fakeNutDog{}
+	srv := nut.server(t)
+	defer srv.Close()
+
+	c, _ := delegateFixture(t, "-800", srv.URL, state.ModeRunning, true)
+	px, pxCalls := hangingStop(t)
+	c.px = px
+	c.wakePoll = 5 * time.Millisecond
+	// Long enough that waiting the stop out cannot be mistaken for cutting it short.
+	c.cfg.Proxmox.StopTimeout = config.Duration{Duration: 30 * time.Second}
+	c.store = &lateIntent{Store: c.store,
+		req: state.WakeRequest{VMID: 601, User: "josef", RequestedAt: time.Now().Unix()}}
+
+	done := make(chan struct{})
+	go func() {
+		c.reconcile(context.Background())
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("reconcile is still waiting out the stop task; the request should have ended the wait")
+	}
+
+	if got := nut.requests(); len(got) != 0 {
+		t.Errorf("power requests = %v, want none: p1 was still up and wanted", got)
+	}
+	if c.askedOff {
+		t.Error("askedOff set: the power-off went out despite a live request")
+	}
+	// Cutting the wait short is not the same as skipping the shed: the load still has to have
+	// been told to go, or a session during a deficit runs with everything else still up.
+	if !slices.Contains(pxCalls(), "/api2/json/nodes/pve-1/stopall") {
+		t.Error("no stopall was ever issued; the guests have to be shed, only the wait is skipped")
+	}
+	if c.pendingStop.upid == "" {
+		t.Error("pendingStop is empty: the restore has no way to wait for the task we left running")
+	}
+	st, err := c.store.Load(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Mode != state.ModeShed {
+		t.Errorf("mode = %q, want shed so the next tick adopts the gaming session", st.Mode)
+	}
+}
+
+// The budget has to travel with the task. stopAll allows it every guest's stopTimeout in turn,
+// so a settle that invented a fresh single stopTimeout would give up while the task still had
+// guests to go - and the restore would then read the very guest list mid-task that waiting was
+// meant to avoid. Four guests at 10m, the production shape, is 40m of budget against 10m.
+func TestTheAbandonedStopKeepsItsOwnBudget(t *testing.T) {
+	nut := &fakeNutDog{}
+	srv := nut.server(t)
+	defer srv.Close()
+
+	c, _ := delegateFixture(t, "-800", srv.URL, state.ModeRunning, true)
+	c.px, _ = hangingStop(t)
+	c.wakePoll = 5 * time.Millisecond
+	c.cfg.Proxmox.StopTimeout = config.Duration{Duration: time.Minute}
+
+	guests := []proxmox.Guest{
+		{VMID: 301, Type: proxmox.TypeQEMU, Running: true},
+		{VMID: 302, Type: proxmox.TypeQEMU, Running: true},
+		{VMID: 303, Type: proxmox.TypeQEMU, Running: true},
+	}
+	if _, err := c.stopAll(context.Background(), guests, func() bool { return true }); !errors.Is(err, errStopInterrupted) {
+		t.Fatalf("stopAll = %v, want the interrupt", err)
+	}
+
+	// Three guests at a minute each, minus the moment the call itself took.
+	if got := time.Until(c.pendingStop.deadline); got < 2*time.Minute {
+		t.Errorf("deadline is %s away, want ~3m: the task's own budget, not one stopTimeout", got)
+	}
+}
+
+// Walking away from the stop task leaves it working through its guests, and good-morning can
+// land while it still is. A guest it has not reached yet reads as running, a running guest is
+// no part of the restore - and the task stops it moments later, so nothing starts it again
+// until the next shed and restore, a day away. The restore has to let that task land first.
+func TestTheRestoreWaitsForAnAbandonedStop(t *testing.T) {
+	var mu sync.Mutex
+	taskSettled, started := false, false
+	px := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch p := r.URL.Path; {
+		case strings.Contains(p, "/tasks/UPID:stopping/"):
+			taskSettled = true
+			_, _ = w.Write([]byte(`{"data":{"status":"stopped","exitstatus":"OK"}}`))
+		case p == "/api2/json/nodes/pve-1/qemu":
+			// 301 is the guest the abandoned task still had to reach: running until it lands.
+			status := "running"
+			if taskSettled {
+				status = "stopped"
+			}
+			_, _ = w.Write([]byte(`{"data":[{"vmid":301,"status":"` + status + `","name":"g"}]}`))
+		case p == "/api2/json/nodes/pve-1/lxc":
+			_, _ = w.Write([]byte(`{"data":[]}`))
+		case strings.HasSuffix(p, "/startall"):
+			started = true
+			_, _ = w.Write([]byte(`{"data":"UPID:done"}`))
+		case strings.Contains(p, "/tasks/"):
+			_, _ = w.Write([]byte(`{"data":{"status":"stopped","exitstatus":"OK"}}`))
+		default:
+			_, _ = w.Write([]byte(`{"data":"UPID:done"}`))
+		}
+	}))
+	defer px.Close()
+
+	nut := &fakeNutDog{}
+	srv := nut.server(t)
+	defer srv.Close()
+
+	c, _ := delegateFixture(t, "5000", srv.URL, state.ModeShed, true)
+	c.px = proxmox.New(px.URL, "u@pam!t", "s", nil)
+	c.pendingStop = stopTask{upid: "UPID:stopping", deadline: time.Now().Add(time.Minute)}
+
+	if err := c.restoreStopped(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if !started {
+		t.Error("301 was left down: the guest list was read while the abandoned stop was still running")
+	}
+	if c.pendingStop.upid != "" {
+		t.Errorf("pendingStop = %q, want cleared once it has been waited for", c.pendingStop.upid)
+	}
+}
+
+// Good-morning starts the VM someone is waiting on before it restores the stop class. Behind
+// the restore it waited out that bulk start task's up= delays, and any stop task we walked away
+// from - minutes in which a request can pass its gamingGrace TTL, leaving a VM that then fails
+// to start with no live request to retry it. The two sets are disjoint by config, so nothing
+// about the start needs the restore to have happened first.
+func TestTheRequestedVMStartsBeforeTheRestore(t *testing.T) {
+	var mu sync.Mutex
+	var order []string
+	px := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch p := r.URL.Path; {
+		case p == "/api2/json/nodes":
+			_, _ = w.Write([]byte(`{"data":[{"node":"pve-1","status":"online","uptime":100000}]}`))
+		case p == "/api2/json/nodes/pve-1/qemu":
+			// 301 is stop-class and down, so the restore wants it; 601 is the requested desktop VM.
+			_, _ = w.Write([]byte(`{"data":[{"vmid":301,"status":"stopped"},{"vmid":601,"status":"stopped"}]}`))
+		case p == "/api2/json/nodes/pve-1/lxc", p == "/api2/json/cluster/replication":
+			_, _ = w.Write([]byte(`{"data":[]}`))
+		case strings.HasSuffix(p, "/startall"):
+			mu.Lock()
+			order = append(order, r.FormValue("vms"))
+			mu.Unlock()
+			_, _ = w.Write([]byte(`{"data":"UPID:done"}`))
+		default:
+			_, _ = w.Write([]byte(`{"data":{"status":"stopped","exitstatus":"OK"}}`))
+		}
+	}))
+	defer px.Close()
+
+	nut := &fakeNutDog{}
+	srv := nut.server(t)
+	defer srv.Close()
+
+	// Surplus with a live request: good-morning restores the stop class and starts the VM.
+	c, _ := delegateFixture(t, "5000", srv.URL, state.ModeGaming, true)
+	c.px = proxmox.New(px.URL, "u@pam!t", "s", nil)
+	if err := c.store.SaveIntent(context.Background(), state.Intent{
+		Wake: []state.WakeRequest{{VMID: 601, User: "josef", RequestedAt: time.Now().Unix()}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	c.reconcile(context.Background())
+
+	mu.Lock()
+	defer mu.Unlock()
+	if !slices.Equal(order, []string{"601", "301"}) {
+		t.Errorf("startall order = %v, want [601 301]: the VM someone is waiting on goes first", order)
+	}
+}
+
+// The trap in interrupting the stop phase: a plan that already knows about the request stops
+// the same guests and then starts the VM in the same run. Cutting that one short abandons its
+// stop and returns before the start, putting the VM off until the next tick - slower, for a
+// host that was never going down in the first place.
+func TestAKnownRequestDoesNotAbandonItsOwnStop(t *testing.T) {
+	nut := &fakeNutDog{}
+	srv := nut.server(t)
+	defer srv.Close()
+
+	c, _ := delegateFixture(t, "-800", srv.URL, state.ModeRunning, true)
+	c.px, _ = hangingStop(t)
+	c.wakePoll = 5 * time.Millisecond
+	c.cfg.Proxmox.StopTimeout = config.Duration{Duration: 30 * time.Second}
+	ctx, cancel := context.WithCancel(context.Background())
+	// Live before the first read, so Decide plans the gaming shed itself: stop the load, keep
+	// p1 up, start the VM. No power-off, and so nothing to interrupt.
+	if err := c.store.SaveIntent(ctx, state.Intent{
+		Wake: []state.WakeRequest{{VMID: 601, User: "josef", RequestedAt: time.Now().Unix()}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		c.reconcile(ctx)
+		close(done)
+	}()
+	select {
+	case <-done:
+		cancel()
+		t.Fatal("reconcile returned while the guests were still stopping: it abandoned its own stop")
+	case <-time.After(200 * time.Millisecond): // still in the stop phase, as it should be
+	}
+	cancel()
+	<-done
 }
 
 // The production failure of 14:40. A shed was planned, stopping the guests ran for 5m45s with
