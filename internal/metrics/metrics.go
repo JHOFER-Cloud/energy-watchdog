@@ -150,8 +150,9 @@ func (m *Metrics) Handler() http.HandlerFunc {
 			fmt.Fprintf(w, "# TYPE energy_watchdog_power_request_success gauge\n")
 			fmt.Fprintf(w, "energy_watchdog_power_request_success %g\n", b2f(*m.powerReqOK))
 		}
-		// Alert on this: the loop is deliberately not acting, and p1 is probably up and
-		// unmanaged. max_over_time(energy_watchdog_node_unconfirmed[10m]) == 1.
+		// Alert on this sustained (== 1 for 10m): the loop is deliberately not acting, and p1
+		// is probably up and unmanaged. Not on a single tick - one unconfirmed reading is a
+		// normal nut-dog blip that the next tick clears.
 		fmt.Fprintf(w, "# HELP energy_watchdog_node_unconfirmed Whether p1 reads offline with nothing agreeing it lost power.\n")
 		fmt.Fprintf(w, "# TYPE energy_watchdog_node_unconfirmed gauge\n")
 		fmt.Fprintf(w, "energy_watchdog_node_unconfirmed %g\n", b2f(m.unconfirmed))

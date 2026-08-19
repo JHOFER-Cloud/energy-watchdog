@@ -101,5 +101,12 @@ func (c *Client) State(ctx context.Context) (actual string, age time.Duration, e
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<10)).Decode(&body); err != nil {
 		return "", 0, fmt.Errorf("decode power state: %w", err)
 	}
-	return body.Actual, time.Duration(body.AgeSeconds) * time.Second, nil
+	switch body.Actual {
+	case ActualUp, ActualDown, ActualUnknown:
+		return body.Actual, time.Duration(body.AgeSeconds) * time.Second, nil
+	default:
+		// A word we don't know is not an opinion. Normalising it here keeps every caller's
+		// "nobody could corroborate this" path reachable by one value rather than several.
+		return ActualUnknown, time.Duration(body.AgeSeconds) * time.Second, nil
+	}
 }

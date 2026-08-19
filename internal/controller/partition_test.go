@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/JHOFER-Cloud/energy-watchdog/internal/metrics"
+	"github.com/JHOFER-Cloud/energy-watchdog/internal/prom"
 	"github.com/JHOFER-Cloud/energy-watchdog/internal/state"
 )
 
@@ -212,5 +213,37 @@ func TestTheUnconfirmedHoldIsVisible(t *testing.T) {
 	m.Handler()(rr, httptest.NewRequest("GET", "/metrics", nil))
 	if !strings.Contains(rr.Body.String(), "energy_watchdog_node_unconfirmed 1") {
 		t.Errorf("holding on an unconfirmed reading left no signal:\n%s", rr.Body.String())
+	}
+}
+
+// The hold gauge must not outlive the state it describes. Its alert is critical, says the loop
+// is healthy and holding deliberately, and offers the operator a manual power-off - so leaving
+// it latched while the loop has gone blind advises exactly the wrong thing at the worst moment.
+func TestTheUnconfirmedSignalClearsWhenTheLoopGoesBlind(t *testing.T) {
+	nut := &fakeNutDog{actual: "up"}
+	srv := nut.server(t)
+	defer srv.Close()
+
+	c, _ := delegateFixture(t, "-800", srv.URL, state.ModeGaming, false)
+	m := metrics.New(false)
+	c.metrics = m
+	ctx := context.Background()
+
+	c.reconcile(ctx) // holds: p1 reads offline, nut-dog says it is up
+	rr := httptest.NewRecorder()
+	m.Handler()(rr, httptest.NewRequest("GET", "/metrics", nil))
+	if !strings.Contains(rr.Body.String(), "energy_watchdog_node_unconfirmed 1") {
+		t.Fatalf("expected the hold to be signalled:\n%s", rr.Body.String())
+	}
+
+	dead := httptest.NewServer(nil)
+	dead.Close()
+	c.prom = prom.New(dead.URL) // now we cannot observe at all
+	c.reconcile(ctx)
+
+	rr = httptest.NewRecorder()
+	m.Handler()(rr, httptest.NewRequest("GET", "/metrics", nil))
+	if !strings.Contains(rr.Body.String(), "energy_watchdog_node_unconfirmed 0") {
+		t.Errorf("the hold signal survived a blind tick; it now claims a healthy loop:\n%s", rr.Body.String())
 	}
 }

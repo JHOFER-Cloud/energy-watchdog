@@ -239,6 +239,11 @@ func (c *Controller) reconcile(ctx context.Context) {
 			c.log.Warn("observe failed", "err", err, "consecutive", c.observeFailures)
 		}
 		c.metrics.MarkStale(now.Unix())
+		// Whatever we were holding for, this is not it any more: blind is not the same as
+		// deliberately holding a host we can see is alive, and the alert on that gauge tells
+		// the operator the loop is healthy and offers them a manual power-off. Leaving it
+		// latched here would say exactly that while we cannot observe at all.
+		c.metrics.SetNodeUnconfirmed(false)
 		// Blind, not silent: going quiet leaves nut-dog deciding p1 from a stale request,
 		// which after a UPS recovery means waking it at whatever hour that lands, with no
 		// solar reading behind it. This pins p1 where it is until we can decide again, except
