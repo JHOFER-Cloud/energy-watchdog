@@ -22,7 +22,7 @@ const (
 	Hold = "hold"
 )
 
-// What nut-dog's probe last saw for the load.
+// Probe states reported by nut-dog for a load.
 const (
 	ActualUp      = "up"
 	ActualDown    = "down"
@@ -71,13 +71,11 @@ func (c *Client) Request(ctx context.Context, desired, reason string) error {
 	return nil
 }
 
-// State is what nut-dog's own probe last saw for the load, and how old that reading is.
+// State returns nut-dog's last probe of the load and the age of that reading.
 //
-// It is worth the extra call because it is a different question from the one Proxmox answers.
-// Node state comes from the *other* pve nodes, so a p1 partitioned from corosync is reported
-// offline there while the host is up and serving - and a power-off decided on that reading
-// shuts down a healthy machine. nut-dog's probe reaches p1 directly and does not care what the
-// cluster thinks of it.
+// This answers a different question from Proxmox node state, which is reported by the other
+// pve nodes and so reads offline for a host that is merely partitioned from corosync. nut-dog
+// probes the host directly.
 func (c *Client) State(ctx context.Context) (actual string, age time.Duration, err error) {
 	url := fmt.Sprintf("%s/api/loads/%s/state", c.base, c.load)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
@@ -101,12 +99,9 @@ func (c *Client) State(ctx context.Context) (actual string, age time.Duration, e
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<10)).Decode(&body); err != nil {
 		return "", 0, fmt.Errorf("decode power state: %w", err)
 	}
-	// Reported as received, including a word we don't know. Normalising an unrecognised state
-	// to "unknown" here would be safe for the decision - the caller treats anything it cannot
-	// read as nobody's opinion - but it would make a vocabulary that has drifted between the
-	// two services indistinguishable from nut-dog simply having nothing to say. That is the
-	// one failure worth being loud about: it silently disables the "p1 probes up, hold its
-	// power" protection and leaves only the weaker two-tick rule, which on its own would not
-	// have prevented the shed this whole path exists to stop.
+	// Returned as received, unrecognised values included. Both services declare this
+	// vocabulary independently, so normalising an unknown word here would make a drift between
+	// them indistinguishable from nut-dog having no opinion - and a drift disables the
+	// caller's up/down handling entirely. Callers treat anything they cannot read as unknown.
 	return body.Actual, time.Duration(body.AgeSeconds) * time.Second, nil
 }

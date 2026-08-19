@@ -11,15 +11,9 @@ import (
 	"github.com/JHOFER-Cloud/energy-watchdog/internal/state"
 )
 
-// The production failure of 17:36 on 19 Aug. p1 dropped out of corosync at 17:35:08
-// ("members: 1/4773") while running perfectly well and serving a gaming session. Proxmox
-// answers node state from the *other* nodes, so it reported pve-1 offline; the loop latched
-// gaming -> shed on that, and the next tick's restate turned mode-shed-and-down into "off".
-// nut-dog asserted the shed signal, p1's upsmon logged "forced shutdown in progress", and the
-// session died - to a host that was never off and never in any trouble.
-//
-// nut-dog knew all along: its probe is a TCP check against pve-1's own Proxmox port, which
-// does not care what the cluster thinks. Asking it is what settles this.
+// Regression for the 19 Aug shed: p1 left corosync while running, Proxmox reported pve-1
+// offline, the loop latched gaming -> shed, and the next tick's restate sent off. Two ticks,
+// because the second is the one that used to send it.
 func TestAPartitionedP1IsNeverShed(t *testing.T) {
 	nut := &fakeNutDog{actual: "up"} // the probe reaches p1 directly: still running
 	srv := nut.server(t)
@@ -46,8 +40,7 @@ func TestAPartitionedP1IsNeverShed(t *testing.T) {
 	}
 }
 
-// With nobody to confirm it, one tick is not evidence. The cluster has to say it twice before
-// the loop acts - which is cheap insurance, since the only thing lost is a minute.
+// With no usable probe the reading must repeat nodeDownConfirm times before the mode latches.
 func TestAnUnconfirmedDownWaitsForASecondTick(t *testing.T) {
 	nut := &fakeNutDog{} // no opinion
 	srv := nut.server(t)
@@ -74,7 +67,7 @@ func TestAnUnconfirmedDownWaitsForASecondTick(t *testing.T) {
 	}
 }
 
-// A probe that agrees p1 is down settles it on the spot: waiting a second tick would only
+// A probe that corroborates the offline reading latches on the first tick; waiting would only
 // delay the shed bookkeeping for a host that is genuinely off.
 func TestAProbedDownIsBelievedAtOnce(t *testing.T) {
 	nut := &fakeNutDog{actual: "down"}
@@ -101,9 +94,8 @@ func TestAProbedDownIsBelievedAtOnce(t *testing.T) {
 	}
 }
 
-// A probe is only evidence while it is fresh. nut-dog polls every 15s, so a reading approaching
-// probeMaxAge means its own loop is in trouble - and a stale "up" must not be allowed to hold
-// p1 in limbo forever, any more than a stale "down" should settle an argument.
+// A probe older than probeMaxAge is not corroboration in either direction: a stale "up" must
+// not hold p1 indefinitely, and a stale "down" must not shortcut the streak.
 func TestAStaleProbeSettlesNothing(t *testing.T) {
 	nut := &fakeNutDog{actual: "up", ageSec: 3600} // its loop stopped an hour ago
 	srv := nut.server(t)
@@ -131,9 +123,8 @@ func TestAStaleProbeSettlesNothing(t *testing.T) {
 	}
 }
 
-// The streak counts *consecutive* unconfirmed readings. A probe that reaches p1 is evidence
-// against acting, so it has to clear the count - otherwise two unreachable-nut-dog ticks either
-// side of a "p1 is up" add up to a reason to shed a host we were just told is alive.
+// The streak counts consecutive readings only. A successful probe clears it, so uncorroborated
+// ticks either side of a "p1 is up" must not accumulate into a reason to act.
 func TestAProbeThatReachesP1ClearsTheStreak(t *testing.T) {
 	nut := &fakeNutDog{} // starts with no opinion
 	srv := nut.server(t)
@@ -163,9 +154,8 @@ func TestAProbeThatReachesP1ClearsTheStreak(t *testing.T) {
 	}
 }
 
-// powerWish directly, because two rows of TestRestateNeverOverridesTheLoop now exit through
-// the confirmDown hold path and never reach it. Off is a decision, never an inference: only a
-// shed this loop asked for produces one.
+// powerWish directly: two rows of TestRestateNeverOverridesTheLoop now exit through the
+// confirmDown hold path and no longer reach it. Only askedOff yields off.
 func TestPowerWishOnlyEverInfersHold(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -194,10 +184,8 @@ func TestPowerWishOnlyEverInfersHold(t *testing.T) {
 	}
 }
 
-// The hold can persist for as long as the partition does, and it means something quite
-// different from a failing reconcile: p1 is most likely up and running unmanaged. It needs its
-// own signal, or the only thing an operator sees is a stale-reconcile alert telling them to go
-// read the pod logs.
+// The hold is distinct from a failing reconcile - p1 is likely up and unmanaged - so it needs
+// its own gauge rather than only surfacing as a stale reconcile.
 func TestTheUnconfirmedHoldIsVisible(t *testing.T) {
 	nut := &fakeNutDog{actual: "up"}
 	srv := nut.server(t)
@@ -216,9 +204,8 @@ func TestTheUnconfirmedHoldIsVisible(t *testing.T) {
 	}
 }
 
-// The hold gauge must not outlive the state it describes. Its alert is critical, says the loop
-// is healthy and holding deliberately, and offers the operator a manual power-off - so leaving
-// it latched while the loop has gone blind advises exactly the wrong thing at the worst moment.
+// The gauge must not outlive the state it describes. Its alert asserts the loop is otherwise
+// healthy, so a value latched across blind ticks would misreport a failing reconcile.
 func TestTheUnconfirmedSignalClearsWhenTheLoopGoesBlind(t *testing.T) {
 	nut := &fakeNutDog{actual: "up"}
 	srv := nut.server(t)
@@ -248,9 +235,8 @@ func TestTheUnconfirmedSignalClearsWhenTheLoopGoesBlind(t *testing.T) {
 	}
 }
 
-// A vocabulary drift between the two services must not read as "up". If it did, the check that
-// keeps a partitioned p1 alive would be silently disabled and only the two-tick rule would
-// remain - the weaker guarantee that on its own would not have stopped the 19 Aug shed.
+// An unrecognised probe state must behave as no opinion: neither latching on the first tick
+// like "down", nor holding indefinitely like "up".
 func TestAnUnrecognisedProbeStateFallsBackRatherThanDeciding(t *testing.T) {
 	nut := &fakeNutDog{actual: "powered-on"} // a word this side does not know
 	srv := nut.server(t)
@@ -259,7 +245,7 @@ func TestAnUnrecognisedProbeStateFallsBackRatherThanDeciding(t *testing.T) {
 	c, _ := delegateFixture(t, "-800", srv.URL, state.ModeGaming, false)
 	ctx := context.Background()
 
-	// Not treated as "down": one tick must not be enough to act on.
+	// Not "down": one tick must not be enough to act on.
 	c.reconcile(ctx)
 	st, err := c.store.Load(ctx)
 	if err != nil {
@@ -269,8 +255,7 @@ func TestAnUnrecognisedProbeStateFallsBackRatherThanDeciding(t *testing.T) {
 		t.Fatalf("mode = %q after one tick, want gaming: an unreadable answer is not a reading", st.Mode)
 	}
 
-	// ...and not treated as "up" either, which would hold p1 in limbo for as long as the
-	// drift lasted.
+	// ...and not "up", which would hold p1 for as long as the drift lasted.
 	c.reconcile(ctx)
 	if st, err = c.store.Load(ctx); err != nil {
 		t.Fatal(err)

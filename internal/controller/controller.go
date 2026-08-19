@@ -60,8 +60,8 @@ type Controller struct {
 	// for. A field so tests don't have to wait it out; see waitStop.
 	wakePoll time.Duration
 
-	// nodeDownStreak counts consecutive ticks that reported p1 offline with nothing agreeing
-	// it lost power. Reset the moment p1 reads up; see confirmDown.
+	// nodeDownStreak counts consecutive uncorroborated "p1 offline" readings. Reset when p1
+	// reads up, or when nut-dog's probe reaches it. See confirmDown.
 	nodeDownStreak int
 
 	// pendingStop is a bulk stop task we stopped waiting for, kept so the restore can let it
@@ -239,10 +239,8 @@ func (c *Controller) reconcile(ctx context.Context) {
 			c.log.Warn("observe failed", "err", err, "consecutive", c.observeFailures)
 		}
 		c.metrics.MarkStale(now.Unix())
-		// Whatever we were holding for, this is not it any more: blind is not the same as
-		// deliberately holding a host we can see is alive, and the alert on that gauge tells
-		// the operator the loop is healthy and offers them a manual power-off. Leaving it
-		// latched here would say exactly that while we cannot observe at all.
+		// A blind tick is not an unconfirmed-down hold. EnergyWatchdogNodeUnconfirmed asserts
+		// the loop is otherwise healthy, so the gauge must not stay latched here.
 		c.metrics.SetNodeUnconfirmed(false)
 		// Blind, not silent: going quiet leaves nut-dog deciding p1 from a stale request,
 		// which after a UPS recovery means waking it at whatever hour that lands, with no
@@ -255,10 +253,9 @@ func (c *Controller) reconcile(ctx context.Context) {
 	if snap.NodeUp {
 		c.nodeDownStreak = 0
 	} else if !c.confirmDown(ctx, snap) {
-		// p1 reads offline but nothing agrees it actually lost power. Do not latch a mode off
-		// that: treat the tick like a failed observe, which pins p1 where it is. This can hold
-		// indefinitely - a partition does not heal on our account - so it gets its own gauge
-		// rather than hiding inside the stale-reconcile one.
+		// Uncorroborated offline reading: skip the tick without latching a mode, as for a
+		// failed observe. Holds for as long as the condition lasts, hence its own gauge
+		// rather than only the stale-reconcile one.
 		c.metrics.SetNodeUnconfirmed(true)
 		c.metrics.MarkStale(now.Unix())
 		c.holdPower(ctx)
@@ -551,36 +548,31 @@ func (c *Controller) wakeRequestedNow(ctx context.Context, done map[int]int64) b
 	return false
 }
 
-// nodeDownConfirm is how many consecutive ticks must report p1 offline, with nothing else
-// agreeing, before this loop acts on it. One tick is not evidence: the reading comes from the
-// rest of the pve cluster, which loses sight of a node for reasons that have nothing to do
-// with power.
+// nodeDownConfirm is how many consecutive uncorroborated "p1 offline" readings are required
+// before acting on one. Proxmox answers node state from the other cluster members, so the
+// reading also goes false on a corosync partition.
 const nodeDownConfirm = 2
 
-// probeMaxAge is how old nut-dog's probe of p1 may be and still count as an opinion. It polls
-// every 15s, so anything approaching this means its own loop is in trouble and the reading
-// should not be allowed to settle an argument.
+// probeMaxAge bounds how old nut-dog's probe may be to count as corroboration. It polls every
+// 15s; a reading near this bound means nut-dog's own loop is degraded.
 const probeMaxAge = 2 * time.Minute
 
-// confirmDown decides whether to believe a Proxmox cluster reporting p1 offline.
+// confirmDown reports whether an offline reading from Proxmox should be acted on.
 //
-// That reading is not a power reading. It is the *other* pve nodes' opinion, so a p1 merely
-// partitioned from corosync is reported exactly like one that is switched off - and this loop
-// acting on it is what powered a healthy host down under a running gaming session: mode
-// latched to shed, and the restate then asserted off, whereupon p1's upsmon shut it down.
+// Proxmox answers node state from the other pve nodes, so a p1 partitioned from corosync is
+// indistinguishable there from one that has lost power. Acting on it unconditionally latches
+// ModeShed, and the restate then asserted off on a host that was still running.
 //
-// Only a reading that contradicts us is worth confirming. A shed of ours needs none - down is
-// precisely what we asked for - and neither does a mode that already has p1 down, where it is
-// the expected steady state and confirming it every tick would only delay good-morning.
-// Otherwise nut-dog's probe settles it, since that reaches p1 directly; and where it has no
-// fresh opinion, the cluster has to say it twice.
+// Corroboration is only required where the reading contradicts what we already hold: askedOff
+// and ModeShed both expect p1 down, and confirming those would delay good-morning by a tick.
+// Otherwise nut-dog's probe decides, since it reaches p1 directly; with no fresh probe the
+// reading must repeat nodeDownConfirm times.
 func (c *Controller) confirmDown(ctx context.Context, snap Snapshot) bool {
 	if c.askedOff || snap.Mode == state.ModeShed {
 		return true
 	}
-	// Anything we cannot use reads as unknown, so the fallback below is reached by one path
-	// rather than several: no nut-dog configured, a failed call, or a probe too old to mean
-	// anything are all "nobody can corroborate this".
+	// Normalise every unusable case - no power API configured, failed call, stale probe - to
+	// unknown, so the fallback below is reached by one value.
 	actual, age := powerapi.ActualUnknown, time.Duration(0)
 	if c.power != nil {
 		switch a, ag, err := c.power.State(ctx); {
@@ -594,10 +586,9 @@ func (c *Controller) confirmDown(ctx context.Context, snap Snapshot) bool {
 	}
 	switch actual {
 	case powerapi.ActualUp:
-		// The one case worth shouting about: p1 is running and we cannot see it. Powering it
-		// off from here would take down whatever is running on it. The streak resets too - a
-		// probe that reaches p1 is evidence *against* acting, and leaving it standing would let
-		// two such ticks either side of an unreachable nut-dog add up to a reason to act.
+		// p1 is reachable, so the offline reading is ours to distrust. Reset the streak as
+		// well: a successful probe must not leave earlier uncorroborated ticks to accumulate
+		// with later ones, which would make non-consecutive readings act like consecutive.
 		c.nodeDownStreak = 0
 		c.log.Error("p1 reads offline in Proxmox but nut-dog probes it as up: holding its power",
 			"node", c.cfg.Proxmox.Node, "probeAge", age)
@@ -605,12 +596,11 @@ func (c *Controller) confirmDown(ctx context.Context, snap Snapshot) bool {
 	case powerapi.ActualDown:
 		return true // an independent reading agrees; no need to wait for a second tick
 	case powerapi.ActualUnknown, "":
-		// nut-dog has nothing to say, or we never got to ask. Fall through to the streak.
+		// No opinion, or no answer at all. Fall through to the streak.
 	default:
-		// A word we don't recognise means the two services no longer agree on the vocabulary,
-		// which silently costs us the check above - the one that keeps a partitioned p1 alive -
-		// and leaves only the streak, which would not have stopped the shed on 19 Aug. Safe to
-		// carry on, but never quietly.
+		// Vocabulary drift between the two services: the up/down branches above are then
+		// unreachable and only the streak remains, which is the weaker guarantee. Safe to
+		// continue on, but not silently.
 		c.log.Error("nut-dog reported a power state we do not recognise; the up/down check is not working",
 			"actual", actual, "node", c.cfg.Proxmox.Node)
 	}
@@ -980,12 +970,10 @@ func (c *Controller) powerOff(ctx context.Context, reason string) error {
 // and leave p1 running. Without that flag the state is indistinguishable from a p1 started by
 // hand during a shed, where asserting off would cut power under running guests.
 //
-// Nothing else ever asks for off. A p1 that merely *reads* as down used to restate off here,
-// to keep the request level-triggered against a nut-dog that had restarted and forgotten - but
-// nut-dog's own startup grace holds every power-on for minutes after a restart, which covers
-// that with room to spare, and hold restated each tick keeps it just as still. What the off
-// did instead was shed a host this loop had lost sight of for reasons that were never about
-// power, killing a running session. Off is now only ever a decision, never an inference.
+// Off is never inferred from observed state. A p1 that only reads as down previously restated
+// off here to keep the request level-triggered across a nut-dog restart; nut-dog's startupGrace
+// (180s) suppresses power-on actions for longer than one tick, so hold covers that case
+// without asserting a shed against a host that may only be unreachable.
 func powerWish(p Plan, snap Snapshot, askedOff bool) string {
 	switch {
 	case askedOff:

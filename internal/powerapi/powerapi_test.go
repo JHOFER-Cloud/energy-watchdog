@@ -34,8 +34,8 @@ func TestRequestSendsTheWishAndTheToken(t *testing.T) {
 	}
 }
 
-// A refused request must surface. p1's power runs entirely through this call, so a wrong token
-// or load name fails silently otherwise - every other gauge stays green.
+// A refused request must surface: p1's power runs entirely through this call, so a wrong token
+// or load name would otherwise fail with every gauge still green.
 func TestRequestSurfacesARefusal(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		http.Error(w, "unknown load", http.StatusNotFound)
@@ -68,9 +68,9 @@ func TestStateReadsTheProbeAndItsAge(t *testing.T) {
 	}
 }
 
-// An unrecognised state is reported as received rather than flattened to "unknown". The two
-// services declare the vocabulary separately, so a drift here disables the up/down check
-// entirely - and the caller can only say so if it can still see the word it did not know.
+// An unrecognised state is returned as received rather than flattened to "unknown": the two
+// services declare this vocabulary independently, and the caller can only report a drift if it
+// still sees the word.
 func TestStateReportsAnUnknownWordAsItself(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte(`{"actual":"powered-on","ageSeconds":1}`))
@@ -86,8 +86,8 @@ func TestStateReportsAnUnknownWordAsItself(t *testing.T) {
 	}
 }
 
-// An older nut-dog has no such endpoint. That has to read as an error rather than an empty
-// success, or a 404 body would look like a probe with no opinion and nothing would say why.
+// An older nut-dog has no such endpoint; a 404 must be an error rather than an empty success,
+// which would be indistinguishable from a probe with no opinion.
 func TestStateSurfacesAMissingEndpoint(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		http.Error(w, "404 page not found", http.StatusNotFound)

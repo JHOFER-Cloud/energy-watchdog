@@ -25,8 +25,7 @@ import (
 )
 
 // fakeNutDog records the power requests it receives, in order, and serves the probe state the
-// watchdog reads back. actual defaults to "" so the fixture answers "unknown" - no opinion,
-// which is what a controller with no nut-dog to ask has to cope with anyway.
+// watchdog reads back. actual defaults to "" and is served as "unknown".
 type fakeNutDog struct {
 	mu     sync.Mutex
 	got    []string
@@ -221,9 +220,8 @@ func TestRestateNeverOverridesTheLoop(t *testing.T) {
 		// p1 started by hand during a shed, seen outside the fresh-boot window: no migrate
 		// and no stop are planned, so asserting "off" would cut power under running guests.
 		{"shed, p1 up, deficit", "-800", state.ModeShed, true, false, "hold"},
-		// A p1 that merely reads as down is never told off: that inference shed a host this
-		// loop had only lost sight of. Hold keeps it where it is, and nut-dog's startup grace -
-		// not this request - is what stops a restarted nut-dog waking it.
+		// A p1 that only reads as down is never told off; hold leaves it where it is, and
+		// nut-dog's startupGrace covers a restart that has forgotten the request.
 		{"shed, p1 down, deficit", "-800", state.ModeShed, false, false, "hold"},
 		{"running, p1 up, surplus", "5000", state.ModeRunning, true, false, "on"},
 		// Same state as the hand-start above, but this shed is ours and p1 hasn't gone down

@@ -25,9 +25,9 @@ type Metrics struct {
 	mode       string
 	lastTick   int64
 	lastOK     bool
-	// unconfirmed means p1 reads offline in Proxmox while nothing agrees it lost power, so
-	// the loop is holding rather than acting. It can persist indefinitely and means something
-	// quite different from a failing reconcile, which is the only other thing that shows here.
+	// unconfirmed: p1 reads offline in Proxmox with nothing corroborating power loss, so the
+	// loop holds instead of acting. Distinct from a failing reconcile and can persist for the
+	// life of the condition.
 	unconfirmed bool
 
 	// Configured thresholds, exported so the dashboard draws decision lines from the
@@ -100,9 +100,9 @@ func (m *Metrics) MarkStale(tick int64) {
 	m.lastTick, m.lastOK = tick, false
 }
 
-// SetNodeUnconfirmed records whether this tick is holding because p1 reads offline with
-// nothing to corroborate it. Its own gauge because the state is neither a failure nor normal
-// operation: p1 is very likely running and unmanaged, which no other metric here would say.
+// SetNodeUnconfirmed records whether this tick held on an uncorroborated offline reading.
+// Separate from the reconcile-success flag: the loop is working, but p1 is likely running and
+// unmanaged, which no other gauge here reports.
 func (m *Metrics) SetNodeUnconfirmed(v bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -150,8 +150,7 @@ func (m *Metrics) Handler() http.HandlerFunc {
 			fmt.Fprintf(w, "# TYPE energy_watchdog_power_request_success gauge\n")
 			fmt.Fprintf(w, "energy_watchdog_power_request_success %g\n", b2f(*m.powerReqOK))
 		}
-		// Alert on this sustained (== 1 for 10m): the loop is deliberately not acting, and p1
-		// is probably up and unmanaged. Not on a single tick - one unconfirmed reading is a
+		// Alert sustained (== 1 for 10m), not per tick: a single uncorroborated reading is a
 		// normal nut-dog blip that the next tick clears.
 		fmt.Fprintf(w, "# HELP energy_watchdog_node_unconfirmed Whether p1 reads offline with nothing agreeing it lost power.\n")
 		fmt.Fprintf(w, "# TYPE energy_watchdog_node_unconfirmed gauge\n")
