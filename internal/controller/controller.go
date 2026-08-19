@@ -251,11 +251,15 @@ func (c *Controller) reconcile(ctx context.Context) {
 		c.nodeDownStreak = 0
 	} else if !c.confirmDown(ctx, snap) {
 		// p1 reads offline but nothing agrees it actually lost power. Do not latch a mode off
-		// that: treat the tick like a failed observe, which pins p1 where it is.
+		// that: treat the tick like a failed observe, which pins p1 where it is. This can hold
+		// indefinitely - a partition does not heal on our account - so it gets its own gauge
+		// rather than hiding inside the stale-reconcile one.
+		c.metrics.SetNodeUnconfirmed(true)
 		c.metrics.MarkStale(now.Unix())
 		c.holdPower(ctx)
 		return
 	}
+	c.metrics.SetNodeUnconfirmed(false)
 	if !snap.NodeUp {
 		c.askedOff = false         // the shed landed; a later hand-start must not be shut back down
 		c.pendingStop = stopTask{} // whatever it still had to stop went down with the host
@@ -569,23 +573,32 @@ func (c *Controller) confirmDown(ctx context.Context, snap Snapshot) bool {
 	if c.askedOff || snap.Mode == state.ModeShed {
 		return true
 	}
-	actual, age, err := powerapi.ActualUnknown, time.Duration(0), error(nil)
+	// Anything we cannot use reads as unknown, so the fallback below is reached by one path
+	// rather than several: no nut-dog configured, a failed call, or a probe too old to mean
+	// anything are all "nobody can corroborate this".
+	actual, age := powerapi.ActualUnknown, time.Duration(0)
 	if c.power != nil {
-		if actual, age, err = c.power.State(ctx); err != nil {
+		switch a, ag, err := c.power.State(ctx); {
+		case err != nil:
 			c.log.Warn("read p1's power state from nut-dog", "err", err)
+		case ag > probeMaxAge:
+			c.log.Warn("nut-dog's probe of p1 is too old to settle this", "probeAge", ag)
+		default:
+			actual, age = a, ag
 		}
 	}
-	if err == nil && age <= probeMaxAge {
-		switch actual {
-		case powerapi.ActualUp:
-			// The one case worth shouting about: p1 is running and we cannot see it. Powering
-			// it off from here would take down whatever is running on it.
-			c.log.Error("p1 reads offline in Proxmox but nut-dog probes it as up: holding its power",
-				"node", c.cfg.Proxmox.Node, "probeAge", age)
-			return false
-		case powerapi.ActualDown:
-			return true // an independent reading agrees; no need to wait for a second tick
-		}
+	switch actual {
+	case powerapi.ActualUp:
+		// The one case worth shouting about: p1 is running and we cannot see it. Powering it
+		// off from here would take down whatever is running on it. The streak resets too - a
+		// probe that reaches p1 is evidence *against* acting, and leaving it standing would let
+		// two such ticks either side of an unreachable nut-dog add up to a reason to act.
+		c.nodeDownStreak = 0
+		c.log.Error("p1 reads offline in Proxmox but nut-dog probes it as up: holding its power",
+			"node", c.cfg.Proxmox.Node, "probeAge", age)
+		return false
+	case powerapi.ActualDown:
+		return true // an independent reading agrees; no need to wait for a second tick
 	}
 	c.nodeDownStreak++
 	if c.nodeDownStreak < nodeDownConfirm {

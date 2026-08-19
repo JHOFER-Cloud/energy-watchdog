@@ -113,6 +113,17 @@ Nothing here ever *infers* a power-off. `off` is sent when this loop decides to 
 as long as that shed is in flight — never because `p1` merely looks absent. That inference
 once shed a host mid-session that had only lost cluster membership.
 
+The consequence is that a host this loop cannot see is a host it will not move, in either
+direction: while `p1` reads offline but probes up, the tick is held before `Decide` runs, so
+even **Hold off does nothing** there. That is deliberate — there is no way to migrate or stop
+guests on a node you cannot reach — but it means the only way to shed such a host is to ask
+nut-dog yourself. `energy_watchdog_node_unconfirmed` is 1 for exactly this state; alert on it,
+because `p1` is most likely up and unmanaged:
+
+```promql
+max_over_time(energy_watchdog_node_unconfirmed[10m]) == 1
+```
+
 It owns the switch because it has to work when the cluster doesn't: its shed signal and WoL
 need neither Proxmox nor a second node to relay a packet — which is what a full shed leaves
 you without. Guest choreography stays here: migrate and stop run first, *then* the power-off

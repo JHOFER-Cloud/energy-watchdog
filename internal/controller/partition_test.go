@@ -2,8 +2,11 @@ package controller
 
 import (
 	"context"
+	"net/http/httptest"
+	"strings"
 	"testing"
 
+	"github.com/JHOFER-Cloud/energy-watchdog/internal/metrics"
 	"github.com/JHOFER-Cloud/energy-watchdog/internal/state"
 )
 
@@ -94,5 +97,120 @@ func TestAProbedDownIsBelievedAtOnce(t *testing.T) {
 		if got == "off" {
 			t.Errorf("power requests = %v, want no off: this loop never asked for a shed", nut.requests())
 		}
+	}
+}
+
+// A probe is only evidence while it is fresh. nut-dog polls every 15s, so a reading approaching
+// probeMaxAge means its own loop is in trouble - and a stale "up" must not be allowed to hold
+// p1 in limbo forever, any more than a stale "down" should settle an argument.
+func TestAStaleProbeSettlesNothing(t *testing.T) {
+	nut := &fakeNutDog{actual: "up", ageSec: 3600} // its loop stopped an hour ago
+	srv := nut.server(t)
+	defer srv.Close()
+
+	c, _ := delegateFixture(t, "-800", srv.URL, state.ModeGaming, false)
+	ctx := context.Background()
+
+	c.reconcile(ctx)
+	st, err := c.store.Load(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Mode != state.ModeGaming {
+		t.Fatalf("mode = %q after one tick, want gaming: a stale probe is no reason to act either", st.Mode)
+	}
+
+	// ...it falls through to the two-tick rule rather than deciding anything.
+	c.reconcile(ctx)
+	if st, err = c.store.Load(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if st.Mode != state.ModeShed {
+		t.Errorf("mode = %q, want shed: with no usable probe the repeated reading stands", st.Mode)
+	}
+}
+
+// The streak counts *consecutive* unconfirmed readings. A probe that reaches p1 is evidence
+// against acting, so it has to clear the count - otherwise two unreachable-nut-dog ticks either
+// side of a "p1 is up" add up to a reason to shed a host we were just told is alive.
+func TestAProbeThatReachesP1ClearsTheStreak(t *testing.T) {
+	nut := &fakeNutDog{} // starts with no opinion
+	srv := nut.server(t)
+	defer srv.Close()
+
+	c, _ := delegateFixture(t, "-800", srv.URL, state.ModeGaming, false)
+	ctx := context.Background()
+
+	c.reconcile(ctx) // unconfirmed: streak 1
+
+	nut.mu.Lock()
+	nut.actual = "up" // nut-dog gets its answer through: p1 is alive
+	nut.mu.Unlock()
+	c.reconcile(ctx)
+
+	nut.mu.Lock()
+	nut.actual = "" // and goes quiet again
+	nut.mu.Unlock()
+	c.reconcile(ctx)
+
+	st, err := c.store.Load(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Mode != state.ModeGaming {
+		t.Errorf("mode = %q, want gaming: the two unconfirmed ticks were not consecutive", st.Mode)
+	}
+}
+
+// powerWish directly, because two rows of TestRestateNeverOverridesTheLoop now exit through
+// the confirmDown hold path and never reach it. Off is a decision, never an inference: only a
+// shed this loop asked for produces one.
+func TestPowerWishOnlyEverInfersHold(t *testing.T) {
+	tests := []struct {
+		name     string
+		plan     Plan
+		snap     Snapshot
+		askedOff bool
+		want     string
+	}{
+		{"our shed, p1 still going down", Plan{NextMode: state.ModeShed},
+			Snapshot{Mode: state.ModeShed, NodeUp: true}, true, "off"},
+		{"p1 down in shed: not ours to assert", Plan{NextMode: state.ModeShed},
+			Snapshot{Mode: state.ModeShed, NodeUp: false}, false, "hold"},
+		{"p1 down while running: nothing decided yet", Plan{NextMode: state.ModeShed},
+			Snapshot{Mode: state.ModeRunning, NodeUp: false}, false, "hold"},
+		{"p1 up and wanted", Plan{NextMode: state.ModeRunning},
+			Snapshot{Mode: state.ModeRunning, NodeUp: true}, false, "on"},
+		{"p1 up during a shed: started by hand", Plan{NextMode: state.ModeShed},
+			Snapshot{Mode: state.ModeShed, NodeUp: true}, false, "hold"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := powerWish(tt.plan, tt.snap, tt.askedOff); got != tt.want {
+				t.Errorf("powerWish = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// The hold can persist for as long as the partition does, and it means something quite
+// different from a failing reconcile: p1 is most likely up and running unmanaged. It needs its
+// own signal, or the only thing an operator sees is a stale-reconcile alert telling them to go
+// read the pod logs.
+func TestTheUnconfirmedHoldIsVisible(t *testing.T) {
+	nut := &fakeNutDog{actual: "up"}
+	srv := nut.server(t)
+	defer srv.Close()
+
+	c, _ := delegateFixture(t, "-800", srv.URL, state.ModeGaming, false)
+	m := metrics.New(false)
+	c.metrics = m
+
+	c.reconcile(context.Background())
+
+	rr := httptest.NewRecorder()
+	m.Handler()(rr, httptest.NewRequest("GET", "/metrics", nil))
+	if !strings.Contains(rr.Body.String(), "energy_watchdog_node_unconfirmed 1") {
+		t.Errorf("holding on an unconfirmed reading left no signal:\n%s", rr.Body.String())
 	}
 }

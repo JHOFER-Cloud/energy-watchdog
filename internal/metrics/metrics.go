@@ -25,6 +25,10 @@ type Metrics struct {
 	mode       string
 	lastTick   int64
 	lastOK     bool
+	// unconfirmed means p1 reads offline in Proxmox while nothing agrees it lost power, so
+	// the loop is holding rather than acting. It can persist indefinitely and means something
+	// quite different from a failing reconcile, which is the only other thing that shows here.
+	unconfirmed bool
 
 	// Configured thresholds, exported so the dashboard draws decision lines from the
 	// live config instead of hard-coded numbers that drift when you tune.
@@ -96,6 +100,15 @@ func (m *Metrics) MarkStale(tick int64) {
 	m.lastTick, m.lastOK = tick, false
 }
 
+// SetNodeUnconfirmed records whether this tick is holding because p1 reads offline with
+// nothing to corroborate it. Its own gauge because the state is neither a failure nor normal
+// operation: p1 is very likely running and unmanaged, which no other metric here would say.
+func (m *Metrics) SetNodeUnconfirmed(v bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.unconfirmed = v
+}
+
 func b2f(b bool) float64 {
 	if b {
 		return 1
@@ -137,6 +150,11 @@ func (m *Metrics) Handler() http.HandlerFunc {
 			fmt.Fprintf(w, "# TYPE energy_watchdog_power_request_success gauge\n")
 			fmt.Fprintf(w, "energy_watchdog_power_request_success %g\n", b2f(*m.powerReqOK))
 		}
+		// Alert on this: the loop is deliberately not acting, and p1 is probably up and
+		// unmanaged. max_over_time(energy_watchdog_node_unconfirmed[10m]) == 1.
+		fmt.Fprintf(w, "# HELP energy_watchdog_node_unconfirmed Whether p1 reads offline with nothing agreeing it lost power.\n")
+		fmt.Fprintf(w, "# TYPE energy_watchdog_node_unconfirmed gauge\n")
+		fmt.Fprintf(w, "energy_watchdog_node_unconfirmed %g\n", b2f(m.unconfirmed))
 		fmt.Fprintf(w, "# HELP energy_watchdog_dry_run Whether the watchdog is in dry-run mode.\n")
 		fmt.Fprintf(w, "# TYPE energy_watchdog_dry_run gauge\n")
 		fmt.Fprintf(w, "energy_watchdog_dry_run %g\n", b2f(m.dryRun))

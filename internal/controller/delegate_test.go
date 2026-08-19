@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -31,6 +32,7 @@ type fakeNutDog struct {
 	got    []string
 	auth   []string
 	actual string
+	ageSec int // how stale its probe claims to be; 0 means fresh
 }
 
 func (f *fakeNutDog) server(t *testing.T) *httptest.Server {
@@ -38,12 +40,16 @@ func (f *fakeNutDog) server(t *testing.T) *httptest.Server {
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/api/loads/p1/state" && r.Method == http.MethodGet {
 			f.mu.Lock()
-			actual := f.actual
+			actual, age := f.actual, f.ageSec
 			f.mu.Unlock()
 			if actual == "" {
 				actual = "unknown"
 			}
-			_, _ = w.Write([]byte(`{"actual":"` + actual + `","ageSeconds":1}`))
+			if age == 0 {
+				age = 1
+			}
+			_, _ = w.Write([]byte(`{"actual":"` + actual +
+				`","ageSeconds":` + strconv.Itoa(age) + `}`))
 			return
 		}
 		if r.URL.Path != "/api/loads/p1/power" || r.Method != http.MethodPut {
