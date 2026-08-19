@@ -25,6 +25,10 @@ type Metrics struct {
 	mode       string
 	lastTick   int64
 	lastOK     bool
+	// unconfirmed: p1 reads offline in Proxmox with nothing corroborating power loss, so the
+	// loop holds instead of acting. Distinct from a failing reconcile and can persist for the
+	// life of the condition.
+	unconfirmed bool
 
 	// Configured thresholds, exported so the dashboard draws decision lines from the
 	// live config instead of hard-coded numbers that drift when you tune.
@@ -96,6 +100,15 @@ func (m *Metrics) MarkStale(tick int64) {
 	m.lastTick, m.lastOK = tick, false
 }
 
+// SetNodeUnconfirmed records whether this tick held on an uncorroborated offline reading.
+// Separate from the reconcile-success flag: the loop is working, but p1 is likely running and
+// unmanaged, which no other gauge here reports.
+func (m *Metrics) SetNodeUnconfirmed(v bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.unconfirmed = v
+}
+
 func b2f(b bool) float64 {
 	if b {
 		return 1
@@ -137,6 +150,11 @@ func (m *Metrics) Handler() http.HandlerFunc {
 			fmt.Fprintf(w, "# TYPE energy_watchdog_power_request_success gauge\n")
 			fmt.Fprintf(w, "energy_watchdog_power_request_success %g\n", b2f(*m.powerReqOK))
 		}
+		// Alert sustained (== 1 for 10m), not per tick: a single uncorroborated reading is a
+		// normal nut-dog blip that the next tick clears.
+		fmt.Fprintf(w, "# HELP energy_watchdog_node_unconfirmed Whether p1 reads offline with nothing agreeing it lost power.\n")
+		fmt.Fprintf(w, "# TYPE energy_watchdog_node_unconfirmed gauge\n")
+		fmt.Fprintf(w, "energy_watchdog_node_unconfirmed %g\n", b2f(m.unconfirmed))
 		fmt.Fprintf(w, "# HELP energy_watchdog_dry_run Whether the watchdog is in dry-run mode.\n")
 		fmt.Fprintf(w, "# TYPE energy_watchdog_dry_run gauge\n")
 		fmt.Fprintf(w, "energy_watchdog_dry_run %g\n", b2f(m.dryRun))

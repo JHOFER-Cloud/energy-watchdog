@@ -22,6 +22,13 @@ const (
 	Hold = "hold"
 )
 
+// Probe states reported by nut-dog for a load.
+const (
+	ActualUp      = "up"
+	ActualDown    = "down"
+	ActualUnknown = "unknown"
+)
+
 // Client talks to one nut-dog load.
 type Client struct {
 	base  string
@@ -62,4 +69,39 @@ func (c *Client) Request(ctx context.Context, desired, reason string) error {
 	}
 	_, _ = io.Copy(io.Discard, resp.Body)
 	return nil
+}
+
+// State returns nut-dog's last probe of the load and the age of that reading.
+//
+// This answers a different question from Proxmox node state, which is reported by the other
+// pve nodes and so reads offline for a host that is merely partitioned from corosync. nut-dog
+// probes the host directly.
+func (c *Client) State(ctx context.Context) (actual string, age time.Duration, err error) {
+	url := fmt.Sprintf("%s/api/loads/%s/state", c.base, c.load)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return "", 0, err
+	}
+	req.Header.Set("Authorization", "Bearer "+c.token)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return "", 0, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= http.StatusMultipleChoices {
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return "", 0, fmt.Errorf("power state: %s: %s", resp.Status, bytes.TrimSpace(msg))
+	}
+	var body struct {
+		Actual     string `json:"actual"`
+		AgeSeconds int    `json:"ageSeconds"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<10)).Decode(&body); err != nil {
+		return "", 0, fmt.Errorf("decode power state: %w", err)
+	}
+	// Returned as received, unrecognised values included. Both services declare this
+	// vocabulary independently, so normalising an unknown word here would make a drift between
+	// them indistinguishable from nut-dog having no opinion - and a drift disables the
+	// caller's up/down handling entirely. Callers treat anything they cannot read as unknown.
+	return body.Actual, time.Duration(body.AgeSeconds) * time.Second, nil
 }

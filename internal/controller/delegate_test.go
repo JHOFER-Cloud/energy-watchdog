@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -23,16 +24,33 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// fakeNutDog records the power requests it receives, in order.
+// fakeNutDog records the power requests it receives, in order, and serves the probe state the
+// watchdog reads back. actual defaults to "" and is served as "unknown".
 type fakeNutDog struct {
-	mu   sync.Mutex
-	got  []string
-	auth []string
+	mu     sync.Mutex
+	got    []string
+	auth   []string
+	actual string
+	ageSec int // how stale its probe claims to be; 0 means fresh
 }
 
 func (f *fakeNutDog) server(t *testing.T) *httptest.Server {
 	t.Helper()
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/loads/p1/state" && r.Method == http.MethodGet {
+			f.mu.Lock()
+			actual, age := f.actual, f.ageSec
+			f.mu.Unlock()
+			if actual == "" {
+				actual = "unknown"
+			}
+			if age == 0 {
+				age = 1
+			}
+			_, _ = w.Write([]byte(`{"actual":"` + actual +
+				`","ageSeconds":` + strconv.Itoa(age) + `}`))
+			return
+		}
 		if r.URL.Path != "/api/loads/p1/power" || r.Method != http.MethodPut {
 			t.Errorf("unexpected power call: %s %s", r.Method, r.URL.Path)
 		}
@@ -202,7 +220,9 @@ func TestRestateNeverOverridesTheLoop(t *testing.T) {
 		// p1 started by hand during a shed, seen outside the fresh-boot window: no migrate
 		// and no stop are planned, so asserting "off" would cut power under running guests.
 		{"shed, p1 up, deficit", "-800", state.ModeShed, true, false, "hold"},
-		{"shed, p1 down, deficit", "-800", state.ModeShed, false, false, "off"},
+		// A p1 that only reads as down is never told off; hold leaves it where it is, and
+		// nut-dog's startupGrace covers a restart that has forgotten the request.
+		{"shed, p1 down, deficit", "-800", state.ModeShed, false, false, "hold"},
 		{"running, p1 up, surplus", "5000", state.ModeRunning, true, false, "on"},
 		// Same state as the hand-start above, but this shed is ours and p1 hasn't gone down
 		// yet. Restating hold here replaced an off nut-dog had not polled, and the shed was

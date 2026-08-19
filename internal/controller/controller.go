@@ -60,6 +60,10 @@ type Controller struct {
 	// for. A field so tests don't have to wait it out; see waitStop.
 	wakePoll time.Duration
 
+	// nodeDownStreak counts consecutive uncorroborated "p1 offline" readings. Reset when p1
+	// reads up, or when nut-dog's probe reaches it. See confirmDown.
+	nodeDownStreak int
+
 	// pendingStop is a bulk stop task we stopped waiting for, kept so the restore can let it
 	// finish first. Without it good-morning reads the guest list mid-task, sees a guest the task
 	// has not reached yet as running, leaves it out of the restart - and the task stops it
@@ -235,6 +239,9 @@ func (c *Controller) reconcile(ctx context.Context) {
 			c.log.Warn("observe failed", "err", err, "consecutive", c.observeFailures)
 		}
 		c.metrics.MarkStale(now.Unix())
+		// A blind tick is not an unconfirmed-down hold. EnergyWatchdogNodeUnconfirmed asserts
+		// the loop is otherwise healthy, so the gauge must not stay latched here.
+		c.metrics.SetNodeUnconfirmed(false)
 		// Blind, not silent: going quiet leaves nut-dog deciding p1 from a stale request,
 		// which after a UPS recovery means waking it at whatever hour that lands, with no
 		// solar reading behind it. This pins p1 where it is until we can decide again, except
@@ -243,6 +250,18 @@ func (c *Controller) reconcile(ctx context.Context) {
 		return
 	}
 	c.observeFailures = 0
+	if snap.NodeUp {
+		c.nodeDownStreak = 0
+	} else if !c.confirmDown(ctx, snap) {
+		// Uncorroborated offline reading: skip the tick without latching a mode, as for a
+		// failed observe. Holds for as long as the condition lasts, hence its own gauge
+		// rather than only the stale-reconcile one.
+		c.metrics.SetNodeUnconfirmed(true)
+		c.metrics.MarkStale(now.Unix())
+		c.holdPower(ctx)
+		return
+	}
+	c.metrics.SetNodeUnconfirmed(false)
 	if !snap.NodeUp {
 		c.askedOff = false         // the shed landed; a later hand-start must not be shut back down
 		c.pendingStop = stopTask{} // whatever it still had to stop went down with the host
@@ -527,6 +546,71 @@ func (c *Controller) wakeRequestedNow(ctx context.Context, done map[int]int64) b
 		}
 	}
 	return false
+}
+
+// nodeDownConfirm is how many consecutive uncorroborated "p1 offline" readings are required
+// before acting on one. Proxmox answers node state from the other cluster members, so the
+// reading also goes false on a corosync partition.
+const nodeDownConfirm = 2
+
+// probeMaxAge bounds how old nut-dog's probe may be to count as corroboration. It polls every
+// 15s; a reading near this bound means nut-dog's own loop is degraded.
+const probeMaxAge = 2 * time.Minute
+
+// confirmDown reports whether an offline reading from Proxmox should be acted on.
+//
+// Proxmox answers node state from the other pve nodes, so a p1 partitioned from corosync is
+// indistinguishable there from one that has lost power. Acting on it unconditionally latches
+// ModeShed, and the restate then asserted off on a host that was still running.
+//
+// Corroboration is only required where the reading contradicts what we already hold: askedOff
+// and ModeShed both expect p1 down, and confirming those would delay good-morning by a tick.
+// Otherwise nut-dog's probe decides, since it reaches p1 directly; with no fresh probe the
+// reading must repeat nodeDownConfirm times.
+func (c *Controller) confirmDown(ctx context.Context, snap Snapshot) bool {
+	if c.askedOff || snap.Mode == state.ModeShed {
+		return true
+	}
+	// Normalise every unusable case - no power API configured, failed call, stale probe - to
+	// unknown, so the fallback below is reached by one value.
+	actual, age := powerapi.ActualUnknown, time.Duration(0)
+	if c.power != nil {
+		switch a, ag, err := c.power.State(ctx); {
+		case err != nil:
+			c.log.Warn("read p1's power state from nut-dog", "err", err)
+		case ag > probeMaxAge:
+			c.log.Warn("nut-dog's probe of p1 is too old to settle this", "probeAge", ag)
+		default:
+			actual, age = a, ag
+		}
+	}
+	switch actual {
+	case powerapi.ActualUp:
+		// p1 is reachable, so the offline reading is ours to distrust. Reset the streak as
+		// well: a successful probe must not leave earlier uncorroborated ticks to accumulate
+		// with later ones, which would make non-consecutive readings act like consecutive.
+		c.nodeDownStreak = 0
+		c.log.Error("p1 reads offline in Proxmox but nut-dog probes it as up: holding its power",
+			"node", c.cfg.Proxmox.Node, "probeAge", age)
+		return false
+	case powerapi.ActualDown:
+		return true // an independent reading agrees; no need to wait for a second tick
+	case powerapi.ActualUnknown, "":
+		// No opinion, or no answer at all. Fall through to the streak.
+	default:
+		// Vocabulary drift between the two services: the up/down branches above are then
+		// unreachable and only the streak remains, which is the weaker guarantee. Safe to
+		// continue on, but not silently.
+		c.log.Error("nut-dog reported a power state we do not recognise; the up/down check is not working",
+			"actual", actual, "node", c.cfg.Proxmox.Node)
+	}
+	c.nodeDownStreak++
+	if c.nodeDownStreak < nodeDownConfirm {
+		c.log.Warn("p1 reads offline with nothing to confirm it: waiting a tick before acting",
+			"node", c.cfg.Proxmox.Node, "probe", actual, "streak", c.nodeDownStreak)
+		return false
+	}
+	return true
 }
 
 // wakeInterrupt is what cuts the stop phase short: a desktop VM asked for during a shed that
@@ -885,14 +969,17 @@ func (c *Controller) powerOff(ctx context.Context, reason string) error {
 // release it and leave the shed half-applied - which is how a shed came to stop every guest
 // and leave p1 running. Without that flag the state is indistinguishable from a p1 started by
 // hand during a shed, where asserting off would cut power under running guests.
+//
+// Off is never inferred from observed state. A p1 that only reads as down previously restated
+// off here to keep the request level-triggered across a nut-dog restart; nut-dog's startupGrace
+// (180s) suppresses power-on actions for longer than one tick, so hold covers that case
+// without asserting a shed against a host that may only be unreachable.
 func powerWish(p Plan, snap Snapshot, askedOff bool) string {
 	switch {
 	case askedOff:
 		return powerapi.Off
 	case p.NextMode != state.ModeShed && snap.NodeUp:
 		return powerapi.On
-	case snap.Mode == state.ModeShed && !snap.NodeUp:
-		return powerapi.Off
 	default:
 		return powerapi.Hold
 	}

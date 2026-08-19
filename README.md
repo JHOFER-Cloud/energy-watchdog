@@ -99,12 +99,36 @@ This watchdog decides *whether* `p1` should be on. `nut-dog` does the powering, 
 
 ```
 PUT /api/loads/p1/power   {"desired": "on" | "off" | "hold", "reason": "solar"}
+GET /api/loads/p1/state   -> {"actual": "up" | "down" | "unknown", "ageSeconds": 3}
 ```
 
 It owns the switch because it has to work when the cluster doesn't: its shed signal and WoL
 need neither Proxmox nor a second node to relay a packet — which is what a full shed leaves
 you without. Guest choreography stays here: migrate and stop run first, *then* the power-off
 is requested.
+
+The read matters as much as the write, because Proxmox does not actually answer "is `p1`
+powered on". Node state comes from the *other* `pve` nodes, so a `p1` that drops out of
+corosync while running perfectly well is reported offline exactly like one that is switched
+off. nut-dog's probe is a TCP check against `p1`'s own Proxmox port and doesn't care what the
+cluster thinks, so it is asked before this loop believes a node has gone away. A reading that
+nothing corroborates has to repeat before it is acted on.
+
+Nothing here ever *infers* a power-off. `off` is sent when this loop decides to shed and for
+as long as that shed is in flight — never because `p1` merely looks absent. That inference
+once shed a host mid-session that had only lost cluster membership.
+
+The consequence is that a host this loop cannot see is a host it will not move, in either
+direction: while `p1` reads offline but probes up, the tick is held before `Decide` runs, so
+even **Hold off does nothing** there. That is deliberate — there is no way to migrate or stop
+guests on a node you cannot reach — but it means the only way to shed such a host is to ask
+nut-dog yourself. `energy_watchdog_node_unconfirmed` is 1 for exactly this state; alert on it *sustained*,
+because `p1` is most likely up and unmanaged — a single unconfirmed tick is a normal nut-dog
+blip that clears itself on the next one:
+
+```promql
+energy_watchdog_node_unconfirmed == 1   # for: 10m
+```
 
 The wish is restated every tick, not just on transitions, so nut-dog can stay stateless.
 It is derived from what the loop established rather than from the mode: when the loop is
