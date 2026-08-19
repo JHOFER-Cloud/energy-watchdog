@@ -101,12 +101,12 @@ func (c *Client) State(ctx context.Context) (actual string, age time.Duration, e
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<10)).Decode(&body); err != nil {
 		return "", 0, fmt.Errorf("decode power state: %w", err)
 	}
-	switch body.Actual {
-	case ActualUp, ActualDown, ActualUnknown:
-		return body.Actual, time.Duration(body.AgeSeconds) * time.Second, nil
-	default:
-		// A word we don't know is not an opinion. Normalising it here keeps every caller's
-		// "nobody could corroborate this" path reachable by one value rather than several.
-		return ActualUnknown, time.Duration(body.AgeSeconds) * time.Second, nil
-	}
+	// Reported as received, including a word we don't know. Normalising an unrecognised state
+	// to "unknown" here would be safe for the decision - the caller treats anything it cannot
+	// read as nobody's opinion - but it would make a vocabulary that has drifted between the
+	// two services indistinguishable from nut-dog simply having nothing to say. That is the
+	// one failure worth being loud about: it silently disables the "p1 probes up, hold its
+	// power" protection and leaves only the weaker two-tick rule, which on its own would not
+	// have prevented the shed this whole path exists to stop.
+	return body.Actual, time.Duration(body.AgeSeconds) * time.Second, nil
 }

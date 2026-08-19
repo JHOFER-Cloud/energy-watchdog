@@ -604,6 +604,15 @@ func (c *Controller) confirmDown(ctx context.Context, snap Snapshot) bool {
 		return false
 	case powerapi.ActualDown:
 		return true // an independent reading agrees; no need to wait for a second tick
+	case powerapi.ActualUnknown, "":
+		// nut-dog has nothing to say, or we never got to ask. Fall through to the streak.
+	default:
+		// A word we don't recognise means the two services no longer agree on the vocabulary,
+		// which silently costs us the check above - the one that keeps a partitioned p1 alive -
+		// and leaves only the streak, which would not have stopped the shed on 19 Aug. Safe to
+		// carry on, but never quietly.
+		c.log.Error("nut-dog reported a power state we do not recognise; the up/down check is not working",
+			"actual", actual, "node", c.cfg.Proxmox.Node)
 	}
 	c.nodeDownStreak++
 	if c.nodeDownStreak < nodeDownConfirm {

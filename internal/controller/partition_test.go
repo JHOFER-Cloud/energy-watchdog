@@ -247,3 +247,35 @@ func TestTheUnconfirmedSignalClearsWhenTheLoopGoesBlind(t *testing.T) {
 		t.Errorf("the hold signal survived a blind tick; it now claims a healthy loop:\n%s", rr.Body.String())
 	}
 }
+
+// A vocabulary drift between the two services must not read as "up". If it did, the check that
+// keeps a partitioned p1 alive would be silently disabled and only the two-tick rule would
+// remain - the weaker guarantee that on its own would not have stopped the 19 Aug shed.
+func TestAnUnrecognisedProbeStateFallsBackRatherThanDeciding(t *testing.T) {
+	nut := &fakeNutDog{actual: "powered-on"} // a word this side does not know
+	srv := nut.server(t)
+	defer srv.Close()
+
+	c, _ := delegateFixture(t, "-800", srv.URL, state.ModeGaming, false)
+	ctx := context.Background()
+
+	// Not treated as "down": one tick must not be enough to act on.
+	c.reconcile(ctx)
+	st, err := c.store.Load(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Mode != state.ModeGaming {
+		t.Fatalf("mode = %q after one tick, want gaming: an unreadable answer is not a reading", st.Mode)
+	}
+
+	// ...and not treated as "up" either, which would hold p1 in limbo for as long as the
+	// drift lasted.
+	c.reconcile(ctx)
+	if st, err = c.store.Load(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if st.Mode != state.ModeShed {
+		t.Errorf("mode = %q, want shed: with no usable probe the repeated reading stands", st.Mode)
+	}
+}
