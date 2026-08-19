@@ -99,7 +99,19 @@ This watchdog decides *whether* `p1` should be on. `nut-dog` does the powering, 
 
 ```
 PUT /api/loads/p1/power   {"desired": "on" | "off" | "hold", "reason": "solar"}
+GET /api/loads/p1/state   -> {"actual": "up" | "down" | "unknown", "ageSeconds": 3}
 ```
+
+The read matters as much as the write, because Proxmox does not actually answer "is `p1`
+powered on". Node state comes from the *other* `pve` nodes, so a `p1` that drops out of
+corosync while running perfectly well is reported offline exactly like one that is switched
+off. nut-dog's probe is a TCP check against `p1`'s own Proxmox port and doesn't care what the
+cluster thinks, so it is asked before this loop believes a node has gone away. A reading that
+nothing corroborates has to repeat before it is acted on.
+
+Nothing here ever *infers* a power-off. `off` is sent when this loop decides to shed and for
+as long as that shed is in flight — never because `p1` merely looks absent. That inference
+once shed a host mid-session that had only lost cluster membership.
 
 It owns the switch because it has to work when the cluster doesn't: its shed signal and WoL
 need neither Proxmox nor a second node to relay a packet — which is what a full shed leaves

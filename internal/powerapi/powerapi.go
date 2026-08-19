@@ -22,6 +22,13 @@ const (
 	Hold = "hold"
 )
 
+// What nut-dog's probe last saw for the load.
+const (
+	ActualUp      = "up"
+	ActualDown    = "down"
+	ActualUnknown = "unknown"
+)
+
 // Client talks to one nut-dog load.
 type Client struct {
 	base  string
@@ -62,4 +69,37 @@ func (c *Client) Request(ctx context.Context, desired, reason string) error {
 	}
 	_, _ = io.Copy(io.Discard, resp.Body)
 	return nil
+}
+
+// State is what nut-dog's own probe last saw for the load, and how old that reading is.
+//
+// It is worth the extra call because it is a different question from the one Proxmox answers.
+// Node state comes from the *other* pve nodes, so a p1 partitioned from corosync is reported
+// offline there while the host is up and serving - and a power-off decided on that reading
+// shuts down a healthy machine. nut-dog's probe reaches p1 directly and does not care what the
+// cluster thinks of it.
+func (c *Client) State(ctx context.Context) (actual string, age time.Duration, err error) {
+	url := fmt.Sprintf("%s/api/loads/%s/state", c.base, c.load)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return "", 0, err
+	}
+	req.Header.Set("Authorization", "Bearer "+c.token)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return "", 0, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= http.StatusMultipleChoices {
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return "", 0, fmt.Errorf("power state: %s: %s", resp.Status, bytes.TrimSpace(msg))
+	}
+	var body struct {
+		Actual     string `json:"actual"`
+		AgeSeconds int    `json:"ageSeconds"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<10)).Decode(&body); err != nil {
+		return "", 0, fmt.Errorf("decode power state: %w", err)
+	}
+	return body.Actual, time.Duration(body.AgeSeconds) * time.Second, nil
 }

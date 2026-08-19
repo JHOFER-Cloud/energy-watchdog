@@ -60,6 +60,10 @@ type Controller struct {
 	// for. A field so tests don't have to wait it out; see waitStop.
 	wakePoll time.Duration
 
+	// nodeDownStreak counts consecutive ticks that reported p1 offline with nothing agreeing
+	// it lost power. Reset the moment p1 reads up; see confirmDown.
+	nodeDownStreak int
+
 	// pendingStop is a bulk stop task we stopped waiting for, kept so the restore can let it
 	// finish first. Without it good-morning reads the guest list mid-task, sees a guest the task
 	// has not reached yet as running, leaves it out of the restart - and the task stops it
@@ -243,6 +247,15 @@ func (c *Controller) reconcile(ctx context.Context) {
 		return
 	}
 	c.observeFailures = 0
+	if snap.NodeUp {
+		c.nodeDownStreak = 0
+	} else if !c.confirmDown(ctx, snap) {
+		// p1 reads offline but nothing agrees it actually lost power. Do not latch a mode off
+		// that: treat the tick like a failed observe, which pins p1 where it is.
+		c.metrics.MarkStale(now.Unix())
+		c.holdPower(ctx)
+		return
+	}
 	if !snap.NodeUp {
 		c.askedOff = false         // the shed landed; a later hand-start must not be shut back down
 		c.pendingStop = stopTask{} // whatever it still had to stop went down with the host
@@ -527,6 +540,60 @@ func (c *Controller) wakeRequestedNow(ctx context.Context, done map[int]int64) b
 		}
 	}
 	return false
+}
+
+// nodeDownConfirm is how many consecutive ticks must report p1 offline, with nothing else
+// agreeing, before this loop acts on it. One tick is not evidence: the reading comes from the
+// rest of the pve cluster, which loses sight of a node for reasons that have nothing to do
+// with power.
+const nodeDownConfirm = 2
+
+// probeMaxAge is how old nut-dog's probe of p1 may be and still count as an opinion. It polls
+// every 15s, so anything approaching this means its own loop is in trouble and the reading
+// should not be allowed to settle an argument.
+const probeMaxAge = 2 * time.Minute
+
+// confirmDown decides whether to believe a Proxmox cluster reporting p1 offline.
+//
+// That reading is not a power reading. It is the *other* pve nodes' opinion, so a p1 merely
+// partitioned from corosync is reported exactly like one that is switched off - and this loop
+// acting on it is what powered a healthy host down under a running gaming session: mode
+// latched to shed, and the restate then asserted off, whereupon p1's upsmon shut it down.
+//
+// Only a reading that contradicts us is worth confirming. A shed of ours needs none - down is
+// precisely what we asked for - and neither does a mode that already has p1 down, where it is
+// the expected steady state and confirming it every tick would only delay good-morning.
+// Otherwise nut-dog's probe settles it, since that reaches p1 directly; and where it has no
+// fresh opinion, the cluster has to say it twice.
+func (c *Controller) confirmDown(ctx context.Context, snap Snapshot) bool {
+	if c.askedOff || snap.Mode == state.ModeShed {
+		return true
+	}
+	actual, age, err := powerapi.ActualUnknown, time.Duration(0), error(nil)
+	if c.power != nil {
+		if actual, age, err = c.power.State(ctx); err != nil {
+			c.log.Warn("read p1's power state from nut-dog", "err", err)
+		}
+	}
+	if err == nil && age <= probeMaxAge {
+		switch actual {
+		case powerapi.ActualUp:
+			// The one case worth shouting about: p1 is running and we cannot see it. Powering
+			// it off from here would take down whatever is running on it.
+			c.log.Error("p1 reads offline in Proxmox but nut-dog probes it as up: holding its power",
+				"node", c.cfg.Proxmox.Node, "probeAge", age)
+			return false
+		case powerapi.ActualDown:
+			return true // an independent reading agrees; no need to wait for a second tick
+		}
+	}
+	c.nodeDownStreak++
+	if c.nodeDownStreak < nodeDownConfirm {
+		c.log.Warn("p1 reads offline with nothing to confirm it: waiting a tick before acting",
+			"node", c.cfg.Proxmox.Node, "probe", actual, "streak", c.nodeDownStreak)
+		return false
+	}
+	return true
 }
 
 // wakeInterrupt is what cuts the stop phase short: a desktop VM asked for during a shed that
@@ -885,14 +952,19 @@ func (c *Controller) powerOff(ctx context.Context, reason string) error {
 // release it and leave the shed half-applied - which is how a shed came to stop every guest
 // and leave p1 running. Without that flag the state is indistinguishable from a p1 started by
 // hand during a shed, where asserting off would cut power under running guests.
+//
+// Nothing else ever asks for off. A p1 that merely *reads* as down used to restate off here,
+// to keep the request level-triggered against a nut-dog that had restarted and forgotten - but
+// nut-dog's own startup grace holds every power-on for minutes after a restart, which covers
+// that with room to spare, and hold restated each tick keeps it just as still. What the off
+// did instead was shed a host this loop had lost sight of for reasons that were never about
+// power, killing a running session. Off is now only ever a decision, never an inference.
 func powerWish(p Plan, snap Snapshot, askedOff bool) string {
 	switch {
 	case askedOff:
 		return powerapi.Off
 	case p.NextMode != state.ModeShed && snap.NodeUp:
 		return powerapi.On
-	case snap.Mode == state.ModeShed && !snap.NodeUp:
-		return powerapi.Off
 	default:
 		return powerapi.Hold
 	}
