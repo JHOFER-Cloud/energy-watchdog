@@ -159,7 +159,7 @@ The generators live as tests that skip unless `OUT` is set, so they cost nothing
 run but still compile against the real signatures:
 
 ```sh
-# every reachable Decide outcome (270 rows)
+# every reachable Decide outcome (274 rows)
 OUT=/tmp/decide.json go test ./internal/controller/ -run TestGenerateDecisionTable
 
 # nut-dog's precedence + reconcile tables (40 + 27 rows), from the nut-dog repo

@@ -6,17 +6,18 @@ import (
 	"testing"
 	"time"
 
+	"github.com/JHOFER-Cloud/energy-watchdog/internal/config"
 	"github.com/JHOFER-Cloud/energy-watchdog/internal/proxmox"
 	"github.com/JHOFER-Cloud/energy-watchdog/internal/state"
 )
 
 // row is one input combination and what Decide made of it.
 type row struct {
-	Mode, Hold, Signal, Node, Guest, Request, Grace string
-	NextMode, Wish                                  string
-	Migrate, Stop, StartReq                         []int
-	Poweroff, Wake, RestoreStopped                  bool
-	GraceAction, Reason                             string
+	Mode, Hold, Signal, Node, Guest, Request, Grace, Uptime string
+	NextMode, Wish                                          string
+	Migrate, Stop, StartReq                                 []int
+	Poweroff, Wake, RestoreStopped                          bool
+	GraceAction, Reason                                     string
 }
 
 // TestGenerateDecisionTable dumps every reachable Decide outcome as JSON, for the decision
@@ -29,7 +30,9 @@ func TestGenerateDecisionTable(t *testing.T) {
 		t.Skip("set OUT=<path> to regenerate the decision table")
 	}
 	cfg := testCfg(t)
+	cfg.MinRuntime = config.Duration{Duration: 2 * time.Hour}
 	surplus := map[string]float64{"deficit": -800, "neutral": 500, "surplus": 4000}
+	uptimes := map[string]time.Duration{"settled": 3 * time.Hour, "fresh": 30 * time.Minute}
 	var rows []row
 	for _, mode := range []state.Mode{state.ModeRunning, state.ModeShed, state.ModeGaming} {
 		for _, hold := range []string{"none", "hold off", "hold on"} {
@@ -38,54 +41,63 @@ func TestGenerateDecisionTable(t *testing.T) {
 					for _, guest := range []bool{true, false} {
 						for _, req := range []bool{true, false} {
 							for _, grace := range []string{"stopped", "running", "elapsed"} {
-								if guest && !nodeUp {
-									continue
-								}
-								if mode != state.ModeGaming && grace != "stopped" {
-									continue
-								}
-								s := Snapshot{
-									Surplus: surplus[sig], SoC: 90, NodeUp: nodeUp, Mode: mode,
-									NodeUptime: time.Hour,
-									ManualShed: hold == "hold off",
-									ManualOn:   hold == "hold on",
-								}
-								if nodeUp {
-									s.Guests = []proxmox.Guest{qemu(101, true), qemu(301, true)}
-									if guest {
-										s.Guests = append(s.Guests, qemu(601, true))
+								for _, uptime := range []string{"settled", "fresh"} {
+									if guest && !nodeUp {
+										continue
 									}
+									if mode != state.ModeGaming && grace != "stopped" {
+										continue
+									}
+									// minRuntime only pins a deficit no manual hold has already pinned,
+									// on a node that is up, and only ModeRunning reads that pin. Anywhere
+									// else a fresh uptime decides exactly as a settled one does.
+									if uptime == "fresh" && (mode != state.ModeRunning || sig != "deficit" || hold != "none" || !nodeUp) {
+										continue
+									}
+									s := Snapshot{
+										Surplus: surplus[sig], SoC: 90, NodeUp: nodeUp, Mode: mode,
+										NodeUptime: uptimes[uptime],
+										ManualShed: hold == "hold off",
+										ManualOn:   hold == "hold on",
+									}
+									if nodeUp {
+										s.Guests = []proxmox.Guest{qemu(101, true), qemu(301, true)}
+										if guest {
+											s.Guests = append(s.Guests, qemu(601, true))
+										}
+									}
+									if req {
+										s.Wake = wants(601)
+									}
+									switch grace {
+									case "running":
+										s.GraceSince = testNow.Add(-time.Minute).Unix()
+									case "elapsed":
+										s.GraceSince = testNow.Add(-11 * time.Minute).Unix()
+									}
+									p := Decide(s, cfg, testNow)
+									ga := "carried"
+									switch {
+									case p.GraceSince == 0 && s.GraceSince != 0:
+										ga = "cleared"
+									case p.GraceSince == testNow.Unix() && s.GraceSince != testNow.Unix():
+										ga = "started"
+									}
+									rows = append(rows, row{
+										Mode: string(mode), Hold: hold, Signal: sig,
+										Node:    map[bool]string{true: "up", false: "down"}[nodeUp],
+										Guest:   map[bool]string{true: "yes", false: "no"}[guest],
+										Request: map[bool]string{true: "yes", false: "no"}[req],
+										// askedOff is controller state, not a Decide input, so it stays out of the
+										// enumeration: Wish is the steady-state answer. Mid-shed (we asked for the
+										// power-off, p1 not down yet) it is off wherever this shows hold.
+										Grace: grace, Uptime: uptime,
+										NextMode: string(p.NextMode), Wish: powerWish(p, s, false),
+										Migrate: ids(p.Migrate), Stop: ids(p.Stop), RestoreStopped: p.RestoreStopped,
+										StartReq: p.StartRequested, Poweroff: p.Poweroff, Wake: p.Wake,
+										GraceAction: ga, Reason: p.Reason,
+									})
 								}
-								if req {
-									s.Wake = wants(601)
-								}
-								switch grace {
-								case "running":
-									s.GraceSince = testNow.Add(-time.Minute).Unix()
-								case "elapsed":
-									s.GraceSince = testNow.Add(-11 * time.Minute).Unix()
-								}
-								p := Decide(s, cfg, testNow)
-								ga := "carried"
-								switch {
-								case p.GraceSince == 0 && s.GraceSince != 0:
-									ga = "cleared"
-								case p.GraceSince == testNow.Unix() && s.GraceSince != testNow.Unix():
-									ga = "started"
-								}
-								rows = append(rows, row{
-									Mode: string(mode), Hold: hold, Signal: sig,
-									Node:    map[bool]string{true: "up", false: "down"}[nodeUp],
-									Guest:   map[bool]string{true: "yes", false: "no"}[guest],
-									Request: map[bool]string{true: "yes", false: "no"}[req],
-									// askedOff is controller state, not a Decide input, so it stays out of the
-									// enumeration: Wish is the steady-state answer. Mid-shed (we asked for the
-									// power-off, p1 not down yet) it is off wherever this shows hold.
-									Grace: grace, NextMode: string(p.NextMode), Wish: powerWish(p, s, false),
-									Migrate: ids(p.Migrate), Stop: ids(p.Stop), RestoreStopped: p.RestoreStopped,
-									StartReq: p.StartRequested, Poweroff: p.Poweroff, Wake: p.Wake,
-									GraceAction: ga, Reason: p.Reason,
-								})
 							}
 						}
 					}

@@ -277,7 +277,7 @@ func (c *Controller) reconcile(ctx context.Context) {
 	c.metrics.Update(metrics.Sample{
 		Surplus: snap.Surplus, SurplusRaw: snap.SurplusRaw, SoC: snap.SoC,
 		NodeUp: snap.NodeUp, Gaming: gaming, ManualShed: snap.ManualShed, ManualOn: snap.ManualOn,
-		Tick: now.Unix(),
+		MinRuntimeHeld: plan.MinRuntimeHeld, Tick: now.Unix(),
 	})
 
 	if err := c.apply(ctx, plan, snap); err != nil {

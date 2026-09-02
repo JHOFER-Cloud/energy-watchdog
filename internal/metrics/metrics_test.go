@@ -10,7 +10,7 @@ func TestHandler(t *testing.T) {
 	m := New(true)
 	m.Update(Sample{
 		Surplus: 1800, SurplusRaw: 2400, SoC: 73.5,
-		NodeUp: false, Gaming: true, Tick: 1700000000,
+		NodeUp: false, Gaming: true, MinRuntimeHeld: true, Tick: 1700000000,
 	})
 	m.SetOutcome("shed", true)
 
@@ -24,6 +24,7 @@ func TestHandler(t *testing.T) {
 		"energy_watchdog_battery_percent 73.5",
 		"energy_watchdog_node_up 0",
 		"energy_watchdog_gaming_active 1",
+		"energy_watchdog_min_runtime_hold 1",
 		"energy_watchdog_dry_run 1",
 		`energy_watchdog_mode{mode="shed"} 1`,
 		`energy_watchdog_mode{mode="running"} 0`,

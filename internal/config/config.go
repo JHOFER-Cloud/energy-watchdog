@@ -27,6 +27,11 @@ type Config struct {
 	// won't autostart) and GPU-passthrough/VM reboots mid-session, so a short gap doesn't
 	// cut the session short. Default 10m.
 	GamingGrace Duration `yaml:"gamingGrace"`
+	// MinRuntime is how long the managed node must have been up before the solar signal may
+	// shed it. On a day of intermittent sun the averaged surplus crosses the band twice, and
+	// undoing a shed costs a migrate, a stop and a full boot - far more than the deficit it
+	// answers. Either manual hold outranks it. 0 (the default) disables it.
+	MinRuntime Duration `yaml:"minRuntime"`
 
 	// PowerAPI delegates p1's power to nut-dog. Unset means the watchdog powers p1
 	// itself over Proxmox (WoL relay + node shutdown), which is what local runs use.
@@ -389,6 +394,9 @@ func (c *Config) defaults() {
 
 func (c *Config) validate() error {
 	switch {
+	// "-2h" parses fine and would silently read as disabled.
+	case c.MinRuntime.Duration < 0:
+		return fmt.Errorf("minRuntime must not be negative, got %v", c.MinRuntime.Duration)
 	case c.Prometheus.URL == "":
 		return fmt.Errorf("prometheus.url is required")
 	case c.Prometheus.ProductionMetric == "":

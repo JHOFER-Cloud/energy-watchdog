@@ -16,12 +16,14 @@ running. That goes into one pure function, `Decide`, which hands back a plan. Th
 executor carries the plan out, or just logs it when `dryRun` is on. Keeping `Decide`
 pure is what lets the whole thing be unit-tested without touching real hardware.
 
-Two things stop it thrashing:
+Three things stop it thrashing:
 
 - averaging over a window (`avg_over_time`), so a quick spike from the oven doesn't
   trip a shutdown
 - a gap between the shutdown threshold (`shedBelowWatts`) and the wake threshold
   (`headroomWatts`), so it doesn't flip-flop around break-even
+- `minRuntime`, so a deficit arriving minutes after a wake doesn't shed `p1` straight
+  back down — see below
 
 ### Modes
 
@@ -186,6 +188,37 @@ three tries, so whatever broke needs no restart here once it is fixed.
 Off unless `selfService.addr` is set. See [DEVELOPMENT.md](./DEVELOPMENT.md) for how it fits
 together and how to run the whole thing locally.
 
+### Minimum runtime
+
+Neither the window nor the hysteresis band helps on a day of intermittent sun: the average
+genuinely does cross both edges, and widening the window only shortens the blip rather than
+removing it — while delaying good-morning by the same amount. What makes that expensive is
+the shed itself. Undoing one costs a migrate, a stop, a boot and a Talos cluster coming back,
+for a deficit that lasted twenty minutes.
+
+`minRuntime` (JHC-522, off unless set) is the bound: `p1` has to have been up that long before
+the solar signal may shed it. It is measured from `p1`'s own uptime, so nothing is persisted
+and a watchdog restart doesn't reset it — and an uptime Proxmox won't report (no `Sys.Audit`)
+reads as no hold rather than one that never lifts.
+
+It pins the signal neutral rather than acting, so it suppresses one branch: `running` +
+deficit. That branch has two exits and both are deferred — the shed, and the `gaming` posture
+that sheds the load but keeps the host up for a session. Nothing is migrated or stopped
+either, which is the point: shedding the guests only to restore them twenty minutes later is
+the same churn one layer down. Everything reached from the other two modes is untouched, since
+`shed` and `gaming` read the signal only for *surplus*: the grace window still runs on its own
+clock, a hand-started host is still adopted, and a desktop VM asked for during a hold still
+starts on the host that is already up.
+
+Both manual holds outrank it: a hold-off still sheds `p1` now, and so does nut-dog on a UPS
+event — this gates the solar signal, not the hardware. It is also no help against a deficit
+ten hours into the day, which is the ordinary evening shed and should happen.
+
+The cost is the whole of `p1`'s load — its guests included — on battery or grid for up to
+`minRuntime`, every time the sun goes away right after a wake.
+`energy_watchdog_min_runtime_hold` is 1 while a shed is being held off, which is the only
+thing that distinguishes it from a watchdog that has stopped deciding.
+
 ### Gaming grace window
 
 When `p1` is on in `gaming` mode but no gaming guest is running yet, it isn't powered off
@@ -308,10 +341,10 @@ calls.
 ## Metrics and dashboard
 
 The watchdog serves Prometheus metrics on `:9333/metrics`: the current mode, averaged
-surplus, battery charge, p1 power state, gaming-guard state, dry-run flag, and reconcile
-health. That's enough to watch what it would do during a dry-run rollout. The Grafana
-dashboard for them is
-[here](https://github.com/JHOFER-Cloud/fleet-dashboards/blob/main/sync/K8s/Misc/energy-watchdog.json).
+surplus, battery charge, p1 power state, gaming-guard state, the minimum-runtime hold,
+dry-run flag, and reconcile health. That's enough to watch what it would do during a dry-run
+rollout. The Grafana dashboard for them is
+[here](https://github.com/JHOFER-Cloud/fleet-dashboards/blob/main/sync/K8s/Environment/energy-watchdog.json).
 
 ## Deploying
 
