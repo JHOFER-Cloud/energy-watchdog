@@ -18,7 +18,9 @@ type Metrics struct {
 	gaming     bool
 	manualShed bool
 	manualOn   bool
-	dryRun     bool
+	// minRuntimeHeld: a deficit the node's minRuntime is holding off; see Plan.MinRuntimeHeld.
+	minRuntimeHeld bool
+	dryRun         bool
 	// powerReqOK is nil until a request has been attempted, so a deployment that
 	// doesn't delegate p1's power exports nothing rather than a misleading 1.
 	powerReqOK *bool
@@ -52,14 +54,15 @@ func (m *Metrics) SetThresholds(headroom, shedBelow, minBattery float64) {
 // Sample is what one reconcile observed, and when. Mode and success aren't known until
 // apply has run - see SetOutcome.
 type Sample struct {
-	Surplus    float64
-	SurplusRaw float64
-	SoC        float64
-	NodeUp     bool
-	Gaming     bool
-	ManualShed bool
-	ManualOn   bool
-	Tick       int64
+	Surplus        float64
+	SurplusRaw     float64
+	SoC            float64
+	NodeUp         bool
+	Gaming         bool
+	ManualShed     bool
+	ManualOn       bool
+	MinRuntimeHeld bool
+	Tick           int64
 }
 
 // Update records the observation from the latest reconcile.
@@ -69,6 +72,7 @@ func (m *Metrics) Update(s Sample) {
 	m.surplus, m.surplusRaw, m.soc = s.Surplus, s.SurplusRaw, s.SoC
 	m.nodeUp, m.gaming = s.NodeUp, s.Gaming
 	m.manualShed, m.manualOn = s.ManualShed, s.ManualOn
+	m.minRuntimeHeld = s.MinRuntimeHeld
 	m.lastTick = s.Tick
 }
 
@@ -145,6 +149,9 @@ func (m *Metrics) Handler() http.HandlerFunc {
 		fmt.Fprintf(w, "# HELP energy_watchdog_manual_on Whether the node is held on by hand rather than by the solar signal.\n")
 		fmt.Fprintf(w, "# TYPE energy_watchdog_manual_on gauge\n")
 		fmt.Fprintf(w, "energy_watchdog_manual_on %g\n", b2f(m.manualOn))
+		fmt.Fprintf(w, "# HELP energy_watchdog_min_runtime_hold Whether a shed is held off because the node has not been up for minRuntime yet.\n")
+		fmt.Fprintf(w, "# TYPE energy_watchdog_min_runtime_hold gauge\n")
+		fmt.Fprintf(w, "energy_watchdog_min_runtime_hold %g\n", b2f(m.minRuntimeHeld))
 		if m.powerReqOK != nil {
 			fmt.Fprintf(w, "# HELP energy_watchdog_power_request_success Whether the last power request to nut-dog succeeded.\n")
 			fmt.Fprintf(w, "# TYPE energy_watchdog_power_request_success gauge\n")

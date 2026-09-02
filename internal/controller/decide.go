@@ -57,6 +57,9 @@ type Plan struct {
 	StartRequested []int
 	Poweroff       bool
 	Wake           bool
+	// MinRuntimeHeld reports a deficit left unacted on because the node has not been up for
+	// minRuntime yet. Exported for the gauge only; it plans nothing.
+	MinRuntimeHeld bool
 	NextMode       state.Mode
 	GraceSince     int64         // the grace clock to persist; carried forward unless a transition changes it
 	WakeDone       map[int]int64 // the spent-request markers to persist; see state.State.WakeDone
@@ -72,6 +75,14 @@ func classify(surplus, soc float64, p config.Prometheus) signal {
 		return sigDeficit
 	}
 	return sigNeutral
+}
+
+// minRuntimeHold reports whether the node has been up too briefly for the solar signal to
+// shed it. Measured from the node's own uptime, so nothing has to be persisted. Uptime 0 is
+// unknown, not freshly booted (Proxmox drops it without Sys.Audit), and holding on that would
+// keep the node up for good, so it reads as no hold.
+func minRuntimeHold(s Snapshot, min time.Duration) bool {
+	return min > 0 && s.NodeUp && s.NodeUptime > 0 && s.NodeUptime < min
 }
 
 func gamingActive(guests []proxmox.Guest, set config.IDSet) bool {
@@ -135,14 +146,21 @@ func refs(guests []proxmox.Guest) []state.GuestRef {
 // (the JHC-504 comment logic) is unit-testable without touching hardware.
 func Decide(s Snapshot, cfg *config.Config, now time.Time) Plan {
 	sig := classify(s.Surplus, s.SoC, cfg.Prometheus)
-	// The manual holds are a pinned signal, not a fourth mode: every existing rule - gaming
-	// guard, grace window, wake requests - then applies unchanged. Shed first, so a
-	// hand-edited intent setting both can't override a heatwave shed.
+	// The holds are a pinned signal, not a fourth mode: every existing rule - gaming guard,
+	// grace window, wake requests - then applies unchanged. Shed first, so a hand-edited
+	// intent setting both can't override a heatwave shed. Both manual holds outrank
+	// minRuntime: a hold-off has to be able to shed the node now.
+	minRuntimeHeld := false
 	switch {
 	case s.ManualShed:
 		sig = sigDeficit
 	case s.ManualOn:
 		sig = sigSurplus // bypasses minBatteryPercent: a manual hold outranks the battery
+	case sig == sigDeficit && minRuntimeHold(s, cfg.MinRuntime.Duration):
+		// Neutral, not surplus: the node is up and never went down, so there is nothing to
+		// restore. Only ModeRunning reads sigDeficit, so the grace window is untouched.
+		sig = sigNeutral
+		minRuntimeHeld = true
 	}
 	gaming := s.NodeUp && gamingActive(s.Guests, cfg.Guests.GamingGuard)
 	pending, wakeDone := resolveWake(s.Wake, s.Guests, s.WakeDone)
@@ -170,6 +188,10 @@ func Decide(s Snapshot, cfg *config.Config, now time.Time) Plan {
 			break
 		}
 		if sig != sigDeficit {
+			if minRuntimeHeld {
+				p.MinRuntimeHeld = true
+				p.Reason = "deficit inside minRuntime: p1 came up too recently to shed again"
+			}
 			break
 		}
 		// Shed posture: criticals move, the rest stop. Alertmanager coverage isn't planned

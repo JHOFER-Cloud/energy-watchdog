@@ -20,6 +20,13 @@ metricsAddr: ":9333"
 # to launch one, and rides out GPU-passthrough/VM reboots mid-session. Default 10m.
 gamingGrace: 10m
 
+# How long p1 must have been up before the solar signal may shed it. On a day of intermittent
+# sun the averaged surplus crosses the band twice and the shed - a migrate, a stop and a full
+# boot to undo - costs far more than the deficit it answers. Measured from p1's own uptime. A
+# manual hold outranks it either way, and the gaming grace window is unaffected.
+# Omit or set 0 to disable.
+minRuntime: 2h
+
 # p1's power belongs to nut-dog: it has to work during an outage, and its shed signal and
 # WoL need neither Proxmox nor a second node to relay the packet. This watchdog only states
 # what it wants, every tick; nut-dog obeys unless a UPS says otherwise. Omit the block to

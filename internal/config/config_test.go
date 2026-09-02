@@ -1,7 +1,9 @@
 package config
 
 import (
+	"strings"
 	"testing"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -81,6 +83,14 @@ func TestReplicationManagedDefault(t *testing.T) {
 		if got := p.ReplicationManaged(); got != tc.want {
 			t.Errorf("%q: ReplicationManaged() = %v, want %v", tc.yaml, got, tc.want)
 		}
+	}
+}
+
+// A negative minRuntime parses fine and would silently read as disabled.
+func TestValidateRejectsNegativeMinRuntime(t *testing.T) {
+	c := &Config{MinRuntime: Duration{-2 * time.Hour}}
+	if err := c.validate(); err == nil || !strings.Contains(err.Error(), "minRuntime") {
+		t.Fatalf("expected a minRuntime error, got %v", err)
 	}
 }
 
