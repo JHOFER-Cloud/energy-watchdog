@@ -8,12 +8,11 @@ gamingGrace: 2m
 prometheus:
   url: http://127.0.0.1:8006
   window: 1m
-  headroomWatts: 1000
-  shedBelowWatts: 0
+  headroomWatts: 1200
+  shedBelowWatts: 700
   minBatteryPercent: 20
   powerScale: 1 # the fake serves watts already
-  productionMetric: fake_production_w
-  consumptionMetric: fake_consumption_w
+  surplusMetric: fake_grid_feed_in_w
   batteryMetric: fake_charge_level_percent
 
 proxmox:

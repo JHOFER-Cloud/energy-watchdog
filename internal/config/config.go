@@ -195,24 +195,29 @@ type Prometheus struct {
 	// Window is the PromQL range used for avg_over_time, e.g. "30m". Averaging over a
 	// window is what keeps a kitchen burst from instantly triggering a shutdown.
 	Window string `yaml:"window"`
-	// HeadroomWatts is the surplus (production - consumption) the system must clear,
-	// sustained over Window, before p1 is woken. ~1kW covers p1+p2+p3 spinning up.
+	// HeadroomWatts is the export the system must clear, sustained over Window, before p1
+	// is woken.
 	HeadroomWatts float64 `yaml:"headroomWatts"`
-	// ShedBelowWatts is the surplus threshold below which p1 is shed. Default 0:
-	// shed once consumption exceeds production. The gap to HeadroomWatts is the
-	// hysteresis band that prevents flapping around the break-even point.
+	// ShedBelowWatts is the export below which p1 is shed. Keep it above 0: a battery that
+	// can still cover the house holds the meter near zero, so 0 only trips once it is flat.
+	// The gap to HeadroomWatts is the hysteresis band, and it must exceed p1's own draw,
+	// which the meter subtracts as soon as p1 wakes.
 	ShedBelowWatts float64 `yaml:"shedBelowWatts"`
 	// MinBatteryPercent gates waking: don't count surplus as "wake" unless the
 	// battery is at least this charged, so we never wake into a battery about to deplete.
+	// The battery charges at a bounded rate, so export alone does not imply it is full.
 	MinBatteryPercent float64 `yaml:"minBatteryPercent"`
-	// PowerScale multiplies the production/consumption metrics to convert them to watts,
-	// so the *Watts thresholds mean what they say. The sonnenbatterie metrics are in
-	// milliwatts, so use 0.001. Defaults to 1 (metric already in watts).
+	// PowerScale multiplies SurplusMetric to convert it to watts, so the *Watts thresholds
+	// mean what they say. The sonnenbatterie metrics are in milliwatts, so use 0.001.
+	// Defaults to 1 (metric already in watts).
 	PowerScale float64 `yaml:"powerScale"`
 
-	ProductionMetric  string `yaml:"productionMetric"`
-	ConsumptionMetric string `yaml:"consumptionMetric"`
-	BatteryMetric     string `yaml:"batteryMetric"`
+	// SurplusMetric is the signed power the decision runs on: positive leaves the house,
+	// negative is drawn in. Must be a plain instant-vector selector, since it is wrapped in
+	// avg_over_time. Grid feed-in, not production minus consumption, which would count power
+	// the battery is absorbing as spare. JHC-627.
+	SurplusMetric string `yaml:"surplusMetric"`
+	BatteryMetric string `yaml:"batteryMetric"`
 }
 
 // PowerAPI points at nut-dog's power endpoint. nut-dog owns p1's power because it
@@ -399,10 +404,8 @@ func (c *Config) validate() error {
 		return fmt.Errorf("minRuntime must not be negative, got %v", c.MinRuntime.Duration)
 	case c.Prometheus.URL == "":
 		return fmt.Errorf("prometheus.url is required")
-	case c.Prometheus.ProductionMetric == "":
-		return fmt.Errorf("prometheus.productionMetric is required")
-	case c.Prometheus.ConsumptionMetric == "":
-		return fmt.Errorf("prometheus.consumptionMetric is required")
+	case c.Prometheus.SurplusMetric == "":
+		return fmt.Errorf("prometheus.surplusMetric is required")
 	case c.Proxmox.Endpoint == "":
 		return fmt.Errorf("proxmox.endpoint is required")
 	case c.Proxmox.Node == "":

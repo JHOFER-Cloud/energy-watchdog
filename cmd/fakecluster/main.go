@@ -138,20 +138,14 @@ func (c *cluster) handleQuery(w http.ResponseWriter, r *http.Request) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	q := r.URL.Query().Get("query")
-	// The watchdog asks for surplus as one expression naming both metrics
-	// ("sum(production) - sum(consumption)"), so that case has to be matched before either
-	// metric alone. The fake serves raw watts, so config.local.yaml sets powerScale: 1.
-	prod, cons := strings.Contains(q, "production"), strings.Contains(q, "consumption")
+	// The watchdog asks for one signed metric, the grid feed-in. The fake serves raw watts,
+	// so config.local.yaml sets powerScale: 1.
 	var v float64
 	switch {
 	case strings.Contains(q, "charge_level"), strings.Contains(q, "battery"):
 		v = c.soc
-	case prod && cons:
+	case strings.Contains(q, "grid"), strings.Contains(q, "surplus"):
 		v = c.surplus
-	case prod:
-		v = max(c.surplus, 0) + 500
-	case cons:
-		v = 500 - min(c.surplus, 0)
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_, _ = fmt.Fprintf(w, `{"status":"success","data":{"resultType":"vector","result":[{"metric":{},"value":[0,"%g"]}]}}`, v)

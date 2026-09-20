@@ -53,7 +53,7 @@ func TestReconcileFailedApplyIsVisible(t *testing.T) {
 	cfg := &config.Config{
 		Prometheus: config.Prometheus{
 			URL: promSrv.URL, Window: "30m", HeadroomWatts: 1000, MinBatteryPercent: 20,
-			ProductionMetric: "prod", ConsumptionMetric: "cons", BatteryMetric: "soc",
+			SurplusMetric: "grid", BatteryMetric: "soc",
 		},
 		Proxmox: config.Proxmox{
 			Node:        "pve-1",

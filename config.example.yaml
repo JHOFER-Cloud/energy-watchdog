@@ -41,20 +41,22 @@ prometheus:
   # avg_over_time window. The "base level" that stops a kitchen burst from triggering
   # a shutdown.
   window: 30m
-  # Surplus (production - consumption), sustained over the window, that must be cleared
-  # before waking p1. ~1kW covers p1+p2+p3 spinning up. Also the upper hysteresis edge.
-  headroomWatts: 1000
-  # Shed once surplus drops below this. 0 = shed when consumption exceeds production.
-  # The gap up to headroomWatts is the hysteresis band that prevents flapping.
-  shedBelowWatts: 0
+  # Export, sustained over the window, that must be cleared before waking p1. Also the
+  # upper hysteresis edge.
+  headroomWatts: 1200
+  # Shed once export drops below this. Not 0: a battery that can still cover the house holds
+  # the meter near zero, so 0 only trips once it is flat. The gap up to headroomWatts is the
+  # hysteresis band and must exceed p1's own draw, which the meter subtracts once p1 wakes.
+  shedBelowWatts: 700
   # Don't treat surplus as "wake" unless the battery is at least this charged. Low on
   # purpose: it only needs enough buffer to ride out short cloud cover.
   minBatteryPercent: 20
-  # Multiplier to convert the production/consumption metrics to watts, so the *Watts
-  # thresholds mean watts. The sonnenbatterie metrics are milliwatts, hence 0.001.
+  # Multiplier to convert surplusMetric to watts, so the *Watts thresholds mean watts. The
+  # sonnenbatterie metrics are milliwatts, hence 0.001.
   powerScale: 0.001
-  productionMetric: sonnenbatterie_production_mw
-  consumptionMetric: sonnenbatterie_consumption_mw
+  # Signed: positive leaves the house, negative is drawn in. Grid feed-in, not production
+  # minus consumption, which counts power the battery is absorbing as spare. JHC-627.
+  surplusMetric: sonnenbatterie_grid_feed_in_mw
   batteryMetric: sonnenbatterie_user_charge_level_percent
 
 proxmox:

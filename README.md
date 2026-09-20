@@ -1,7 +1,7 @@
 # energy-watchdog
 
-Shuts the Proxmox host `p1` down at night when there's no solar surplus, and wakes it
-back up in the morning once production covers the load again. The always-on stuff
+Shuts the Proxmox host `p1` down when there's no solar surplus, and wakes it back up
+once the house is exporting enough to carry it. The always-on stuff
 (network gear, the control-plane Raspberry Pis) keeps running the whole time.
 
 Part of JHC-504. The UPS / power-cut side is a separate service (`nut-dog`, JHC-501), since
@@ -10,18 +10,27 @@ see "Who actually powers p1" below.
 
 ## How it works
 
-It's a reconcile loop. Every tick it looks at the averaged solar surplus (production
-minus consumption), the battery charge, whether `p1` is on, and which guests are
-running. That goes into one pure function, `Decide`, which hands back a plan. The
-executor carries the plan out, or just logs it when `dryRun` is on. Keeping `Decide`
-pure is what lets the whole thing be unit-tested without touching real hardware.
+It's a reconcile loop. Every tick it looks at the averaged grid export, the battery
+charge, whether `p1` is on, and which guests are running. That goes into one pure
+function, `Decide`, which hands back a plan. The executor carries the plan out, or just
+logs it when `dryRun` is on. Keeping `Decide` pure is what lets the whole thing be
+unit-tested without touching real hardware.
+
+Surplus means what the meter exports, not production minus consumption. The
+sonnenbatterie fills the battery before it exports anything, so production beating
+consumption only means the battery is getting the difference. `p1` woken on that is
+spending charge the house buys back after dark, and nothing at the meter ever shows it.
+Export is the part the battery cannot absorb, so it is the only power actually spare
+(JHC-627).
 
 Three things stop it thrashing:
 
 - averaging over a window (`avg_over_time`), so a quick spike from the oven doesn't
   trip a shutdown
 - a gap between the shutdown threshold (`shedBelowWatts`) and the wake threshold
-  (`headroomWatts`), so it doesn't flip-flop around break-even
+  (`headroomWatts`). It has to be wider than `p1`'s own draw (~210 W at the rack plug),
+  because `p1` is part of what the meter reads: waking it drops the next reading by
+  exactly its own consumption
 - `minRuntime`, so a deficit arriving minutes after a wake doesn't shed `p1` straight
   back down — see below
 

@@ -99,8 +99,7 @@ func TestValidateRejectsOverlap(t *testing.T) {
 	if err := yaml.Unmarshal([]byte(`
 prometheus:
   url: http://prom
-  productionMetric: p
-  consumptionMetric: c
+  surplusMetric: g
 proxmox:
   endpoint: https://pve-2
   node: pve-1

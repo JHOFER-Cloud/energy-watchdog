@@ -128,7 +128,7 @@ func delegateFixture(t *testing.T, surplus, nutURL string, mode state.Mode, node
 		GamingGrace: config.Duration{Duration: 10 * time.Minute},
 		Prometheus: config.Prometheus{
 			URL: promSrv.URL, Window: "30m", HeadroomWatts: 1000, MinBatteryPercent: 0,
-			ProductionMetric: "prod", ConsumptionMetric: "cons",
+			SurplusMetric: "grid",
 		},
 		Proxmox: config.Proxmox{
 			Node: "pve-1", TargetNodes: []string{"pve-2"},
