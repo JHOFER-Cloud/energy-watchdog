@@ -15,8 +15,8 @@ func TestRead(t *testing.T) {
 		q := r.URL.Query().Get("query")
 		w.Header().Set("Content-Type", "application/json")
 		switch {
-		case strings.Contains(q, "production"):
-			// production avg 3000 - consumption avg 1200 => surplus 1800
+		case strings.Contains(q, "grid_feed_in"):
+			// 1800 W leaving the house
 			_, _ = w.Write([]byte(`{"status":"success","data":{"resultType":"vector","result":[{"metric":{},"value":[1700000000,"1800"]}]}}`))
 		case strings.Contains(q, "charge_level"):
 			_, _ = w.Write([]byte(`{"status":"success","data":{"resultType":"vector","result":[{"metric":{},"value":[1700000000,"73.5"]}]}}`))
@@ -28,10 +28,9 @@ func TestRead(t *testing.T) {
 
 	c := New(srv.URL)
 	r, err := c.Read(context.Background(), config.Prometheus{
-		Window:            "30m",
-		ProductionMetric:  "sonnenbatterie_production_mw",
-		ConsumptionMetric: "sonnenbatterie_consumption_mw",
-		BatteryMetric:     "sonnenbatterie_user_charge_level_percent",
+		Window:        "30m",
+		SurplusMetric: "sonnenbatterie_grid_feed_in_mw",
+		BatteryMetric: "sonnenbatterie_user_charge_level_percent",
 	})
 	if err != nil {
 		t.Fatalf("Read: %v", err)
@@ -56,7 +55,7 @@ func TestReadPowerScale(t *testing.T) {
 
 	c := New(srv.URL)
 	r, err := c.Read(context.Background(), config.Prometheus{
-		Window: "30m", ProductionMetric: "p", ConsumptionMetric: "c", PowerScale: 0.001,
+		Window: "30m", SurplusMetric: "g", PowerScale: 0.001,
 	})
 	if err != nil {
 		t.Fatalf("Read: %v", err)
@@ -73,7 +72,7 @@ func TestReadEmptyVector(t *testing.T) {
 	defer srv.Close()
 
 	c := New(srv.URL)
-	_, err := c.Read(context.Background(), config.Prometheus{Window: "30m", ProductionMetric: "p", ConsumptionMetric: "c"})
+	_, err := c.Read(context.Background(), config.Prometheus{Window: "30m", SurplusMetric: "g"})
 	if err == nil {
 		t.Fatal("expected error for empty series, got nil")
 	}
@@ -86,7 +85,7 @@ func TestReadScalar(t *testing.T) {
 	defer srv.Close()
 
 	c := New(srv.URL)
-	r, err := c.Read(context.Background(), config.Prometheus{Window: "30m", ProductionMetric: "p", ConsumptionMetric: "c"})
+	r, err := c.Read(context.Background(), config.Prometheus{Window: "30m", SurplusMetric: "g"})
 	if err != nil {
 		t.Fatalf("Read: %v", err)
 	}
